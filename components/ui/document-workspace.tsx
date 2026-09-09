@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { deleteDocument } from "@/lib/actions/documents";
-import { isPdfFilename } from "@/lib/document-input";
+import { isSupportedDocumentFilename } from "@/lib/document-input";
 import type { UploadedDocument } from "@/lib/types/document";
 import { Button } from "./button";
 import DocumentTable from "./document-table";
@@ -26,9 +26,12 @@ export default function DocumentWorkspace({
   );
   const hasDocuments = documents.length > 0;
   const canConvert =
-    documents.some((doc) => !doc.locked && isPdfFilename(doc.name)) &&
-    !isProcessing;
-  const hasLegacyDocuments = documents.some((doc) => !isPdfFilename(doc.name));
+    documents.some(
+      (doc) => !doc.locked && isSupportedDocumentFilename(doc.name)
+    ) && !isProcessing;
+  const hasUnsupportedDocuments = documents.some(
+    (doc) => !isSupportedDocumentFilename(doc.name)
+  );
 
   useEffect(() => {
     const controllers = abortControllersRef.current;
@@ -86,7 +89,7 @@ export default function DocumentWorkspace({
 
   const convertDocument = useCallback(
     async (doc: UploadedDocument) => {
-      if (!isPdfFilename(doc.name)) return;
+      if (!isSupportedDocumentFilename(doc.name)) return;
       const form = new FormData();
       form.append("sessionId", sessionId);
 
@@ -151,7 +154,7 @@ export default function DocumentWorkspace({
 
   const runConversion = useCallback(() => {
     const targets = documents.filter(
-      (doc) => !doc.locked && isPdfFilename(doc.name)
+      (doc) => !doc.locked && isSupportedDocumentFilename(doc.name)
     );
     if (targets.length === 0) return;
 
@@ -177,19 +180,20 @@ export default function DocumentWorkspace({
         </Button>
         {!hasDocuments && (
           <p className="mt-2 text-sm text-muted-foreground">
-            Upload at least one PDF to enable conversion.
+            Upload at least one Word document or PDF to enable conversion.
           </p>
         )}
-        {hasLegacyDocuments && (
+        {hasUnsupportedDocuments && (
           <p className="mt-2 text-sm text-muted-foreground">
-            Previous Word conversions remain available. To convert one again,
-            export it as PDF and upload the PDF. Only unlocked PDFs are
-            converted.
+            Previous conversions remain available. Only unlocked PDF and .docx
+            documents are converted. Save older .doc files as .docx before
+            uploading.
           </p>
         )}
         {hasDocuments && isProcessing && (
           <p className="mt-2 text-sm text-muted-foreground">
-            Conversion in progress…
+            Conversion in progress… Word files are prepared as PDFs
+            automatically.
           </p>
         )}
       </section>

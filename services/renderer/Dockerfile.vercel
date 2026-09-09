@@ -1,0 +1,13 @@
+FROM gotenberg/gotenberg:8.36.0-libreoffice@sha256:88f9cc4a8b9468443220a0b945174c794880c1b6d3d583efba6e2319e509ac92
+
+# Copy only the startup policy; no app source, documents, or env files.
+COPY --chmod=0555 start-renderer.sh /usr/local/bin/start-renderer.sh
+
+# Match Vercel's default HTTP port; startup also honors an injected PORT.
+ENV PORT=80
+EXPOSE 80
+USER gotenberg
+
+# Clear inherited project secrets before starting tini and document processes.
+ENTRYPOINT ["/bin/sh", "/usr/local/bin/start-renderer.sh"]
+CMD []

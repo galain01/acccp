@@ -22,8 +22,7 @@ if (!serviceRoleKey)
 
 export const DOCUMENTS_BUCKET = "documents";
 
-export const DOCX_MIME_TYPE =
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+export { DOCX_MIME_TYPE } from "./document-input";
 
 const storage = createClient(supabaseUrl, serviceRoleKey, {
   auth: { persistSession: false, autoRefreshToken: false },
@@ -34,7 +33,7 @@ export function sourcePdfKey(sessionId: string, documentId: string): string {
   return `${sessionId}/${documentId}/source.pdf`;
 }
 
-/** Retained so documents uploaded before PDF support can still be deleted. */
+/** Retain the original Word document alongside its rendered PDF. */
 export function sourceDocxKey(sessionId: string, documentId: string): string {
   return `${sessionId}/${documentId}/source.docx`;
 }

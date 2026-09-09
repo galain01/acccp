@@ -17,15 +17,15 @@ export default function ApplicationUsage(): React.JSX.Element {
         <DialogHeader>
           <DialogTitle>Usage</DialogTitle>
           <DialogDescription>
-            Convert PDFs into accessible Canvas content. For Word documents,
-            export a PDF before uploading.
+            Convert Word documents and PDFs into accessible Canvas content.
           </DialogDescription>
         </DialogHeader>
         <p className="font-medium">Follow the steps below to get started.</p>
         <ol className="list-inside list-decimal space-y-2 text-sm text-muted-foreground">
           <li>
-            Export your Word document as PDF, then drop the PDF onto the upload
-            area or click to browse. Each PDF can be up to 4 MB.
+            Drop your Word (.docx) document or PDF onto the upload area or click
+            to browse. Each file can be up to 4 MB. Word documents are converted
+            to PDF automatically.
           </li>
           <li>
             Click{" "}
