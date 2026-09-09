@@ -289,7 +289,8 @@ LiteLLM proxy; no local Word/LibreOffice service is required.
 
 ### Recovery point and preview deployment
 
-The tag `pre-pdf-2026-09-09` preserves the original `main` commit
+The local tag `pre-pdf-2026-09-09` and the GitHub branch
+`backup/pre-pdf-2026-09-09` preserve the original `main` commit
 `630088808268f78c53d2f35ef141301e86490b86`. Deploy the PDF branch to a Vercel
 Preview and test it before merging into the production branch. Preview needs
 the app's database, storage, model, and email environment variables, with
@@ -297,7 +298,7 @@ the app's database, storage, model, and email environment variables, with
 `EMAIL_PROVIDER=resend`; console OTP delivery is available only in development.
 
 If a code rollback is needed, redeploy the previous Vercel deployment or deploy
-the recovery tag. This does not roll back database state. The additive
+the GitHub backup branch. This does not roll back database state. The additive
 `source_pdf` enum value can remain when running the original Word-based code;
 PDF uploads created by the new code require the PDF-capable version to reconvert.
 The recovery tag also predates the security fixes in this branch.
