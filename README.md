@@ -190,6 +190,8 @@ following variables:
 ```bash
 # Database (Supabase Postgres connection string)
 DATABASE_URL=
+# Optional public CA certificate for verified TLS (PEM text, not a file path)
+DATABASE_SSL_CA=
 
 # Supabase (used for file storage)
 SUPABASE_URL=
@@ -214,6 +216,19 @@ Where to find each value:
   shared Supabase project dashboard, under **Project Settings → Data API**
   (`SUPABASE_URL`, service role key) and **Project Settings → Database**
   (connection string for `DATABASE_URL`; use the pooled connection string).
+- `DATABASE_SSL_CA` — the public CA certificate downloaded from Supabase's
+  **Database Settings → SSL Configuration**. For hosted database connections,
+  set `sslmode=verify-full` in `DATABASE_URL` and put the complete PEM text in
+  this variable. The app verifies the certificate and hostname; it never
+  disables verification when a CA is supplied. Actual line breaks and escaped
+  `\n` are accepted. This is a public certificate, not a private key. Without
+  this variable the app retains the connection string's TLS settings; the
+  Postgres.js default without an SSL setting is unencrypted. Restart local
+  development or redeploy after changing it.
+  This variable configures the app's Postgres.js client. Drizzle CLI migrations
+  use a separate client: for verified migration connections, save the public CA
+  to a local file and launch Node with `NODE_EXTRA_CA_CERTS` pointing to that
+  file and `DATABASE_URL` using `sslmode=verify-full`.
 - `BETTER_AUTH_SECRET` — any random secret string, e.g. generate one with
   `openssl rand -base64 32`. `BETTER_AUTH_URL` should match the URL the app
   is running on (`http://localhost:3000` for local dev).

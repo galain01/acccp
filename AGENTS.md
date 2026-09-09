@@ -23,6 +23,7 @@ accordion, badge, breadcrumb, button, card, dialog, dropdown-menu, field, input,
 ## Data layer
 
 - **Postgres via Supabase**, accessed with **Drizzle ORM** (`drizzle-orm/postgres-js`). Client setup: `lib/db.ts` (uses `prepare: false`, required by Supabase's transaction-mode pooler; caches the client on `globalThis` in dev to survive HMR). Schema: `lib/db/schema.ts`; relations: `lib/db/relations.ts`.
+- `lib/db/connection-options.ts` accepts optional `DATABASE_SSL_CA` (public PEM certificate, actual or escaped newlines). When set, the app uses `ssl: { ca, rejectUnauthorized: true }`, overriding URL SSL options and verifying the certificate/hostname. Without it, URL/driver TLS behavior is preserved; Postgres.js defaults to no TLS. Configure the hosted app with its Supabase CA and `sslmode=verify-full`. Restart/redeploy after changes. Drizzle CLI uses a separate driver and does not read this app-only variable; supply the public CA through Node's `NODE_EXTRA_CA_CERTS` at process startup for CLI migrations.
 - Core tables: `users`, `auth_sessions`, `accounts`, `verifications` (better-auth's tables, mapped — see below), `sessions`, `documents`, `conversion_jobs`, `artifacts`, `validation_findings`, `job_events`, `model_calls`. Plus several `pgView`s for admin summaries (`admin_finding_summary`, `admin_retention_summary`, `admin_job_status_summary`, `admin_daily_job_summary`, `user_session_file_overview`).
 - All tables have RLS enabled (`.enableRLS()`); app code goes through the Drizzle client with the app's own authorization checks (`verifyRoleOrRedirect` / `verifyRoleOrUnauthorized` in `lib/auth.ts`), not per-user Postgres roles.
 - **Sessions and documents are persisted** (no longer in-memory demo state). `contexts/session-context.tsx` (`SessionProvider`) treats the `sessions` prop from the dashboard layout as server state; every mutation (`createSession`, `renameSession`, `archiveSession` in `lib/actions/sessions.ts`) goes through a server action that revalidates the layout. Document actions live in `lib/actions/documents.ts` (`listDocuments`, `getDocumentHtml` — output HTML lives in storage, not a column, so it's fetched on demand; `deleteDocument` — tombstones via `deleted_at`, then best-effort blob cleanup).
@@ -69,6 +70,7 @@ All read via `process.env` (no `.env.example` in the repo — check `.env` again
 | Variable | Required | Used by | Notes |
 |---|---|---|---|
 | `DATABASE_URL` | Yes | `lib/db.ts`, `drizzle.config.ts` | Postgres connection string. Must point at Supabase's **transaction-mode pooler** (`prepare: false` is set to match). |
+| `DATABASE_SSL_CA` | For verified TLS with a private CA | `lib/db/connection-options.ts` | Public CA PEM text from Supabase SSL settings. Enables certificate and hostname verification for the app; never use a private key. See README for Drizzle CLI TLS setup. |
 | `BETTER_AUTH_SECRET` | Yes | better-auth (implicit) | Signs sessions/tokens. |
 | `BETTER_AUTH_URL` | Yes | better-auth (implicit) | Base URL better-auth issues callback/redirect links against, e.g. `http://localhost:3000` in dev. |
 | `LITELLM_BASE_URL` | Yes | `lib/litellm.ts` | e.g. `https://litellm.cloud.osu.edu`. |
