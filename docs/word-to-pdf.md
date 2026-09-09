@@ -85,18 +85,57 @@ findings, and timing). Reusing an output directory overwrites these files.
 PDF input is also accepted and bypasses the worker. These files may contain
 document content and should remain outside source control.
 
-## Deploy alongside Vercel
+## Deploy with Vercel Services
 
-Provision the same pinned image on a Linux container host. Put an HTTPS gateway
-in front of its private port, retain authentication and outbound restrictions,
-and permit only the required conversion route and health checks. The local
-Compose file is not a public hosting deployment. In Vercel, set:
+The included [vercel.json](../vercel.json) defines the Next.js `web` service
+and a private `renderer` container service. Select **Services** as the Vercel
+project's framework before deploying this configuration. Only `web` has a
+public rewrite. Its binding injects `GOTENBERG_URL` at runtime for the renderer
+in the same deployment; do not manually set that URL when using the binding.
+Vercel handles the internal HTTPS connection and certificate trust.
+[Services setup](https://vercel.com/docs/services),
+[Binding transport](https://vercel.com/changelog/secure-internal-communication-between-services).
 
-| Variable             | Purpose                                            |
-| -------------------- | -------------------------------------------------- |
-| `GOTENBERG_URL`      | The worker's HTTPS origin; no embedded credentials |
-| `GOTENBERG_USERNAME` | Worker Basic authentication username               |
-| `GOTENBERG_PASSWORD` | Worker password, stored as a Vercel Secret         |
+Set `GOTENBERG_USERNAME` and `GOTENBERG_PASSWORD` in each deployment environment
+alongside the existing app environment variables. The app and renderer use
+these credentials for Basic authentication. Keep the password in Vercel's
+secret settings. Preview deployments need their own complete configuration,
+including the correct `BETTER_AUTH_URL`.
+
+The [renderer image](../services/renderer/Dockerfile.vercel) pins Gotenberg by
+version and digest, runs as its non-root user, and serves Vercel's default
+port 80. Startup honors an injected `PORT`; no project-wide port override is
+needed for the documented default. Vercel builds the image and stores it in
+its Container Registry. Container Images and Services are beta features
+available on all plans. Compute, service requests, transfer, and image storage
+have their own usage accounting; this configuration does not promise free
+hosting. [Container deployment](https://vercel.com/docs/functions/container-images),
+[Services pricing](https://vercel.com/docs/services/pricing),
+[Registry pricing](https://vercel.com/docs/container-registry/limits-and-pricing).
+
+The startup script clears inherited environment variables before launching
+`tini`, Gotenberg, and LibreOffice. Only worker authentication, the selected
+port, and fixed nonsecret renderer settings remain. This prevents the document
+processor from inheriting the app's database, model, or email credentials.
+It fixes `LOG_LEVEL=error` to suppress denied-source-URL warnings, disables
+telemetry exports, downloads, and webhooks, and denies LibreOffice outbound
+URLs through Gotenberg's filter.
+
+That application filter is different from the local Compose worker's network
+isolation. Vercel does not document an equivalent deny-all egress setting for
+container services; Secure Compute and Static IPs are currently unsupported
+for custom containers. Do not describe the hosted worker as having no network
+egress. The local Compose worker retains its stronger isolated-network setup.
+[Container limitations](https://vercel.com/docs/functions/container-images#limits-and-pricing).
+
+### Alternative external worker
+
+A separately hosted Linux worker remains an option. Keep its port private
+behind an HTTPS gateway, require Basic authentication, and retain outbound
+restrictions. For that topology, use a normal Next.js deployment without the
+renderer service binding and set `GOTENBERG_URL` manually to the worker's HTTPS
+origin, together with the same two credential variables. The local Compose
+file alone is not a public hosting deployment.
 
 The app sends one DOCX as the `files` multipart field to
 `POST /forms/libreoffice/convert`, with Basic authentication in the HTTP header.
@@ -110,10 +149,10 @@ can render into a larger PDF; such output must be rejected before the model
 request. The worker's 5 MB body limit allows multipart overhead. Vercel's
 request payload limit remains 4.5 MB, and the existing app allows 300 seconds
 for the complete request. The renderer timeout uses part of that budget.
-Vercel now offers 5 GB large functions in beta; a separate worker is an
-operational choice that avoids bundling and supervising LibreOffice inside the
-Next.js function, rather than a claim that every Vercel function has a 250 MB
-limit. [Vercel limits](https://vercel.com/docs/functions/limitations).
+Vercel offers large functions up to 5 GB in beta; the historical 250 MB limit
+is not a universal deployment barrier. New projects are eligible by default;
+existing eligible projects can set `VERCEL_SUPPORT_LARGE_FUNCTIONS=1`.
+[Vercel limits](https://vercel.com/docs/functions/limitations).
 
 ## Document handling and fidelity
 

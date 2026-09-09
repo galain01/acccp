@@ -251,10 +251,12 @@ Where to find each value:
   `RESEND_API_KEY` (from the [Resend dashboard](https://resend.com)) and
   `EMAIL_FROM` (a verified sending address/domain).
 - `GOTENBERG_URL`, `GOTENBERG_USERNAME`, `GOTENBERG_PASSWORD` — needed for Word
-  conversion. The URL points to your separate renderer; hosted connections use
-  HTTPS and Basic authentication. Follow [Word renderer setup](docs/word-to-pdf.md)
-  for the local Docker worker and deployment requirements. PDF conversion works
-  without these variables.
+  conversion. The included Vercel Services configuration injects the URL through
+  a private binding; set only the two credential variables in each deployment
+  environment. Local or externally hosted workers need an explicit URL. Hosted
+  connections use HTTPS and Basic authentication. Follow
+  [Word renderer setup](docs/word-to-pdf.md) for Docker and Vercel configuration.
+  PDF conversion works without these variables.
 
 The full environment variable reference (which module reads each variable, and
 gotchas like the pooled-connection requirement) is in
@@ -310,8 +312,13 @@ The upload limit is 4 MB per file to leave room below Vercel's 4.5 MB multipart
 request limit. Larger uploads would require a separate direct-upload workflow.
 The conversion route uses the Node runtime and a 300-second function duration.
 
-Configure the separate [Word renderer](docs/word-to-pdf.md) before testing DOCX
-uploads on Vercel. Rendering has a 60-second timeout and rejects generated PDFs
+For the included [Word renderer](docs/word-to-pdf.md#deploy-with-vercel-services),
+set the Vercel project framework to **Services** and configure the renderer's
+two credentials alongside the app's existing variables in each deployment
+environment. The private binding supplies its URL automatically. The renderer
+clears unrelated app secrets before processing documents; its outbound URL
+filter is not equivalent to the local worker's network isolation. Rendering
+has a 60-second timeout and rejects generated PDFs
 over 4 MB before calling the model. New Word uploads preserve the original as
 `source.docx`, the generated PDF as `source.pdf`, and the HTML as `output.html`
 under the document's private storage directory. Metadata and checksum describe
