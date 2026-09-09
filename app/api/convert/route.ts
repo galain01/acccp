@@ -1,13 +1,13 @@
 /**
  * POST /api/convert
  *
- * Converts a .docx into accessible Canvas HTML and persists the document, the
+ * Converts a .pdf into accessible Canvas HTML and persists the document, the
  * conversion job, its artifacts, and its accessibility findings.
  *
  * Request:  multipart/form-data
  *   sessionId   string  — the session to file the document under (required)
- *   file        File    — the .docx (required unless documentId is given)
- *   documentId  string  — re-convert an existing document; its .docx is read
+ *   file        File    — the .pdf (required unless documentId is given)
+ *   documentId  string  — re-convert an existing PDF; its source is read
  *                         back from storage and no new document row is created
  *
  * Response: application/json
@@ -32,7 +32,13 @@ import { NextRequest, NextResponse } from "next/server";
 import { and, eq, isNull, sql } from "drizzle-orm";
 
 import { verifyRoleOrUnauthorized } from "@/lib/auth";
-import { convertDocx, type AccessibilityError } from "@/lib/convert";
+import { convertPdf, type AccessibilityError } from "@/lib/convert";
+import {
+  isPdfFilename,
+  MAX_FILE_SIZE_BYTES,
+  PDF_MIME_TYPE,
+  validatePdfInput,
+} from "@/lib/document-input";
 import { db } from "@/lib/db";
 import {
   artifacts,
@@ -44,14 +50,15 @@ import {
   validationFindings,
 } from "@/lib/db/schema";
 import {
-  DOCX_MIME_TYPE,
   downloadObject,
   htmlOutputKey,
-  sourceDocxKey,
+  sourcePdfKey,
   uploadObject,
 } from "@/lib/storage";
 
-const MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024; // 20 MB
+export const runtime = "nodejs";
+export const maxDuration = 300;
+
 const PROVIDER = "litellm";
 
 /** validation_findings.title is NOT NULL, but the pipeline only emits a type slug. */
@@ -75,7 +82,7 @@ function json(body: unknown, status: number) {
   return NextResponse.json(body, { status });
 }
 
-export async function POST(req: NextRequest) {
+async function convertRequest(req: NextRequest) {
   const authCheck = await verifyRoleOrUnauthorized(["instructor", "admin"]);
   if ("response" in authCheck) return authCheck.response;
   const userId = authCheck.session.user.id;
@@ -135,28 +142,44 @@ export async function POST(req: NextRequest) {
 
     documentId = existing.id;
     filename = existing.originalFilename;
-    try {
-      buffer = await downloadObject(sourceDocxKey(sessionId, documentId));
-    } catch (error) {
-      console.error(
-        `[api/convert] document=${documentId} source fetch failed`,
-        error
+    if (!isPdfFilename(filename)) {
+      return json(
+        {
+          error:
+            "This document was uploaded as a Word file. Export it from Word as a PDF and upload the PDF to convert it again. Its existing HTML remains available.",
+        },
+        415
       );
+    }
+    try {
+      buffer = await downloadObject(sourcePdfKey(sessionId, documentId));
+    } catch {
+      console.error(`[api/convert] document=${documentId} source fetch failed`);
       return json({ error: "Could not read the stored document." }, 500);
+    }
+    const inputError = validatePdfInput(buffer, filename);
+    if (inputError) {
+      return json(
+        { error: inputError },
+        buffer.byteLength > MAX_FILE_SIZE_BYTES ? 413 : 415
+      );
     }
   } else {
     const file = formData.get("file");
     if (!file || !(file instanceof File)) {
       return json(
         {
-          error: "No file provided. Include a .docx file as the 'file' field.",
+          error: "No file provided. Include a .pdf file as the 'file' field.",
         },
         400
       );
     }
-    if (!file.name.toLowerCase().endsWith(".docx")) {
+    if (!isPdfFilename(file.name)) {
       return json(
-        { error: "Invalid file type. Only .docx files are supported." },
+        {
+          error:
+            "Export your Word document as a PDF, then upload the .pdf file.",
+        },
         415
       );
     }
@@ -171,6 +194,8 @@ export async function POST(req: NextRequest) {
 
     filename = file.name;
     buffer = Buffer.from(await file.arrayBuffer());
+    const inputError = validatePdfInput(buffer, filename);
+    if (inputError) return json({ error: inputError }, 415);
 
     const [created] = await db
       .insert(documents)
@@ -178,6 +203,7 @@ export async function POST(req: NextRequest) {
         sessionId,
         uploadedByUserId: userId,
         originalFilename: filename,
+        mimeType: PDF_MIME_TYPE,
         fileSizeBytes: buffer.byteLength,
         checksumSha256: createHash("sha256").update(buffer).digest("hex"),
       })
@@ -187,16 +213,13 @@ export async function POST(req: NextRequest) {
     // The row is useless without its blob, so don't leave one behind.
     try {
       await uploadObject(
-        sourceDocxKey(sessionId, documentId),
+        sourcePdfKey(sessionId, documentId),
         buffer,
-        DOCX_MIME_TYPE
+        PDF_MIME_TYPE
       );
-    } catch (error) {
+    } catch {
       await db.delete(documents).where(eq(documents.id, documentId));
-      console.error(
-        `[api/convert] document=${documentId} upload failed`,
-        error
-      );
+      console.error(`[api/convert] document=${documentId} upload failed`);
       return json({ error: "Could not store the uploaded document." }, 500);
     }
   }
@@ -228,11 +251,11 @@ export async function POST(req: NextRequest) {
     .returning({ id: conversionJobs.id });
   const jobId = job.id;
 
-  console.log(`[api/convert] job=${jobId} user=${userId} file=${filename}`);
+  console.log(`[api/convert] job=${jobId} started`);
 
   // Deliberately outside a transaction: this is a multi-second model call and
   // would pin a pooled connection for its whole duration.
-  const result = await convertDocx(buffer, filename);
+  const result = await convertPdf(buffer, filename);
 
   if ("error" in result) {
     const failedAt = new Date().toISOString();
@@ -279,8 +302,8 @@ export async function POST(req: NextRequest) {
   const htmlKey = htmlOutputKey(sessionId, documentId);
   try {
     await uploadObject(htmlKey, result.html, "text/html; charset=utf-8");
-  } catch (error) {
-    console.error(`[api/convert] job=${jobId} html upload failed`, error);
+  } catch {
+    console.error(`[api/convert] job=${jobId} html upload failed`);
     return json({ error: "Could not store the converted document." }, 500);
   }
 
@@ -300,16 +323,16 @@ export async function POST(req: NextRequest) {
     // so a re-convert updates the existing row rather than inserting a second.
     for (const artifact of [
       {
-        artifactType: "source_docx" as const,
+        artifactType: "source_pdf" as const,
         filename,
-        mimeType: DOCX_MIME_TYPE,
-        storageKey: sourceDocxKey(sessionId, documentId),
+        mimeType: PDF_MIME_TYPE,
+        storageKey: sourcePdfKey(sessionId, documentId),
         fileSizeBytes: buffer.byteLength,
         previewSnippet: null,
       },
       {
         artifactType: "html_output" as const,
-        filename: filename.replace(/\.docx$/i, ".html"),
+        filename: filename.replace(/\.(?:pdf|docx)$/i, ".html"),
         mimeType: "text/html",
         storageKey: htmlKey,
         fileSizeBytes: Buffer.byteLength(result.html),
@@ -389,4 +412,18 @@ export async function POST(req: NextRequest) {
     tokensUsed: result.tokensUsed,
     extractionWarnings: result.extractionWarnings,
   });
+}
+
+export async function POST(req: NextRequest) {
+  try {
+    return await convertRequest(req);
+  } catch {
+    // Driver/storage exceptions may contain query parameters or credentials.
+    // Keep them out of both HTTP responses and the host's exception logs.
+    console.error("[api/convert] request failed unexpectedly");
+    return json(
+      { error: "Could not complete the conversion. Please try again." },
+      500
+    );
+  }
 }

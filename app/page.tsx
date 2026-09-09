@@ -111,8 +111,7 @@ export default function HomePage(): React.JSX.Element {
           Accessible Canvas Content Conversion Platform
         </h1>
         <p className="text-sm text-muted-foreground">
-          Easily convert your DOCX course content into accessible Canvas-ready
-          HTML.
+          Convert your PDF course content into accessible Canvas-ready HTML.
         </p>
       </header>
       {step === "email" ? (

@@ -84,7 +84,7 @@ describe("callLiteLLM", () => {
     expect(result.completionTokens).toBe(0);
   });
 
-  it("throws with the response body on a non-2xx response", async () => {
+  it("throws with the HTTP status on a non-2xx response", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(new Response("boom", { status: 500 }))

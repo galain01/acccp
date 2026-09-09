@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { deleteDocument } from "@/lib/actions/documents";
+import { isPdfFilename } from "@/lib/document-input";
 import type { UploadedDocument } from "@/lib/types/document";
 import { Button } from "./button";
 import DocumentTable from "./document-table";
@@ -24,7 +25,10 @@ export default function DocumentWorkspace({
     (doc) => doc.status === "processing" || doc.status === "queued"
   );
   const hasDocuments = documents.length > 0;
-  const canConvert = hasDocuments && !isProcessing;
+  const canConvert =
+    documents.some((doc) => !doc.locked && isPdfFilename(doc.name)) &&
+    !isProcessing;
+  const hasLegacyDocuments = documents.some((doc) => !isPdfFilename(doc.name));
 
   useEffect(() => {
     const controllers = abortControllersRef.current;
@@ -82,6 +86,7 @@ export default function DocumentWorkspace({
 
   const convertDocument = useCallback(
     async (doc: UploadedDocument) => {
+      if (!isPdfFilename(doc.name)) return;
       const form = new FormData();
       form.append("sessionId", sessionId);
 
@@ -145,7 +150,9 @@ export default function DocumentWorkspace({
   );
 
   const runConversion = useCallback(() => {
-    const targets = documents.filter((doc) => !doc.locked);
+    const targets = documents.filter(
+      (doc) => !doc.locked && isPdfFilename(doc.name)
+    );
     if (targets.length === 0) return;
 
     targets.forEach((doc) => {
@@ -170,7 +177,14 @@ export default function DocumentWorkspace({
         </Button>
         {!hasDocuments && (
           <p className="mt-2 text-sm text-muted-foreground">
-            Upload at least one document to enable conversion.
+            Upload at least one PDF to enable conversion.
+          </p>
+        )}
+        {hasLegacyDocuments && (
+          <p className="mt-2 text-sm text-muted-foreground">
+            Previous Word conversions remain available. To convert one again,
+            export it as PDF and upload the PDF. Only unlocked PDFs are
+            converted.
           </p>
         )}
         {hasDocuments && isProcessing && (

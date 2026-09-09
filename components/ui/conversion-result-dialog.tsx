@@ -92,7 +92,7 @@ export default function ConversionResultDialog({
     const url = URL.createObjectURL(blob);
     const anchor = window.document.createElement("a");
     anchor.href = url;
-    anchor.download = `${document.name.replace(/\.docx$/i, "")}.html`;
+    anchor.download = `${document.name.replace(/\.(?:pdf|docx)$/i, "")}.html`;
     anchor.click();
     URL.revokeObjectURL(url);
   };

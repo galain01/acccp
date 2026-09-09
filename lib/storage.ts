@@ -30,6 +30,11 @@ const storage = createClient(supabaseUrl, serviceRoleKey, {
 }).storage.from(DOCUMENTS_BUCKET);
 
 /** Object keys are grouped by session so a session's blobs can be swept together. */
+export function sourcePdfKey(sessionId: string, documentId: string): string {
+  return `${sessionId}/${documentId}/source.pdf`;
+}
+
+/** Retained so documents uploaded before PDF support can still be deleted. */
 export function sourceDocxKey(sessionId: string, documentId: string): string {
   return `${sessionId}/${documentId}/source.docx`;
 }

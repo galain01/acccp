@@ -18,6 +18,7 @@ import {
   htmlOutputKey,
   removeObjects,
   sourceDocxKey,
+  sourcePdfKey,
 } from "@/lib/storage";
 import type { UploadedDocument } from "@/lib/types/document";
 
@@ -156,10 +157,13 @@ export async function deleteDocument(documentId: string): Promise<void> {
   // not surface as a failed delete.
   try {
     await removeObjects([
+      sourcePdfKey(doc.sessionId, documentId),
       sourceDocxKey(doc.sessionId, documentId),
       htmlOutputKey(doc.sessionId, documentId),
     ]);
-  } catch (error) {
-    console.error(`[documents] blob cleanup failed for ${documentId}`, error);
+  } catch {
+    // A storage provider error can include request details; keep those out of
+    // deployment logs while retaining the event needed to retry cleanup.
+    console.error(`[documents] blob cleanup failed for ${documentId}`);
   }
 }
