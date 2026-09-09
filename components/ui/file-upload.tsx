@@ -3,7 +3,10 @@
 import { useRef, useState, type DragEvent } from "react";
 import { Upload } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { isPdfFilename, MAX_FILE_SIZE_BYTES } from "@/lib/document-input";
+import {
+  isSupportedDocumentFilename,
+  MAX_FILE_SIZE_BYTES,
+} from "@/lib/document-input";
 
 interface FileUploadProps {
   onFilesSelected: (files: File[]) => void;
@@ -23,7 +26,7 @@ export default function FileUpload({
 
     const accepted = Array.from(fileList).filter(
       (file) =>
-        isPdfFilename(file.name) &&
+        isSupportedDocumentFilename(file.name) &&
         file.size > 0 &&
         file.size <= MAX_FILE_SIZE_BYTES
     );
@@ -31,7 +34,7 @@ export default function FileUpload({
 
     if (rejected > 0) {
       setRejectHint(
-        "Upload a PDF up to 4 MB. Empty files are not supported. Export Word documents as PDF first."
+        "Upload a PDF or Word (.docx) file up to 4 MB. Empty files are not supported."
       );
       setTimeout(() => setRejectHint(null), 3000);
     }
@@ -82,15 +85,16 @@ export default function FileUpload({
       >
         <Upload className="size-8 text-muted-foreground" />
         <p className="text-sm font-medium">
-          Drop PDF files here or click to browse
+          Drop Word or PDF files here or click to browse
         </p>
         <p className="text-xs text-muted-foreground">
-          PDF files up to 4 MB. Export Word documents as PDF first.
+          Word (.docx) and PDF files up to 4 MB. Word files are converted
+          automatically.
         </p>
         <input
           ref={inputRef}
           type="file"
-          accept=".pdf,application/pdf"
+          accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
           multiple
           className="hidden"
           disabled={disabled}

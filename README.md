@@ -3,7 +3,7 @@
 ## Overview
 
 The Accessible Canvas Content Conversion Platform (dubbed "ACCCP" by the development team)
-is a centralized platform for OSU instructors to convert their PDF course content into accessible
+is a centralized platform for OSU instructors to convert their Word and PDF course content into accessible
 Canvas-ready HTML by leveraging state-of-the-art LLM AI models.
 
 This project was developed as part of a summer 2026 CSE 5911 capstone session
@@ -44,11 +44,11 @@ project's technical reference for humans.
    **sessions** (think folders/course contexts), listed in the sidebar. Sessions
    can be created, renamed, and archived; a default session is created
    automatically on first visit.
-2. Inside a session, upload one or more `.pdf` files (up to 4 MB each). Export Word
-   documents to PDF first; the app does not render Word documents on Vercel.
-3. Click **Convert**. Each unlocked document is sent through a two-stage AI
-   pipeline:
-   - **Stage 1 — conversion**: the original PDF is sent to the configured
+2. Inside a session, upload one or more `.docx` or `.pdf` files (up to 4 MB each).
+   Word uploads require the [Word rendering service](docs/word-to-pdf.md).
+3. Click **Convert**. Word documents are first rendered to PDF by the configured
+   service. Each unlocked document then enters the same two-stage AI pipeline:
+   - **Stage 1 — conversion**: the uploaded or rendered PDF is sent to the configured
      vision-capable model as a file, including text and page images. The model
      infers headings and reading order from content and appearance, preserves
      substantive text, and produces accessible Canvas HTML. Images remain
@@ -58,6 +58,9 @@ project's technical reference for humans.
      HTML and returns a structured list of accessibility findings (missing alt
      text, heading skips, non-descriptive links, table issues, etc.), each
      tagged with the WCAG criterion it violates.
+   Word conversions also include a manual-review notice: linked content can be
+   omitted and fonts or page layout can change during rendering. Compare the
+   rendered result with the original even when conversion succeeds.
 4. Click a converted document to open the **result dialog**: the pretty-printed
    HTML output, the accessibility findings, and buttons to copy the HTML or
    download it as an `.html` file — ready to paste into the Canvas RCE.
@@ -105,6 +108,7 @@ acccp/
 ├── hooks/                    # Shared React hooks (use-mobile)
 ├── lib/
 │   ├── convert.ts            # ★ The PDF → HTML conversion pipeline
+│   ├── word-to-pdf.ts        # DOCX → PDF renderer client
 │   ├── prompts/pdf-accessibility.ts  # Stage-1 system prompt (BUX/WCAG rules)
 │   ├── litellm.ts            # LiteLLM API client + pricing/cost helpers
 │   ├── auth.ts               # better-auth config + role-gate helpers
@@ -153,8 +157,10 @@ The following were used on the frontend to build the website:
 The following were used on the backend to build the API and database:
 
 - `Supabase`: The application's database (PostgreSQL) and file-storage
-  provider. Uploaded `.pdf` sources and generated HTML outputs live in a
-  private Supabase Storage bucket.
+  provider. Original documents, rendered PDFs, and generated HTML outputs live
+  in a private Supabase Storage bucket.
+- `Gotenberg / LibreOffice`: A separate worker renders Word uploads to PDF
+  before the existing AI pipeline. Direct PDF uploads need no worker.
 - `Drizzle ORM`: Type-safe database access and migration tooling
   (`drizzle-kit`).
 - `Better Auth`: The application's authentication provider. Instructors
@@ -244,6 +250,11 @@ Where to find each value:
   To send real email, set it to `resend` and add
   `RESEND_API_KEY` (from the [Resend dashboard](https://resend.com)) and
   `EMAIL_FROM` (a verified sending address/domain).
+- `GOTENBERG_URL`, `GOTENBERG_USERNAME`, `GOTENBERG_PASSWORD` — needed for Word
+  conversion. The URL points to your separate renderer; hosted connections use
+  HTTPS and Basic authentication. Follow [Word renderer setup](docs/word-to-pdf.md)
+  for the local Docker worker and deployment requirements. PDF conversion works
+  without these variables.
 
 The full environment variable reference (which module reads each variable, and
 gotchas like the pooled-connection requirement) is in
@@ -272,12 +283,13 @@ admin dashboard's recorded model calls. Unit tests mock the proxy, so passing
 tests do not establish live access to a model. Pricing continues to come from
 LiteLLM's `/model/info`; historical model-call records keep their saved costs.
 
-### Deploying the PDF input change
+### Deploying Word and PDF input
 
 Before deploying this branch, apply `drizzle/0007_source_pdf.sql` through your
 database migration workflow. It adds the `source_pdf` artifact type; the original
-`source_docx` type remains for existing documents. The application code cannot
-persist PDF artifacts until this migration has run.
+`source_docx` type remains for Word originals. The application code cannot
+persist PDF artifacts until this migration has run. Automatic Word rendering
+requires no additional database migration beyond this earlier PDF migration.
 
 For a local environment configured in `.env.local`, the migration command is:
 
@@ -290,17 +302,27 @@ Use the intended development or deployment database. The migration is included
 in the branch; it is not automatically applied by a Vercel build.
 
 If the Supabase `documents` bucket restricts allowed MIME types, include
-`application/pdf` in its allowlist. Keep the bucket private.
+`application/pdf` and
+`application/vnd.openxmlformats-officedocument.wordprocessingml.document`
+in its allowlist. Keep the bucket private.
 
 The upload limit is 4 MB per file to leave room below Vercel's 4.5 MB multipart
 request limit. Larger uploads would require a separate direct-upload workflow.
 The conversion route uses the Node runtime and a 300-second function duration.
 
-Previously converted Word documents keep their saved HTML and can be deleted.
-To convert one again, export the original from Word as a PDF and upload it as a
-new document. Changing a filename extension from .docx to .pdf does not convert
-the file. Exported PDF text and page images are sent directly to the configured
-LiteLLM proxy; no local Word/LibreOffice service is required.
+Configure the separate [Word renderer](docs/word-to-pdf.md) before testing DOCX
+uploads on Vercel. Rendering has a 60-second timeout and rejects generated PDFs
+over 4 MB before calling the model. New Word uploads preserve the original as
+`source.docx`, the generated PDF as `source.pdf`, and the HTML as `output.html`
+under the document's private storage directory. Metadata and checksum describe
+the original Word upload; artifacts record both source formats.
+
+Previously saved DOCX documents can be converted again from their stored
+originals. Reconversion renders a fresh PDF and updates the output, keeping the
+original Word source; a model failure leaves the prior stored PDF intact.
+If the renderer is unavailable, users can still export
+Word documents to PDF and upload them directly. Changing a filename extension
+does not convert a file.
 
 ### Recovery point and preview deployment
 
@@ -319,8 +341,9 @@ PDF uploads created by the new code require the PDF-capable version to reconvert
 The recovery tag also predates the security fixes in this branch.
 
 Secrets belong in ignored `.env` files or Vercel environment settings. Source
-documents and generated test outputs must not be committed. Conversion sends
-the source PDF to the configured LiteLLM provider, and production errors omit
+documents and generated test outputs must not be committed. Word conversion
+sends the DOCX to the configured renderer; the resulting or directly uploaded
+PDF is sent to the configured LiteLLM provider. Production errors omit
 provider response bodies and sign-in codes. The app displays generated HTML as
 text; review downloaded HTML before opening it as a standalone page or
 publishing it in Canvas.
@@ -391,6 +414,11 @@ confirms connection/model access; use `convert:local` with a sample document
 to inspect conversion quality. That command prints HTML and findings in the
 terminal and also runs without a database. Both commands incur model usage.
 Neither writes to the application's database or storage.
+
+For the complete Word → PDF → HTML path, `npm run convert:document` saves the
+rendered PDF, HTML, and findings locally without using the app database or
+storage. It also supports `--render-only` to inspect the PDF before any model
+request. See [CLI testing instructions](docs/word-to-pdf.md#test-without-the-app-database).
 
 To use the full browser app, also configure `DATABASE_URL`, `SUPABASE_URL`,
 `SUPABASE_SERVICE_ROLE_KEY`, and `BETTER_AUTH_SECRET` in `.env.local`, set
