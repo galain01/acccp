@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { deleteDocument } from "@/lib/actions/documents";
+import { isSupportedDocumentFilename } from "@/lib/document-input";
 import type { UploadedDocument } from "@/lib/types/document";
 import { Button } from "./button";
 import DocumentTable from "./document-table";
@@ -24,7 +25,13 @@ export default function DocumentWorkspace({
     (doc) => doc.status === "processing" || doc.status === "queued"
   );
   const hasDocuments = documents.length > 0;
-  const canConvert = hasDocuments && !isProcessing;
+  const canConvert =
+    documents.some(
+      (doc) => !doc.locked && isSupportedDocumentFilename(doc.name)
+    ) && !isProcessing;
+  const hasUnsupportedDocuments = documents.some(
+    (doc) => !isSupportedDocumentFilename(doc.name)
+  );
 
   useEffect(() => {
     const controllers = abortControllersRef.current;
@@ -82,6 +89,7 @@ export default function DocumentWorkspace({
 
   const convertDocument = useCallback(
     async (doc: UploadedDocument) => {
+      if (!isSupportedDocumentFilename(doc.name)) return;
       const form = new FormData();
       form.append("sessionId", sessionId);
 
@@ -145,7 +153,9 @@ export default function DocumentWorkspace({
   );
 
   const runConversion = useCallback(() => {
-    const targets = documents.filter((doc) => !doc.locked);
+    const targets = documents.filter(
+      (doc) => !doc.locked && isSupportedDocumentFilename(doc.name)
+    );
     if (targets.length === 0) return;
 
     targets.forEach((doc) => {
@@ -170,12 +180,20 @@ export default function DocumentWorkspace({
         </Button>
         {!hasDocuments && (
           <p className="mt-2 text-sm text-muted-foreground">
-            Upload at least one document to enable conversion.
+            Upload at least one Word document or PDF to enable conversion.
+          </p>
+        )}
+        {hasUnsupportedDocuments && (
+          <p className="mt-2 text-sm text-muted-foreground">
+            Previous conversions remain available. Only unlocked PDF and .docx
+            documents are converted. Save older .doc files as .docx before
+            uploading.
           </p>
         )}
         {hasDocuments && isProcessing && (
           <p className="mt-2 text-sm text-muted-foreground">
-            Conversion in progress…
+            Conversion in progress… Word files are prepared as PDFs
+            automatically.
           </p>
         )}
       </section>

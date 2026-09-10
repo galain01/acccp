@@ -26,6 +26,7 @@ export const artifactStatus = pgEnum("artifact_status", [
 ]);
 export const artifactType = pgEnum("artifact_type", [
   "source_docx",
+  "source_pdf",
   "extracted_text",
   "html_output",
   "validation_report",

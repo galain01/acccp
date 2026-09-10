@@ -23,7 +23,7 @@ export interface UploadedDocument {
   errors?: AccessibilityError[];
   /**
    * The picked file, held only until the server has stored it. Documents loaded
-   * from the database have none — their .docx is re-read from storage instead.
+   * from the database have none — their source PDF is re-read from storage instead.
    */
   file?: File;
 }

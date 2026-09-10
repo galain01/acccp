@@ -1,0 +1,1 @@
+ALTER TYPE "public"."artifact_type" ADD VALUE 'source_pdf' BEFORE 'extracted_text';

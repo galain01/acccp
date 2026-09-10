@@ -126,6 +126,7 @@ describe("Schema integrity — enums", () => {
     expect(artifactType.enumValues).toEqual(
       expect.arrayContaining([
         "source_docx",
+        "source_pdf",
         "extracted_text",
         "html_output",
         "validation_report",

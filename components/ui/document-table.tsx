@@ -104,8 +104,8 @@ export default function DocumentTable({
         </CardHeader>
         <CardContent>
           <p className="text-sm text-muted-foreground">
-            Drag .docx files onto the dropzone above or click to browse, then
-            click{" "}
+            Drag Word or PDF files onto the upload area above or click to
+            browse, then click{" "}
             <strong className="font-medium text-foreground">Convert</strong> to
             start the conversion process.
           </p>

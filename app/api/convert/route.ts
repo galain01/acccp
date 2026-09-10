@@ -1,13 +1,13 @@
 /**
  * POST /api/convert
  *
- * Converts a .docx into accessible Canvas HTML and persists the document, the
+ * Converts a .pdf or .docx into accessible Canvas HTML and persists the document, the
  * conversion job, its artifacts, and its accessibility findings.
  *
  * Request:  multipart/form-data
  *   sessionId   string  — the session to file the document under (required)
- *   file        File    — the .docx (required unless documentId is given)
- *   documentId  string  — re-convert an existing document; its .docx is read
+ *   file        File    — the .pdf or .docx (required unless documentId is given)
+ *   documentId  string  — re-convert an existing document; its source is read
  *                         back from storage and no new document row is created
  *
  * Response: application/json
@@ -32,7 +32,21 @@ import { NextRequest, NextResponse } from "next/server";
 import { and, eq, isNull, sql } from "drizzle-orm";
 
 import { verifyRoleOrUnauthorized } from "@/lib/auth";
-import { convertDocx, type AccessibilityError } from "@/lib/convert";
+import {
+  convertPdf,
+  type AccessibilityError,
+  type ModelCallUsage,
+} from "@/lib/convert";
+import {
+  DOCX_MIME_TYPE,
+  isDocxFilename,
+  isSupportedDocumentFilename,
+  MAX_FILE_SIZE_BYTES,
+  PDF_MIME_TYPE,
+  validateDocumentInput,
+} from "@/lib/document-input";
+import { renderWordToPdf, WordToPdfError } from "@/lib/word-to-pdf";
+import { withWordRenderingReview } from "@/lib/word-rendering-review";
 import { db } from "@/lib/db";
 import {
   artifacts,
@@ -44,14 +58,17 @@ import {
   validationFindings,
 } from "@/lib/db/schema";
 import {
-  DOCX_MIME_TYPE,
   downloadObject,
   htmlOutputKey,
+  removeObjects,
   sourceDocxKey,
+  sourcePdfKey,
   uploadObject,
 } from "@/lib/storage";
 
-const MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024; // 20 MB
+export const runtime = "nodejs";
+export const maxDuration = 300;
+
 const PROVIDER = "litellm";
 
 /** validation_findings.title is NOT NULL, but the pipeline only emits a type slug. */
@@ -75,7 +92,48 @@ function json(body: unknown, status: number) {
   return NextResponse.json(body, { status });
 }
 
-export async function POST(req: NextRequest) {
+async function recordJobFailure(
+  jobId: string,
+  code: string,
+  message: string,
+  calls: ModelCallUsage[] = [],
+  detail?: string
+) {
+  const failedAt = new Date().toISOString();
+  await db.transaction(async (tx) => {
+    await tx
+      .update(conversionJobs)
+      .set({
+        status: "failed",
+        completedAt: failedAt,
+        updatedAt: failedAt,
+        errorCode: code,
+        errorMessage: message,
+      })
+      .where(eq(conversionJobs.id, jobId));
+    await tx.insert(jobEvents).values({
+      jobId,
+      eventType: code,
+      message,
+      metadata: { detail: detail ?? null },
+    });
+    // Model work remains billable when conversion or output storage fails.
+    if (calls.length > 0) {
+      await tx.insert(modelCalls).values(
+        calls.map((call) => ({
+          jobId,
+          stage: call.stage,
+          model: call.model,
+          promptTokens: call.promptTokens,
+          completionTokens: call.completionTokens,
+          costUsd: call.costUsd !== null ? String(call.costUsd) : null,
+        }))
+      );
+    }
+  });
+}
+
+async function convertRequest(req: NextRequest) {
   const authCheck = await verifyRoleOrUnauthorized(["instructor", "admin"]);
   if ("response" in authCheck) return authCheck.response;
   const userId = authCheck.session.user.id;
@@ -114,7 +172,7 @@ export async function POST(req: NextRequest) {
 
   let documentId: string;
   let filename: string;
-  let buffer: Buffer;
+  let sourceBuffer: Buffer;
 
   if (isReconversion) {
     // Scoped to the session we just proved the caller owns.
@@ -135,28 +193,48 @@ export async function POST(req: NextRequest) {
 
     documentId = existing.id;
     filename = existing.originalFilename;
-    try {
-      buffer = await downloadObject(sourceDocxKey(sessionId, documentId));
-    } catch (error) {
-      console.error(
-        `[api/convert] document=${documentId} source fetch failed`,
-        error
+    if (!isSupportedDocumentFilename(filename)) {
+      return json(
+        {
+          error:
+            "This document format cannot be converted. Upload a PDF or Word (.docx) file.",
+        },
+        415
       );
+    }
+    try {
+      sourceBuffer = await downloadObject(
+        isDocxFilename(filename)
+          ? sourceDocxKey(sessionId, documentId)
+          : sourcePdfKey(sessionId, documentId)
+      );
+    } catch {
+      console.error(`[api/convert] document=${documentId} source fetch failed`);
       return json({ error: "Could not read the stored document." }, 500);
+    }
+    const inputError = validateDocumentInput(sourceBuffer, filename);
+    if (inputError) {
+      return json(
+        { error: inputError },
+        sourceBuffer.byteLength > MAX_FILE_SIZE_BYTES ? 413 : 415
+      );
     }
   } else {
     const file = formData.get("file");
     if (!file || !(file instanceof File)) {
       return json(
         {
-          error: "No file provided. Include a .docx file as the 'file' field.",
+          error: "No file provided. Include a PDF or Word (.docx) file.",
         },
         400
       );
     }
-    if (!file.name.toLowerCase().endsWith(".docx")) {
+    if (!isSupportedDocumentFilename(file.name)) {
       return json(
-        { error: "Invalid file type. Only .docx files are supported." },
+        {
+          error:
+            "Upload a PDF or Word (.docx) file. Older .doc files must be saved as .docx first.",
+        },
         415
       );
     }
@@ -170,33 +248,57 @@ export async function POST(req: NextRequest) {
     }
 
     filename = file.name;
-    buffer = Buffer.from(await file.arrayBuffer());
+    sourceBuffer = Buffer.from(await file.arrayBuffer());
+    const inputError = validateDocumentInput(sourceBuffer, filename);
+    if (inputError) return json({ error: inputError }, 415);
 
+    // Render before creating rows: a rejected Word file leaves no empty document.
+    // PDFs use the existing path without contacting the Word renderer.
+    documentId = "";
+  }
+
+  const isWord = isDocxFilename(filename);
+  const pdfFilename = isWord ? filename.replace(/\.docx$/i, ".pdf") : filename;
+  const buffer = isWord
+    ? await renderWordToPdf(sourceBuffer, filename)
+    : sourceBuffer;
+  const sourceMimeType = isWord ? DOCX_MIME_TYPE : PDF_MIME_TYPE;
+
+  if (!isReconversion) {
     const [created] = await db
       .insert(documents)
       .values({
         sessionId,
         uploadedByUserId: userId,
         originalFilename: filename,
-        fileSizeBytes: buffer.byteLength,
-        checksumSha256: createHash("sha256").update(buffer).digest("hex"),
+        mimeType: sourceMimeType,
+        fileSizeBytes: sourceBuffer.byteLength,
+        checksumSha256: createHash("sha256").update(sourceBuffer).digest("hex"),
       })
       .returning({ id: documents.id });
     documentId = created.id;
 
-    // The row is useless without its blob, so don't leave one behind.
+    const sourceKey = isWord
+      ? sourceDocxKey(sessionId, documentId)
+      : sourcePdfKey(sessionId, documentId);
+    // The row is useless without its source, so don't leave one behind.
     try {
-      await uploadObject(
-        sourceDocxKey(sessionId, documentId),
-        buffer,
-        DOCX_MIME_TYPE
-      );
-    } catch (error) {
+      await uploadObject(sourceKey, sourceBuffer, sourceMimeType);
+      if (isWord) {
+        await uploadObject(
+          sourcePdfKey(sessionId, documentId),
+          buffer,
+          PDF_MIME_TYPE
+        );
+      }
+    } catch {
       await db.delete(documents).where(eq(documents.id, documentId));
-      console.error(
-        `[api/convert] document=${documentId} upload failed`,
-        error
-      );
+      try {
+        await removeObjects([sourceKey, sourcePdfKey(sessionId, documentId)]);
+      } catch {
+        console.error("[api/convert] incomplete source cleanup failed");
+      }
+      console.error(`[api/convert] document=${documentId} upload failed`);
       return json({ error: "Could not store the uploaded document." }, 500);
     }
   }
@@ -228,46 +330,20 @@ export async function POST(req: NextRequest) {
     .returning({ id: conversionJobs.id });
   const jobId = job.id;
 
-  console.log(`[api/convert] job=${jobId} user=${userId} file=${filename}`);
+  console.log(`[api/convert] job=${jobId} started`);
 
   // Deliberately outside a transaction: this is a multi-second model call and
   // would pin a pooled connection for its whole duration.
-  const result = await convertDocx(buffer, filename);
+  let result = await convertPdf(buffer, pdfFilename);
 
   if ("error" in result) {
-    const failedAt = new Date().toISOString();
-    await db.transaction(async (tx) => {
-      await tx
-        .update(conversionJobs)
-        .set({
-          status: "failed",
-          completedAt: failedAt,
-          updatedAt: failedAt,
-          errorCode: "conversion_failed",
-          errorMessage: result.error,
-        })
-        .where(eq(conversionJobs.id, jobId));
-      await tx.insert(jobEvents).values({
-        jobId,
-        eventType: "conversion_failed",
-        message: result.error,
-        metadata: { detail: result.detail ?? null },
-      });
-      // Usage incurred before the failure (e.g. stage 1 succeeded, stage 2
-      // threw) is still billable, so it's still recorded.
-      if (result.calls && result.calls.length > 0) {
-        await tx.insert(modelCalls).values(
-          result.calls.map((call) => ({
-            jobId,
-            stage: call.stage,
-            model: call.model,
-            promptTokens: call.promptTokens,
-            completionTokens: call.completionTokens,
-            costUsd: call.costUsd !== null ? String(call.costUsd) : null,
-          }))
-        );
-      }
-    });
+    await recordJobFailure(
+      jobId,
+      "conversion_failed",
+      result.error,
+      result.calls,
+      result.detail
+    );
 
     console.error(`[api/convert] job=${jobId} failed: ${result.error}`);
     return json(
@@ -276,12 +352,30 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  if (isWord) result = withWordRenderingReview(result);
+
   const htmlKey = htmlOutputKey(sessionId, documentId);
   try {
+    if (isReconversion && isWord) {
+      // A failed model attempt must not replace the PDF paired with the last
+      // saved HTML and artifact metadata. Persist this render only on success.
+      await uploadObject(
+        sourcePdfKey(sessionId, documentId),
+        buffer,
+        PDF_MIME_TYPE
+      );
+    }
     await uploadObject(htmlKey, result.html, "text/html; charset=utf-8");
-  } catch (error) {
-    console.error(`[api/convert] job=${jobId} html upload failed`, error);
-    return json({ error: "Could not store the converted document." }, 500);
+  } catch {
+    const message = "Could not store the converted document. Please try again.";
+    await recordJobFailure(
+      jobId,
+      "output_storage_failed",
+      message,
+      result.calls
+    );
+    console.error(`[api/convert] job=${jobId} output upload failed`);
+    return json({ error: message, jobId, documentId }, 500);
   }
 
   const completedAt = new Date().toISOString();
@@ -299,17 +393,29 @@ export async function POST(req: NextRequest) {
     // uq_available_artifact_per_job_type allows one available artifact per type,
     // so a re-convert updates the existing row rather than inserting a second.
     for (const artifact of [
+      ...(isWord
+        ? [
+            {
+              artifactType: "source_docx" as const,
+              filename,
+              mimeType: DOCX_MIME_TYPE,
+              storageKey: sourceDocxKey(sessionId, documentId),
+              fileSizeBytes: sourceBuffer.byteLength,
+              previewSnippet: null,
+            },
+          ]
+        : []),
       {
-        artifactType: "source_docx" as const,
-        filename,
-        mimeType: DOCX_MIME_TYPE,
-        storageKey: sourceDocxKey(sessionId, documentId),
+        artifactType: "source_pdf" as const,
+        filename: pdfFilename,
+        mimeType: PDF_MIME_TYPE,
+        storageKey: sourcePdfKey(sessionId, documentId),
         fileSizeBytes: buffer.byteLength,
         previewSnippet: null,
       },
       {
         artifactType: "html_output" as const,
-        filename: filename.replace(/\.docx$/i, ".html"),
+        filename: filename.replace(/\.(?:pdf|docx)$/i, ".html"),
         mimeType: "text/html",
         storageKey: htmlKey,
         fileSizeBytes: Buffer.byteLength(result.html),
@@ -389,4 +495,21 @@ export async function POST(req: NextRequest) {
     tokensUsed: result.tokensUsed,
     extractionWarnings: result.extractionWarnings,
   });
+}
+
+export async function POST(req: NextRequest) {
+  try {
+    return await convertRequest(req);
+  } catch (error) {
+    if (error instanceof WordToPdfError) {
+      return json({ error: error.message }, error.status);
+    }
+    // Driver/storage exceptions may contain query parameters or credentials.
+    // Keep them out of both HTTP responses and the host's exception logs.
+    console.error("[api/convert] request failed unexpectedly");
+    return json(
+      { error: "Could not complete the conversion. Please try again." },
+      500
+    );
+  }
 }

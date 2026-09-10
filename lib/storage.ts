@@ -22,14 +22,18 @@ if (!serviceRoleKey)
 
 export const DOCUMENTS_BUCKET = "documents";
 
-export const DOCX_MIME_TYPE =
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+export { DOCX_MIME_TYPE } from "./document-input";
 
 const storage = createClient(supabaseUrl, serviceRoleKey, {
   auth: { persistSession: false, autoRefreshToken: false },
 }).storage.from(DOCUMENTS_BUCKET);
 
 /** Object keys are grouped by session so a session's blobs can be swept together. */
+export function sourcePdfKey(sessionId: string, documentId: string): string {
+  return `${sessionId}/${documentId}/source.pdf`;
+}
+
+/** Retain the original Word document alongside its rendered PDF. */
 export function sourceDocxKey(sessionId: string, documentId: string): string {
   return `${sessionId}/${documentId}/source.docx`;
 }

@@ -3,18 +3,14 @@
 import { useRef, useState, type DragEvent } from "react";
 import { Upload } from "lucide-react";
 import { cn } from "@/lib/utils";
+import {
+  isSupportedDocumentFilename,
+  MAX_FILE_SIZE_BYTES,
+} from "@/lib/document-input";
 
 interface FileUploadProps {
   onFilesSelected: (files: File[]) => void;
   disabled?: boolean;
-}
-
-function isDocxFile(file: File): boolean {
-  return (
-    file.name.toLowerCase().endsWith(".docx") ||
-    file.type ===
-      "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-  );
 }
 
 export default function FileUpload({
@@ -28,11 +24,18 @@ export default function FileUpload({
   const handleFiles = (fileList: FileList | null) => {
     if (!fileList || disabled) return;
 
-    const accepted = Array.from(fileList).filter(isDocxFile);
+    const accepted = Array.from(fileList).filter(
+      (file) =>
+        isSupportedDocumentFilename(file.name) &&
+        file.size > 0 &&
+        file.size <= MAX_FILE_SIZE_BYTES
+    );
     const rejected = fileList.length - accepted.length;
 
     if (rejected > 0) {
-      setRejectHint("Only .docx files are supported.");
+      setRejectHint(
+        "Upload a PDF or Word (.docx) file up to 4 MB. Empty files are not supported."
+      );
       setTimeout(() => setRejectHint(null), 3000);
     }
 
@@ -82,15 +85,16 @@ export default function FileUpload({
       >
         <Upload className="size-8 text-muted-foreground" />
         <p className="text-sm font-medium">
-          Drop .docx files here or click to browse
+          Drop Word or PDF files here or click to browse
         </p>
         <p className="text-xs text-muted-foreground">
-          Microsoft Word documents only
+          Word (.docx) and PDF files up to 4 MB. Word files are converted
+          automatically.
         </p>
         <input
           ref={inputRef}
           type="file"
-          accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+          accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
           multiple
           className="hidden"
           disabled={disabled}
@@ -100,7 +104,11 @@ export default function FileUpload({
           }}
         />
       </div>
-      {rejectHint && <p className="text-sm text-destructive">{rejectHint}</p>}
+      {rejectHint && (
+        <p role="status" className="text-sm text-destructive">
+          {rejectHint}
+        </p>
+      )}
     </div>
   );
 }

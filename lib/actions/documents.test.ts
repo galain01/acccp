@@ -20,6 +20,11 @@ vi.mock("@/lib/storage", () => ({
   downloadObject: vi.fn(),
   removeObjects: vi.fn(),
   // Produce real-looking keys so the removeObjects assertion is meaningful.
+  sourcePdfKey: vi
+    .fn()
+    .mockImplementation(
+      (sessionId: string, docId: string) => `${sessionId}/${docId}/source.pdf`
+    ),
   sourceDocxKey: vi
     .fn()
     .mockImplementation(
@@ -61,10 +66,9 @@ function makeChain<T>(value: T) {
   chain.values = selfFn();
   chain.set = selfFn();
   chain.returning = vi.fn().mockResolvedValue(value);
-  (chain as { then: Function }).then = (resolve: Function, reject: Function) =>
-    Promise.resolve(value).then(resolve as never, reject as never);
-  (chain as { catch: Function }).catch = (fn: Function) =>
-    Promise.resolve(value).catch(fn as never);
+  const promise = Promise.resolve(value);
+  chain.then = promise.then.bind(promise);
+  chain.catch = promise.catch.bind(promise);
 
   // Duck-types Drizzle's query builders: `any` satisfies mockReturnValue's
   // builder types while keeping property access for assertions.
@@ -235,7 +239,7 @@ describe("getDocumentHtml", () => {
 describe("deleteDocument", () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it("soft-deletes the document row and removes both blobs", async () => {
+  it("soft-deletes the document row and cleans PDF, legacy Word, and HTML blobs", async () => {
     vi.mocked(db.select).mockReturnValue(
       makeChain([{ id: "doc-1", sessionId: "session-1" }])
     );
@@ -246,6 +250,7 @@ describe("deleteDocument", () => {
 
     expect(db.update).toHaveBeenCalled();
     expect(removeObjects).toHaveBeenCalledWith([
+      "session-1/doc-1/source.pdf",
       "session-1/doc-1/source.docx",
       "session-1/doc-1/output.html",
     ]);
@@ -293,5 +298,25 @@ describe("deleteDocument", () => {
     await deleteDocument("other-users-doc");
 
     expect(removeObjects).not.toHaveBeenCalled();
+  });
+
+  it("does not log private provider details when cleanup fails", async () => {
+    vi.mocked(db.select).mockReturnValue(
+      makeChain([{ id: "doc-1", sessionId: "session-1" }])
+    );
+    vi.mocked(db.update).mockReturnValue(makeChain(undefined));
+    vi.mocked(removeObjects).mockRejectedValue(
+      new Error("Authorization: test-service-role-key; private PDF contents")
+    );
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await deleteDocument("doc-1");
+      expect(log).toHaveBeenCalledWith(
+        "[documents] blob cleanup failed for doc-1"
+      );
+      expect(log).toHaveBeenCalledTimes(1);
+    } finally {
+      log.mockRestore();
+    }
   });
 });

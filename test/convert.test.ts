@@ -1,17 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import type { AccessibilityError } from "@/lib/convert";
 import type { LiteLLMConfig } from "@/lib/litellm";
-
-const convertToHtmlMock = vi
-  .fn()
-  .mockResolvedValue({ value: "<p>Hello world</p>", messages: [] });
-
-vi.mock("mammoth", () => ({
-  default: {
-    convertToHtml: convertToHtmlMock,
-    images: { imgElement: vi.fn(() => vi.fn()) },
-  },
-}));
 
 // Defaults to the real formatter so most tests exercise actual pretty-printing;
 // individual tests can override with mockRejectedValueOnce/mockImplementationOnce.
@@ -45,56 +35,97 @@ const TEST_CONFIG: LiteLLMConfig = {
   model: "test-model",
 };
 
+const PDF_BYTES = Buffer.from("%PDF-1.7\nmock pdf bytes\n%%EOF");
+
+const VALID_FINDING: AccessibilityError = {
+  type: "missing-alt",
+  severity: "error",
+  message: "The diagram is missing alternate text.",
+  suggestion: "Add alternate text describing the diagram.",
+};
+
 // Imported after the mocks above so convert.ts picks up the mocked module.
-const { convertDocx, validateWithAI } = await import("../lib/convert");
+const { convertPdf, validateWithAI } = await import("../lib/convert");
+const { LiteLLMError } = await import("../lib/litellm");
 
 describe("validateWithAI", () => {
   beforeEach(() => {
     callLiteLLMMock.mockReset();
   });
 
-  it("returns the parsed errors array on valid JSON", async () => {
-    callLiteLLMMock.mockResolvedValueOnce({
-      content:
-        '[{"type":"missing-alt","severity":"error","message":"m","suggestion":"s"}]',
+  it("preserves supported finding types, severities, and optional strings", async () => {
+    const types: AccessibilityError["type"][] = [
+      "missing-alt",
+      "heading-skip",
+      "bad-link",
+      "no-table-caption",
+      "no-table-headers",
+      "missing-list-markup",
+      "empty-heading",
+      "color-only-meaning",
+      "h1-present",
+      "non-descriptive-link",
+      "missing-image",
+      "missing-link",
+      "other",
+    ];
+    const findings: AccessibilityError[] = types.map((type, index) => ({
+      ...VALID_FINDING,
+      type,
+      severity: index % 2 === 0 ? "error" : "warning",
+      ...(index === 0
+        ? { element: '<img src="diagram.png">', wcag: "WCAG 1.1.1" }
+        : {}),
+    }));
+    const response = {
+      content: JSON.stringify(findings),
       model: "test-model",
       promptTokens: 10,
       completionTokens: 5,
-    });
+    };
+    callLiteLLMMock.mockResolvedValueOnce(response);
 
     const { errors, call } = await validateWithAI("<p>html</p>", TEST_CONFIG);
 
-    expect(errors).toEqual([
-      { type: "missing-alt", severity: "error", message: "m", suggestion: "s" },
-    ]);
-    expect(call).toEqual({
-      content: expect.any(String),
-      model: "test-model",
-      promptTokens: 10,
-      completionTokens: 5,
-    });
+    expect(errors).toEqual(findings);
+    expect(call).toEqual(response);
   });
 
-  it("falls back to a single warning when the AI returns malformed JSON", async () => {
+  it.each([
+    ["malformed JSON", "not valid json"],
+    ["an object", '{"not":"an array"}'],
+    ["null", "null"],
+    ["a string", '"no issues"'],
+    ["a number", "0"],
+    ["a boolean", "false"],
+  ])(
+    "warns and retains usage when the audit returns %s",
+    async (_, content) => {
+      const response = {
+        content,
+        model: "test-model",
+        promptTokens: 8,
+        completionTokens: 2,
+      };
+      callLiteLLMMock.mockResolvedValueOnce(response);
+
+      const { errors, call } = await validateWithAI("<p>html</p>", TEST_CONFIG);
+
+      expect(errors).toEqual([
+        expect.objectContaining({
+          type: "other",
+          severity: "warning",
+          message: expect.any(String),
+          suggestion: expect.stringMatching(/review.*manually/i),
+        }),
+      ]);
+      expect(call).toEqual(response);
+    }
+  );
+
+  it("accepts an empty findings array as a completed audit with no issues", async () => {
     callLiteLLMMock.mockResolvedValueOnce({
-      content: "not valid json",
-      model: "test-model",
-      promptTokens: 8,
-      completionTokens: 2,
-    });
-
-    const { errors, call } = await validateWithAI("<p>html</p>", TEST_CONFIG);
-
-    expect(errors).toHaveLength(1);
-    expect(errors[0]).toMatchObject({ type: "other", severity: "warning" });
-    // Usage is still counted even though the response was unusable.
-    expect(call.promptTokens).toBe(8);
-    expect(call.completionTokens).toBe(2);
-  });
-
-  it("treats a non-array JSON value as no errors", async () => {
-    callLiteLLMMock.mockResolvedValueOnce({
-      content: '{"not": "an array"}',
+      content: "[]",
       model: "test-model",
       promptTokens: 1,
       completionTokens: 1,
@@ -103,17 +134,131 @@ describe("validateWithAI", () => {
     const { errors } = await validateWithAI("<p>html</p>", TEST_CONFIG);
     expect(errors).toEqual([]);
   });
+
+  it.each([
+    ["null", null],
+    ["a number", 7],
+    ["a string", "missing-alt"],
+    ["a boolean", false],
+    ["an array", []],
+    ["missing required fields", {}],
+    ["an unsupported type", { ...VALID_FINDING, type: "unknown-rule" }],
+    ["an unsupported severity", { ...VALID_FINDING, severity: "info" }],
+    ["a blank message", { ...VALID_FINDING, message: " \t\n" }],
+    ["a blank suggestion", { ...VALID_FINDING, suggestion: "" }],
+    ["a non-string message", { ...VALID_FINDING, message: 42 }],
+    ["a non-string suggestion", { ...VALID_FINDING, suggestion: null }],
+    ["a non-string element", { ...VALID_FINDING, element: {} }],
+    ["a non-string WCAG value", { ...VALID_FINDING, wcag: 1.1 }],
+  ])(
+    "replaces an invalid finding containing %s with a review warning",
+    async (_, finding) => {
+      callLiteLLMMock.mockResolvedValueOnce({
+        content: JSON.stringify([finding]),
+        model: "test-model",
+        promptTokens: 8,
+        completionTokens: 2,
+      });
+
+      const { errors } = await validateWithAI("<p>html</p>", TEST_CONFIG);
+
+      expect(errors).toEqual([
+        expect.objectContaining({
+          type: "other",
+          severity: "warning",
+          suggestion: expect.stringMatching(/review.*manually/i),
+        }),
+      ]);
+    }
+  );
+
+  it("retains valid findings in order and appends one warning for multiple invalid entries", async () => {
+    const secondFinding: AccessibilityError = {
+      type: "empty-heading",
+      severity: "warning",
+      message: "The final heading is empty.",
+      suggestion: "Remove the empty heading.",
+      element: "<h2></h2>",
+    };
+    callLiteLLMMock.mockResolvedValueOnce({
+      content: JSON.stringify([
+        null,
+        VALID_FINDING,
+        {},
+        secondFinding,
+        "invalid",
+      ]),
+      model: "test-model",
+      promptTokens: 8,
+      completionTokens: 2,
+    });
+
+    const { errors } = await validateWithAI("<p>html</p>", TEST_CONFIG);
+
+    expect(errors).toEqual([
+      VALID_FINDING,
+      secondFinding,
+      expect.objectContaining({ type: "other", severity: "warning" }),
+    ]);
+  });
 });
 
-describe("convertDocx", () => {
+describe("convertPdf", () => {
   beforeEach(() => {
     callLiteLLMMock.mockReset();
     fetchModelPricingMock.mockReset();
-    convertToHtmlMock.mockResolvedValue({
-      value: "<p>Hello world</p>",
-      messages: [],
-    });
   });
+
+  it.each([
+    ["a Word filename", PDF_BYTES, "test.docx"],
+    ["an empty file", Buffer.alloc(0), "test.pdf"],
+    ["a file without a PDF header", Buffer.from("not a PDF"), "test.pdf"],
+    [
+      "a file larger than 4 MiB",
+      Buffer.concat([PDF_BYTES, Buffer.alloc(4 * 1024 * 1024)]),
+      "test.pdf",
+    ],
+  ])("rejects %s before any model or pricing calls", async (_, bytes, name) => {
+    const result = await convertPdf(bytes, name);
+
+    expect(result).toHaveProperty("error");
+    expect(callLiteLLMMock).not.toHaveBeenCalled();
+    expect(fetchModelPricingMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["empty content", "", "stop"],
+    ["whitespace-only content", " \t\n", "stop"],
+    ["plain text instead of HTML", "The PDF is unavailable.", "stop"],
+    ["truncated HTML", "<p>Incomplete content</p>", "length"],
+    ["filtered HTML", "<p>Partial content</p>", "content_filter"],
+  ])(
+    "rejects %s while retaining its billable usage and skipping the audit",
+    async (_, content, finishReason) => {
+      callLiteLLMMock.mockResolvedValueOnce({
+        content,
+        finishReason,
+        model: "test-model",
+        promptTokens: 100,
+        completionTokens: 50,
+      });
+      fetchModelPricingMock.mockResolvedValue(null);
+
+      const result = await convertPdf(PDF_BYTES, "test.pdf");
+
+      if (!("error" in result)) throw new Error("expected failure");
+      expect(callLiteLLMMock).toHaveBeenCalledTimes(1);
+      expect(result.calls).toEqual([
+        {
+          stage: "convert",
+          model: "test-model",
+          promptTokens: 100,
+          completionTokens: 50,
+          costUsd: null,
+        },
+      ]);
+    }
+  );
 
   it("returns one calls[] entry per stage whose tokens sum to tokensUsed", async () => {
     callLiteLLMMock
@@ -134,10 +279,7 @@ describe("convertDocx", () => {
       outputCostPerToken: 0.000004,
     });
 
-    const result = await convertDocx(
-      Buffer.from("fake docx bytes"),
-      "test.docx"
-    );
+    const result = await convertPdf(PDF_BYTES, "test.pdf");
 
     if ("error" in result)
       throw new Error(`expected success, got: ${result.error}`);
@@ -145,6 +287,20 @@ describe("convertDocx", () => {
     expect(result.calls).toHaveLength(2);
     expect(result.calls[0].stage).toBe("convert");
     expect(result.calls[1].stage).toBe("validate");
+    expect(callLiteLLMMock).toHaveBeenCalledTimes(2);
+    expect(callLiteLLMMock.mock.calls[0][1]).toEqual([
+      { type: "text", text: expect.any(String) },
+      {
+        type: "file",
+        file: {
+          filename: "test.pdf",
+          file_data: `data:application/pdf;base64,${PDF_BYTES.toString("base64")}`,
+        },
+      },
+    ]);
+    expect(callLiteLLMMock.mock.calls[1][1]).toEqual(
+      expect.stringContaining(result.html)
+    );
 
     const tokenSum = result.calls.reduce(
       (sum, call) => sum + call.promptTokens + call.completionTokens,
@@ -168,28 +324,33 @@ describe("convertDocx", () => {
       .mockRejectedValueOnce(new Error("LiteLLM error 500: boom"));
     fetchModelPricingMock.mockResolvedValue(null);
 
-    const result = await convertDocx(
-      Buffer.from("fake docx bytes"),
-      "test.docx"
-    );
+    const result = await convertPdf(PDF_BYTES, "test.pdf");
 
     if (!("error" in result)) throw new Error("expected failure");
     expect(result.calls ?? []).toHaveLength(1);
     expect(result.calls?.[0].stage).toBe("convert");
   });
 
-  it("classifies missing-image and missing-link extraction warnings as warnings, merged into errors", async () => {
-    convertToHtmlMock.mockResolvedValueOnce({
-      value: "<p>Hello world</p>",
-      messages: [
-        {
-          type: "warning",
-          message: "Could not find image file for image1.png",
-        },
-        { type: "warning", message: "Could not find hyperlink target" },
-        { type: "warning", message: "Unrecognised paragraph style" },
-      ],
+  it("keeps controlled provider diagnostics but omits arbitrary exception text", async () => {
+    callLiteLLMMock.mockRejectedValueOnce(
+      new LiteLLMError(
+        "LiteLLM error 401: Check the API key and its access to the configured model."
+      )
+    );
+    expect(await convertPdf(PDF_BYTES, "test.pdf")).toMatchObject({
+      error: "Conversion failed",
+      detail:
+        "LiteLLM error 401: Check the API key and its access to the configured model.",
     });
+    callLiteLLMMock.mockRejectedValueOnce(
+      new Error("private-document-text; upstream-secret")
+    );
+    const failure = await convertPdf(PDF_BYTES, "test.pdf");
+    expect(JSON.stringify(failure)).not.toContain("private-document-text");
+    expect(JSON.stringify(failure)).not.toContain("upstream-secret");
+  });
+
+  it("preserves converted HTML, valid findings, and usage when some audit entries are invalid", async () => {
     callLiteLLMMock
       .mockResolvedValueOnce({
         content: "<p>converted</p>",
@@ -198,27 +359,108 @@ describe("convertDocx", () => {
         completionTokens: 50,
       })
       .mockResolvedValueOnce({
-        content:
-          '[{"type":"missing-alt","severity":"error","message":"m","suggestion":"s"}]',
+        content: JSON.stringify([null, VALID_FINDING, { severity: "error" }]),
         model: "test-model",
         promptTokens: 30,
         completionTokens: 10,
       });
     fetchModelPricingMock.mockResolvedValue(null);
 
-    const result = await convertDocx(
-      Buffer.from("fake docx bytes"),
-      "test.docx"
-    );
+    const result = await convertPdf(PDF_BYTES, "test.pdf");
+
+    if ("error" in result)
+      throw new Error(`expected success, got: ${result.error}`);
+
+    expect(result.html).toContain("<p>converted</p>");
+    expect(result.errors).toEqual([
+      VALID_FINDING,
+      expect.objectContaining({
+        type: "other",
+        severity: "warning",
+        suggestion: expect.stringMatching(/review.*manually/i),
+      }),
+    ]);
+    expect(result.calls).toEqual([
+      {
+        stage: "convert",
+        model: "test-model",
+        promptTokens: 100,
+        completionTokens: 50,
+        costUsd: null,
+      },
+      {
+        stage: "validate",
+        model: "test-model",
+        promptTokens: 30,
+        completionTokens: 10,
+        costUsd: null,
+      },
+    ]);
+    expect(result.tokensUsed).toBe(190);
+  });
+
+  it("flags every image placeholder even when the AI audit reports no issues", async () => {
+    callLiteLLMMock
+      .mockResolvedValueOnce({
+        content:
+          '<p>Course diagrams</p><img src="{{PLACEHOLDER:image1.png}}" alt="A process diagram"><img src="{{PLACEHOLDER:image2.png}}" alt="">',
+        model: "test-model",
+        promptTokens: 100,
+        completionTokens: 50,
+      })
+      .mockResolvedValueOnce({
+        content: "[]",
+        model: "test-model",
+        promptTokens: 30,
+        completionTokens: 10,
+      });
+    fetchModelPricingMock.mockResolvedValue(null);
+
+    const result = await convertPdf(PDF_BYTES, "test.pdf");
 
     if ("error" in result)
       throw new Error(`expected success, got: ${result.error}`);
 
     expect(result.errors).toEqual([
-      expect.objectContaining({ type: "missing-image", severity: "warning" }),
+      expect.objectContaining({
+        type: "missing-image",
+        severity: "warning",
+        element: expect.stringContaining("{{PLACEHOLDER:image1.png}}"),
+      }),
+      expect.objectContaining({
+        type: "missing-image",
+        severity: "warning",
+        element: expect.stringContaining("{{PLACEHOLDER:image2.png}}"),
+      }),
+    ]);
+  });
+
+  it("surfaces unreadable source content even when the output audit is clean", async () => {
+    callLiteLLMMock
+      .mockResolvedValueOnce({
+        content:
+          "<p>Visible passage.</p><!-- SOURCE TEXT REVIEW REQUIRED: page 3; bottom paragraph --><!-- LINK TARGET REQUIRED -->",
+        model: "test-model",
+        promptTokens: 100,
+        completionTokens: 50,
+      })
+      .mockResolvedValueOnce({
+        content: "[]",
+        model: "test-model",
+        promptTokens: 30,
+        completionTokens: 10,
+      });
+    fetchModelPricingMock.mockResolvedValue(null);
+
+    const result = await convertPdf(PDF_BYTES, "test.pdf");
+    if ("error" in result) throw new Error(result.error);
+    expect(result.errors).toEqual([
+      expect.objectContaining({
+        type: "other",
+        severity: "warning",
+        message: expect.stringContaining("page 3; bottom paragraph"),
+      }),
       expect.objectContaining({ type: "missing-link", severity: "warning" }),
-      expect.objectContaining({ type: "other", severity: "warning" }),
-      expect.objectContaining({ type: "missing-alt", severity: "error" }),
     ]);
   });
 
@@ -238,10 +480,7 @@ describe("convertDocx", () => {
       });
     fetchModelPricingMock.mockResolvedValue(null);
 
-    const result = await convertDocx(
-      Buffer.from("fake docx bytes"),
-      "test.docx"
-    );
+    const result = await convertPdf(PDF_BYTES, "test.pdf");
 
     if ("error" in result)
       throw new Error(`expected success, got: ${result.error}`);
@@ -250,7 +489,11 @@ describe("convertDocx", () => {
   });
 
   it("falls back to the unformatted HTML if formatting fails", async () => {
-    prettierFormatMock.mockRejectedValueOnce(new Error("parse error"));
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    prettierFormatMock.mockRejectedValueOnce(
+      new Error("parse error containing private-document-text")
+    );
     callLiteLLMMock
       .mockResolvedValueOnce({
         content: "<p>converted</p>",
@@ -266,13 +509,18 @@ describe("convertDocx", () => {
       });
     fetchModelPricingMock.mockResolvedValue(null);
 
-    const result = await convertDocx(
-      Buffer.from("fake docx bytes"),
-      "test.docx"
-    );
+    const result = await convertPdf(PDF_BYTES, "private-filename.pdf");
 
     if ("error" in result)
       throw new Error(`expected success, got: ${result.error}`);
     expect(result.html).toBe("<p>converted</p>");
+    expect(JSON.stringify(warning.mock.calls)).not.toContain(
+      "private-document-text"
+    );
+    expect(JSON.stringify(log.mock.calls)).not.toContain(
+      "private-filename.pdf"
+    );
+    warning.mockRestore();
+    log.mockRestore();
   });
 });

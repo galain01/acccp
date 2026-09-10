@@ -1,6 +1,6 @@
 "use client";
 
-import { JSX, useState } from "react";
+import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { Loader2 } from "lucide-react";
 
@@ -111,7 +111,7 @@ export default function HomePage(): React.JSX.Element {
           Accessible Canvas Content Conversion Platform
         </h1>
         <p className="text-sm text-muted-foreground">
-          Easily convert your DOCX course content into accessible Canvas-ready
+          Convert your Word and PDF course content into accessible Canvas-ready
           HTML.
         </p>
       </header>
