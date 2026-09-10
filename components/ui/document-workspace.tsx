@@ -13,6 +13,14 @@ interface DocumentWorkspaceProps {
   initialDocuments: UploadedDocument[];
 }
 
+function isBatchTarget(doc: UploadedDocument): boolean {
+  return (
+    !doc.locked &&
+    (doc.status === "idle" || doc.status === "error") &&
+    isSupportedDocumentFilename(doc.name)
+  );
+}
+
 export default function DocumentWorkspace({
   sessionId,
   initialDocuments,
@@ -25,10 +33,7 @@ export default function DocumentWorkspace({
     (doc) => doc.status === "processing" || doc.status === "queued"
   );
   const hasDocuments = documents.length > 0;
-  const canConvert =
-    documents.some(
-      (doc) => !doc.locked && isSupportedDocumentFilename(doc.name)
-    ) && !isProcessing;
+  const canConvert = documents.some(isBatchTarget) && !isProcessing;
   const hasUnsupportedDocuments = documents.some(
     (doc) => !isSupportedDocumentFilename(doc.name)
   );
@@ -89,7 +94,11 @@ export default function DocumentWorkspace({
 
   const convertDocument = useCallback(
     async (doc: UploadedDocument) => {
-      if (!isSupportedDocumentFilename(doc.name)) return;
+      if (
+        !isSupportedDocumentFilename(doc.name) ||
+        abortControllersRef.current.has(doc.id)
+      )
+        return;
       const form = new FormData();
       form.append("sessionId", sessionId);
 
@@ -124,6 +133,11 @@ export default function DocumentWorkspace({
         if (!response.ok) {
           updateDocument(doc.id, {
             status: "error",
+            // A failed model call may already have saved the source. Retrying
+            // must reuse that document instead of uploading a duplicate.
+            ...(typeof data.documentId === "string"
+              ? { documentId: data.documentId }
+              : {}),
             html: undefined,
             errorMessage: data.error ?? "Conversion failed.",
           });
@@ -153,17 +167,26 @@ export default function DocumentWorkspace({
   );
 
   const runConversion = useCallback(() => {
-    const targets = documents.filter(
-      (doc) => !doc.locked && isSupportedDocumentFilename(doc.name)
-    );
+    // The ref also catches a second click before React renders disabled buttons.
+    if (isProcessing || abortControllersRef.current.size > 0) return;
+    const targets = documents.filter(isBatchTarget);
     if (targets.length === 0) return;
 
     targets.forEach((doc) => {
-      abortControllersRef.current.get(doc.id)?.abort();
       updateDocument(doc.id, { status: "queued" });
     });
     targets.forEach((doc) => void convertDocument(doc));
-  }, [documents, convertDocument, updateDocument]);
+  }, [documents, isProcessing, convertDocument, updateDocument]);
+
+  const reconvertDocument = useCallback(
+    (docId: string) => {
+      if (isProcessing || abortControllersRef.current.size > 0) return;
+      const doc = documents.find((document) => document.id === docId);
+      if (!doc || doc.locked || doc.status !== "success") return;
+      void convertDocument(doc);
+    },
+    [documents, isProcessing, convertDocument]
+  );
 
   return (
     <div className="mt-8 flex flex-col gap-6">
@@ -190,11 +213,18 @@ export default function DocumentWorkspace({
             Upload at least one Word document or PDF to enable conversion.
           </p>
         )}
+        {hasDocuments && !isProcessing && (
+          <p className="mt-2 text-sm text-muted-foreground">
+            Convert processes only new or failed documents that are unlocked.
+            Completed documents are skipped. Use Re-convert on a completed
+            document to generate a new result and use additional model tokens.
+          </p>
+        )}
         {hasUnsupportedDocuments && (
           <p className="mt-2 text-sm text-muted-foreground">
-            Previous conversions remain available until they expire. Only
-            unlocked PDF and .docx documents are converted. Save older .doc
-            files as .docx before uploading.
+            Previous conversions remain available until they expire. Only PDF
+            and .docx documents can be converted. Save older .doc files as .docx
+            before uploading.
           </p>
         )}
         {hasDocuments && isProcessing && (
@@ -209,6 +239,8 @@ export default function DocumentWorkspace({
         documents={documents}
         onToggleLock={toggleDocumentLock}
         onDeleteDocument={handleDeleteDocument}
+        onReconvert={reconvertDocument}
+        isProcessing={isProcessing}
       />
     </div>
   );
