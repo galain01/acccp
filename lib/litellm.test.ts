@@ -163,6 +163,7 @@ describe("AI & LiteLLM connection", () => {
       })
     );
     expect(pricing).toEqual({
+      source: "gateway",
       inputCostPerToken: 0.000003,
       outputCostPerToken: 0.000006,
     });
@@ -398,6 +399,7 @@ describe("Response validation", () => {
     const pricing = await fetchModelPricing("gpt-5.4-nano-2026-03-17", CONFIG);
 
     expect(pricing).toEqual({
+      source: "gateway",
       inputCostPerToken: 0.000002,
       outputCostPerToken: 0.000004,
     });
@@ -426,6 +428,7 @@ describe("Response validation", () => {
     const pricing = await fetchModelPricing("gpt-5.4-nano-2026-03-17", CONFIG);
 
     expect(pricing).toEqual({
+      source: "gateway",
       inputCostPerToken: 0.000001,
       outputCostPerToken: 0.000002,
     });

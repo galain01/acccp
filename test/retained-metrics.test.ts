@@ -6,7 +6,12 @@ vi.mock("server-only", () => ({}));
 
 import { archiveDocumentMetrics } from "@/lib/retained-metrics";
 import type { DocumentTransaction } from "@/lib/document-retention";
-import { retainedJobMetrics, retainedModelMetrics } from "@/lib/db/schema";
+import {
+  retainedJobMetrics,
+  retainedModelMetrics,
+  retainedJobStats,
+  retainedJobDurationMetrics,
+} from "@/lib/db/schema";
 
 describe("retained metric privacy contract", () => {
   it.each([
@@ -21,8 +26,23 @@ describe("retained metric privacy contract", () => {
         "prompt_tokens",
         "completion_tokens",
         "cost_usd",
+        "priced_call_count",
+        "estimated_call_count",
+        "unpriced_call_count",
       ],
     ],
+    [
+      retainedJobStats,
+      [
+        "day",
+        "model",
+        "job_count",
+        "total_tokens",
+        "page_count_sum",
+        "page_measured_job_count",
+      ],
+    ],
+    [retainedJobDurationMetrics, ["day", "model", "duration_ms", "job_count"]],
   ] as const)(
     "stores only approved aggregate dimensions and measures",
     (table, columns) => {
@@ -46,11 +66,13 @@ describe("retained metric privacy contract", () => {
       { execute } as unknown as DocumentTransaction,
       "private-document-id"
     );
-    expect(statements).toHaveLength(2);
+    expect(statements).toHaveLength(4);
     for (const statement of statements) {
-      expect(statement.params).toEqual(["private-document-id"]);
-      expect(statement.sql).toContain(
-        'where "conversion_jobs"."document_id" = $1'
+      expect(
+        statement.params.filter((value) => value === "private-document-id")
+      ).toEqual(["private-document-id"]);
+      expect(statement.sql).toMatch(
+        /where "conversion_jobs"\."document_id" = \$\d+/
       );
       expect(statement.sql).toContain("at time zone 'UTC')::date");
       expect(statement.sql).not.toContain("private-document-id");

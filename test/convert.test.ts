@@ -331,6 +331,242 @@ describe("convertPdf", () => {
     expect(result.calls?.[0].stage).toBe("convert");
   });
 
+  it.each([0, 0.003456])(
+    "preserves gateway cost %s and skips pricing lookup for both stages",
+    async (reportedCost) => {
+      callLiteLLMMock
+        .mockResolvedValueOnce({
+          content: "<p>converted</p>",
+          model: "test-model",
+          promptTokens: 1_000,
+          completionTokens: 50,
+          cachedPromptTokens: 200,
+          cacheCreationPromptTokens: 100,
+          responseCostUsd: reportedCost,
+        })
+        .mockResolvedValueOnce({
+          content: "[]",
+          model: "test-model",
+          promptTokens: 30,
+          completionTokens: 10,
+          cachedPromptTokens: 0,
+          cacheCreationPromptTokens: 0,
+          responseCostUsd: 0,
+        });
+      // Even unavailable pricing cannot interfere with a reported amount.
+      fetchModelPricingMock.mockRejectedValue(new Error("Pricing unavailable"));
+
+      const result = await convertPdf(PDF_BYTES, "test.pdf");
+      if ("error" in result) throw new Error(result.error);
+      expect(fetchModelPricingMock).not.toHaveBeenCalled();
+      expect(result.calls).toEqual([
+        {
+          stage: "convert",
+          model: "test-model",
+          promptTokens: 1_000,
+          completionTokens: 50,
+          cachedPromptTokens: 200,
+          cacheCreationPromptTokens: 100,
+          costUsd: reportedCost,
+          costSource: "gateway",
+        },
+        {
+          stage: "validate",
+          model: "test-model",
+          promptTokens: 30,
+          completionTokens: 10,
+          cachedPromptTokens: 0,
+          cacheCreationPromptTokens: 0,
+          costUsd: 0,
+          costSource: "gateway",
+        },
+      ]);
+      expect(result.tokensUsed).toBe(1_090); // Cache tokens are subsets of input.
+    }
+  );
+
+  it.each([
+    ["gateway", "model-info"],
+    ["openai-list-price", "openai-list-price"],
+  ] as const)(
+    "integrates %s fallback rates, cache usage, and the %s cost source",
+    async (pricingSource, costSource) => {
+      callLiteLLMMock
+        .mockResolvedValueOnce({
+          content: "<p>converted</p>",
+          model: "test-model",
+          promptTokens: 1_000,
+          completionTokens: 50,
+          cachedPromptTokens: 200,
+          cacheCreationPromptTokens: 100,
+        })
+        .mockResolvedValueOnce({
+          content: "[]",
+          model: "test-model",
+          promptTokens: 30,
+          completionTokens: 10,
+          responseCostUsd: 0,
+        });
+      fetchModelPricingMock.mockResolvedValue({
+        source: pricingSource,
+        inputCostPerToken: 0.000004,
+        cachedInputCostPerToken: 0.0000004,
+        cacheCreationInputCostPerToken: 0.000005,
+        outputCostPerToken: 0.00002,
+      });
+
+      const result = await convertPdf(PDF_BYTES, "test.pdf");
+      if ("error" in result) throw new Error(result.error);
+      expect(fetchModelPricingMock).toHaveBeenCalledExactlyOnceWith(
+        "test-model",
+        TEST_CONFIG
+      );
+      expect(result.calls[0]).toMatchObject({
+        costSource,
+        cachedPromptTokens: 200,
+        cacheCreationPromptTokens: 100,
+      });
+      expect(result.calls[0].costUsd).toBeCloseTo(0.00438, 12);
+      expect(result.calls[1]).toMatchObject({
+        costUsd: 0,
+        costSource: "gateway",
+      });
+    }
+  );
+
+  it("keeps unpriced calls unknown while retaining known cache zeroes", async () => {
+    callLiteLLMMock
+      .mockResolvedValueOnce({
+        content: "<p>converted</p>",
+        model: "unknown-model",
+        promptTokens: 100,
+        completionTokens: 50,
+        cachedPromptTokens: 0,
+        cacheCreationPromptTokens: 0,
+      })
+      .mockResolvedValueOnce({
+        content: "[]",
+        model: "unknown-model",
+        promptTokens: 30,
+        completionTokens: 10,
+      });
+    fetchModelPricingMock.mockResolvedValue(null);
+
+    const result = await convertPdf(PDF_BYTES, "test.pdf");
+    if ("error" in result) throw new Error(result.error);
+    expect(result.calls[0]).toMatchObject({
+      costUsd: null,
+      cachedPromptTokens: 0,
+      cacheCreationPromptTokens: 0,
+    });
+    for (const call of result.calls)
+      expect(call).not.toHaveProperty("costSource");
+    expect(result.calls[1]).not.toHaveProperty("cachedPromptTokens");
+    expect(result.calls[1]).not.toHaveProperty("cacheCreationPromptTokens");
+  });
+
+  describe.each([
+    ["negative", -1, 10],
+    ["fractional", 20, 1.5],
+    ["outside the database integer range", 2_147_483_648, 0],
+    ["combined cache usage exceeds the prompt", 80, 30],
+  ])(
+    "invalid cache metadata: %s",
+    (_, cachedPromptTokens, cacheCreationPromptTokens) => {
+      it.each([undefined, 0, 0.0123])(
+        "drops the invalid pair without losing conversion or gateway cost %s",
+        async (responseCostUsd) => {
+          callLiteLLMMock
+            .mockResolvedValueOnce({
+              content: "<p>converted</p>",
+              model: "test-model",
+              promptTokens: 100,
+              completionTokens: 50,
+              cachedPromptTokens,
+              cacheCreationPromptTokens,
+              ...(responseCostUsd !== undefined ? { responseCostUsd } : {}),
+            })
+            .mockResolvedValueOnce({
+              content: "[]",
+              model: "test-model",
+              promptTokens: 30,
+              completionTokens: 10,
+              responseCostUsd: 0,
+            });
+          fetchModelPricingMock.mockResolvedValue({
+            source: "gateway",
+            inputCostPerToken: 0.000004,
+            cachedInputCostPerToken: 0.0000004,
+            cacheCreationInputCostPerToken: 0.000005,
+            outputCostPerToken: 0.00002,
+          });
+
+          const result = await convertPdf(PDF_BYTES, "test.pdf");
+          if ("error" in result) throw new Error(result.error);
+          expect(result.html).toContain("<p>converted</p>");
+          expect(result.tokensUsed).toBe(190);
+          const call = result.calls[0];
+          expect(call).not.toHaveProperty("cachedPromptTokens");
+          expect(call).not.toHaveProperty("cacheCreationPromptTokens");
+          if (responseCostUsd === undefined) {
+            expect(call.costUsd).toBeCloseTo(0.0014, 12);
+            expect(call.costSource).toBe("model-info");
+            expect(fetchModelPricingMock).toHaveBeenCalledExactlyOnceWith(
+              "test-model",
+              TEST_CONFIG
+            );
+          } else {
+            expect(call.costUsd).toBe(responseCostUsd);
+            expect(call.costSource).toBe("gateway");
+            expect(fetchModelPricingMock).not.toHaveBeenCalled();
+          }
+        }
+      );
+    }
+  );
+
+  it.each(["incomplete output", "audit failure"])(
+    "retains gateway billing and cache metadata after %s",
+    async (failure) => {
+      callLiteLLMMock.mockResolvedValueOnce({
+        content: "<p>converted</p>",
+        model: "test-model",
+        promptTokens: 100,
+        completionTokens: 50,
+        cachedPromptTokens: 20,
+        cacheCreationPromptTokens: 10,
+        responseCostUsd: 0.0123,
+        finishReason: failure === "incomplete output" ? "length" : "stop",
+      });
+      if (failure === "audit failure")
+        callLiteLLMMock.mockRejectedValueOnce(
+          new Error("Private gateway diagnostics")
+        );
+
+      const result = await convertPdf(PDF_BYTES, "test.pdf");
+      if (!("error" in result)) throw new Error("Expected failed conversion");
+      expect(result.calls).toEqual([
+        {
+          stage: "convert",
+          model: "test-model",
+          promptTokens: 100,
+          completionTokens: 50,
+          cachedPromptTokens: 20,
+          cacheCreationPromptTokens: 10,
+          costUsd: 0.0123,
+          costSource: "gateway",
+        },
+      ]);
+      expect(fetchModelPricingMock).not.toHaveBeenCalled();
+      expect(JSON.stringify(result)).not.toContain(
+        "Private gateway diagnostics"
+      );
+      expect(callLiteLLMMock).toHaveBeenCalledTimes(
+        failure === "audit failure" ? 2 : 1
+      );
+    }
+  );
+
   it("keeps controlled provider diagnostics but omits arbitrary exception text", async () => {
     callLiteLLMMock.mockRejectedValueOnce(
       new LiteLLMError(

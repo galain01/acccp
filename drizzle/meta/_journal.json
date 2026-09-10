@@ -71,6 +71,13 @@
       "when": 1789048703693,
       "tag": "0009_retained_metrics",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1789053905123,
+      "tag": "0010_dashboard_job_metrics",
+      "breakpoints": true
     }
   ]
 }

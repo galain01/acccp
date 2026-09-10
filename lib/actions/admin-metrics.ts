@@ -15,6 +15,10 @@ import {
 } from "@/lib/db/schema";
 import { isDocumentExpired } from "@/lib/retention";
 import {
+  effectiveModelCallCostSql,
+  estimatedModelCallSql,
+} from "@/lib/model-cost-sql";
+import {
   type JobStatusSummary,
   summarizeJobStatusCounts,
   totalPages,
@@ -124,7 +128,7 @@ export async function getCostSummary(days = 30): Promise<CostSummary> {
         (now() at time zone 'UTC')::date - (${window}::integer - 1))`,
     allTimeCost: sql<string | null>`sum(usage.cost)`,
   }).from(sql`(
-      select (${modelCalls.createdAt} at time zone 'UTC')::date as day, ${modelCalls.costUsd} as cost
+      select (${modelCalls.createdAt} at time zone 'UTC')::date as day, ${effectiveModelCallCostSql()} as cost
       from ${modelCalls}
       union all
       select ${retainedModelMetrics.day} as day, ${retainedModelMetrics.costUsd} as cost
@@ -155,6 +159,11 @@ export interface RecentJobRow {
   totalTokens: number;
   costUsd: number | null;
   createdAt: string;
+  pageCount: number | null;
+  processingDurationMs: number | null;
+  attemptCount: number;
+  estimatedCallCount: number;
+  unpricedCallCount: number;
 }
 
 export async function listRecentJobs(
@@ -162,7 +171,10 @@ export async function listRecentJobs(
   pageSize = DEFAULT_PAGE_SIZE
 ): Promise<PagedResult<RecentJobRow>> {
   await requireAdmin();
-  const safePage = Math.max(1, Math.floor(page));
+  const safePage = Number.isFinite(page) ? Math.max(1, Math.floor(page)) : 1;
+  pageSize = Number.isFinite(pageSize)
+    ? Math.max(1, Math.min(100, Math.floor(pageSize)))
+    : DEFAULT_PAGE_SIZE;
 
   const [{ value: totalCount }] = await db
     .select({ value: count() })
@@ -178,7 +190,12 @@ export async function listRecentJobs(
       status: conversionJobs.status,
       model: conversionJobs.modelName,
       totalTokens: sql<number>`coalesce(sum(${modelCalls.promptTokens} + ${modelCalls.completionTokens}), 0)`,
-      costUsd: sql<string | null>`sum(${modelCalls.costUsd})`,
+      costUsd: sql<string | null>`sum(${effectiveModelCallCostSql()})`,
+      estimatedCallCount: sql<string>`count(${modelCalls.id}) filter (where ${estimatedModelCallSql()})`,
+      unpricedCallCount: sql<string>`count(${modelCalls.id}) filter (where ${effectiveModelCallCostSql()} is null)`,
+      pageCount: conversionJobs.pageCount,
+      processingDurationMs: conversionJobs.processingDurationMs,
+      attemptCount: conversionJobs.attemptCount,
       createdAt: conversionJobs.createdAt,
       documentCreatedAt: documents.createdAt,
     })
@@ -210,8 +227,16 @@ export async function listRecentJobs(
         requestedByEmail: row.requestedByEmail,
         status: row.status,
         model: row.model,
-        totalTokens: row.totalTokens,
+        totalTokens: Number(row.totalTokens),
         costUsd: row.costUsd != null ? Number(row.costUsd) : null,
+        pageCount: row.pageCount ?? null,
+        processingDurationMs:
+          row.processingDurationMs != null
+            ? Number(row.processingDurationMs)
+            : null,
+        attemptCount: Number(row.attemptCount ?? 1),
+        estimatedCallCount: Number(row.estimatedCallCount ?? 0),
+        unpricedCallCount: Number(row.unpricedCallCount ?? 0),
         createdAt: row.createdAt,
       })),
     page: safePage,

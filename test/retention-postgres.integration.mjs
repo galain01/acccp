@@ -1,5 +1,6 @@
 import {
   afterAll,
+  afterEach,
   beforeAll,
   beforeEach,
   describe,
@@ -54,6 +55,10 @@ import {
   getJobStatusSummary,
   getTokenUsage,
 } from "@/lib/actions/admin-metrics";
+import {
+  effectiveModelCallCostSql,
+  estimatedModelCallSql,
+} from "@/lib/model-cost-sql";
 
 let pg;
 let ownerId;
@@ -162,6 +167,38 @@ async function archivedMetrics() {
   return { jobs: jobs.rows, calls: calls.rows };
 }
 
+async function archivedJobStats() {
+  const stats = await pg.query(
+    "SELECT * FROM retained_job_stats ORDER BY day,model"
+  );
+  const durations = await pg.query(
+    "SELECT * FROM retained_job_duration_metrics ORDER BY day,model,duration_ms"
+  );
+  return { stats: stats.rows, durations: durations.rows };
+}
+
+async function combinedJobStats() {
+  const stats =
+    await pg.query(`SELECT day::text,model,sum(job_count)::int AS job_count,
+    sum(total_tokens)::int AS total_tokens,sum(page_count_sum)::int AS page_count_sum,
+    sum(page_measured_job_count)::int AS page_measured_job_count FROM (
+    SELECT (j.created_at AT TIME ZONE 'UTC')::date AS day,
+      coalesce(nullif(btrim(j.model_name),''),'unknown') AS model,1 AS job_count,
+      (SELECT coalesce(sum(c.prompt_tokens::bigint+c.completion_tokens),0) FROM model_calls c WHERE c.job_id=j.id) AS total_tokens,
+      coalesce(j.page_count,0) AS page_count_sum,CASE WHEN j.page_count IS NULL THEN 0 ELSE 1 END AS page_measured_job_count
+    FROM conversion_jobs j
+    UNION ALL SELECT day,model,job_count,total_tokens,page_count_sum,page_measured_job_count FROM retained_job_stats
+    ) metrics GROUP BY day,model ORDER BY day,model`);
+  const durations =
+    await pg.query(`SELECT day::text,model,duration_ms::text,sum(job_count)::int AS job_count FROM (
+    SELECT (created_at AT TIME ZONE 'UTC')::date AS day,
+      coalesce(nullif(btrim(model_name),''),'unknown') AS model,processing_duration_ms AS duration_ms,1 AS job_count
+    FROM conversion_jobs WHERE status IN ('completed','needs_review') AND processing_duration_ms IS NOT NULL
+    UNION ALL SELECT day,model,duration_ms,job_count FROM retained_job_duration_metrics
+    ) metrics GROUP BY day,model,duration_ms ORDER BY day,model,duration_ms`);
+  return { stats: stats.rows, durations: durations.rows };
+}
+
 beforeAll(async () => {
   const runtime = process.env.PGLITE_RUNTIME_DIR;
   if (!runtime)
@@ -200,15 +237,24 @@ beforeAll(async () => {
       "utf8"
     )
   );
+  await pg.exec(
+    await readFile(
+      new URL("../drizzle/0010_dashboard_job_metrics.sql", import.meta.url),
+      "utf8"
+    )
+  );
 });
 
 afterAll(async () => {
   if (pg) await pg.close();
 });
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 beforeEach(async () => {
   await pg.exec(
-    "TRUNCATE users, retained_job_metrics, retained_model_metrics CASCADE"
+    "TRUNCATE users, retained_job_metrics, retained_model_metrics, retained_job_stats, retained_job_duration_metrics CASCADE"
   );
   blobs.clear();
   fixture.remove.mockReset();
@@ -228,6 +274,219 @@ beforeEach(async () => {
 });
 
 describe("retention against in-memory PostgreSQL", () => {
+  it("preserves latest-attempt pages, all-attempt tokens and exact duration frequencies by original job cohort", async () => {
+    const measured = await seedDocument(360);
+    const sameDuration = await seedDocument(360);
+    const failed = await seedDocument(360);
+    const unknownDuration = await seedDocument(360);
+    const fresh = await seedDocument(1);
+    for (const [doc, status, duration, pages, model] of [
+      [measured, "completed", 1500, 8, " synthetic-model "],
+      [sameDuration, "needs_review", 1500, 4, "synthetic-model"],
+      [failed, "failed", 900, null, "synthetic-model"],
+      [unknownDuration, "completed", null, null, null],
+      [fresh, "completed", 3500, 6, "different-model"],
+    ]) {
+      await pg.query(
+        `UPDATE conversion_jobs SET created_at='2026-08-01T00:30:00Z',
+        started_at='2026-09-01T00:00:00Z',completed_at='2026-09-01T00:01:00Z',
+        status=$1,processing_duration_ms=$2,page_count=$3,model_name=$4,attempt_count=3 WHERE id=$5`,
+        [status, duration, pages, model, doc.jobId]
+      );
+    }
+    await pg.query(
+      `INSERT INTO model_calls(job_id,stage,model,prompt_tokens,completion_tokens)
+      VALUES ($1,'convert','earlier-model',100,20),($1,'validate','synthetic-model',10,5)`,
+      [measured.jobId]
+    );
+    const before = await combinedJobStats();
+    expect(before.stats.find((row) => row.model === "synthetic-model")).toEqual(
+      {
+        day: "2026-08-01",
+        model: "synthetic-model",
+        job_count: 3,
+        total_tokens: 141,
+        page_count_sum: 12,
+        page_measured_job_count: 2,
+      }
+    );
+    expect(before.durations).toEqual([
+      {
+        day: "2026-08-01",
+        model: "different-model",
+        duration_ms: "3500",
+        job_count: 1,
+      },
+      {
+        day: "2026-08-01",
+        model: "synthetic-model",
+        duration_ms: "1500",
+        job_count: 2,
+      },
+    ]);
+    await pg.exec("SET TIME ZONE 'America/Los_Angeles'");
+    try {
+      expect(await purgeExpiredDocuments()).toMatchObject({
+        purged: 4,
+        failed: 0,
+      });
+    } finally {
+      await pg.exec("SET TIME ZONE 'UTC'");
+    }
+    expect(await combinedJobStats()).toEqual(before);
+    const archived = await archivedJobStats();
+    expect(
+      archived.stats.reduce((total, row) => total + Number(row.job_count), 0)
+    ).toBe(4);
+    expect(
+      archived.durations.map((row) => [
+        Number(row.duration_ms),
+        Number(row.job_count),
+      ])
+    ).toEqual([[1500, 2]]);
+    expect(await purgeExpiredDocuments()).toMatchObject({ purged: 0 });
+    expect(await archivedJobStats()).toEqual(archived);
+    expect(await combinedJobStats()).toEqual(before);
+  });
+
+  it("does not invent job-stat history or measurements for documents with no job", async () => {
+    const doc = randomUUID();
+    await pg.query(
+      `INSERT INTO documents(id,session_id,uploaded_by_user_id,original_filename,mime_type,file_size_bytes,created_at)
+      VALUES ($1,$2,$3,'synthetic.pdf','application/pdf',1,clock_timestamp()-interval '360 hours')`,
+      [doc, sessionId, ownerId]
+    );
+    expect(await purgeDocumentIfEligible(doc)).toBe("purged");
+    expect(await archivedJobStats()).toEqual({ stats: [], durations: [] });
+    expect(await archivedMetrics()).toEqual({ jobs: [], calls: [] });
+  });
+
+  it("freezes effective Sol costs and coverage without changing stored call costs or inventing unknown-model prices", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-10T12:00:00Z"));
+    const doc = await seedDocument(360);
+    await pg.query("DELETE FROM model_calls WHERE job_id=$1", [doc.jobId]);
+    // Ordinary cache mix: .00344 + .00004 + .0002 + .004 = .00768.
+    // Long-context mix: 279600*.000008 + 300*.0000008 + 100*.00001 + 1000*.00003 = 2.26804.
+    await pg.query(
+      `INSERT INTO model_calls(job_id,stage,model,prompt_tokens,completion_tokens,cost_usd,cost_source,cached_prompt_tokens,cache_creation_prompt_tokens)
+      VALUES ($1,'convert','gpt-5.6-sol-2026-07-09',1000,200,NULL,NULL,100,40),
+      ($1,'convert','gpt-5.6-sol-2026-07-09',280000,1000,NULL,NULL,300,100),
+      ($1,'convert','gpt-5.6-sol-2026-07-09',1,1,0,'gateway',NULL,NULL),
+      ($1,'validate','gpt-5.6-sol-2026-07-09',1,1,0.05,'model-info',NULL,NULL),
+      ($1,'convert','unpriced-model',1,1,NULL,NULL,NULL,NULL),
+      ($1,'validate','gpt-5.6-sol-2026-07-09',1,1,NULL,NULL,5,0)`,
+      [doc.jobId]
+    );
+    const live = await fixture.db
+      .select({
+        model: schema.modelCalls.model,
+        stage: schema.modelCalls.stage,
+        cost: effectiveModelCallCostSql(),
+        estimated: estimatedModelCallSql(),
+      })
+      .from(schema.modelCalls);
+    expect(
+      live.map((row) => (row.cost === null ? null : Number(row.cost)))
+    ).toEqual([0.00768, 2.26804, 0, 0.05, null, null]);
+    expect(live.map((row) => row.estimated)).toEqual([
+      true,
+      true,
+      false,
+      true,
+      false,
+      false,
+    ]);
+    const untouched = await pg.query(
+      "SELECT count(*)::int AS unknown FROM model_calls WHERE cost_usd IS NULL"
+    );
+    expect(untouched.rows[0].unknown).toBe(4);
+    expect(await purgeDocumentIfEligible(doc.id)).toBe("purged");
+    const calls = (await archivedMetrics()).calls;
+    const convert = calls.find(
+      (row) => row.model === "gpt-5.6-sol-2026-07-09" && row.stage === "convert"
+    );
+    expect(Number(convert.cost_usd)).toBe(2.27572);
+    expect(
+      [
+        convert.call_count,
+        convert.priced_call_count,
+        convert.estimated_call_count,
+        convert.unpriced_call_count,
+      ].map(Number)
+    ).toEqual([3, 3, 2, 0]);
+    const validate = calls.find(
+      (row) =>
+        row.model === "gpt-5.6-sol-2026-07-09" && row.stage === "validate"
+    );
+    expect(Number(validate.cost_usd)).toBe(0.05);
+    expect(
+      [
+        validate.call_count,
+        validate.priced_call_count,
+        validate.estimated_call_count,
+        validate.unpriced_call_count,
+      ].map(Number)
+    ).toEqual([2, 1, 1, 1]);
+    const unknown = calls.find((row) => row.model === "unpriced-model");
+    expect(unknown.cost_usd).toBeNull();
+    expect(
+      [
+        unknown.priced_call_count,
+        unknown.estimated_call_count,
+        unknown.unpriced_call_count,
+      ].map(Number)
+    ).toEqual([0, 0, 1]);
+  });
+
+  it("handles schema-valid giant cache counts and preserves finite costs above the old numeric limit", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-10T12:00:00Z"));
+    const doc = await seedDocument(360);
+    await pg.query("DELETE FROM model_calls WHERE job_id=$1", [doc.jobId]);
+    await pg.query(
+      `INSERT INTO model_calls(job_id,stage,model,prompt_tokens,completion_tokens,cost_usd,cost_source,cached_prompt_tokens,cache_creation_prompt_tokens)
+      VALUES ($1,'convert','gpt-5.6-sol-2026-07-09',2000000000,1,NULL,NULL,1500000000,1500000000),
+      ($1,'validate','gpt-5.6-sol-2026-07-09',1,1,1234567.890123456789,'gateway',NULL,NULL)`,
+      [doc.jobId]
+    );
+    const live = await fixture.db
+      .select({
+        cost: effectiveModelCallCostSql(),
+        estimated: estimatedModelCallSql(),
+      })
+      .from(schema.modelCalls);
+    expect(live[0]).toEqual({ cost: null, estimated: false });
+    expect(live[1]).toEqual({ cost: "1234567.890123456789", estimated: false });
+    expect(await purgeDocumentIfEligible(doc.id)).toBe("purged");
+    const calls = (await archivedMetrics()).calls;
+    expect(calls.find((row) => row.stage === "convert").cost_usd).toBeNull();
+    expect(
+      Number(calls.find((row) => row.stage === "convert").unpriced_call_count)
+    ).toBe(1);
+    expect(calls.find((row) => row.stage === "validate").cost_usd).toBe(
+      "1234567.890123456789"
+    );
+    expect(
+      Number(calls.find((row) => row.stage === "validate").priced_call_count)
+    ).toBe(1);
+  });
+
+  it("keeps pre-migration pricing coverage unknown when newer calls join a legacy group", async () => {
+    const doc = await seedDocument(360);
+    await pg.query(`INSERT INTO retained_model_metrics(day,model,stage,call_count,prompt_tokens,completion_tokens,cost_usd)
+      VALUES ((now() AT TIME ZONE 'UTC')::date,'synthetic-model','convert',2,10,20,0.5)`);
+    expect(await purgeDocumentIfEligible(doc.id)).toBe("purged");
+    const row = (await archivedMetrics()).calls[0];
+    expect(Number(row.call_count)).toBe(3);
+    expect(Number(row.cost_usd)).toBe(0.501);
+    expect([
+      row.priced_call_count,
+      row.estimated_call_count,
+      row.unpriced_call_count,
+    ]).toEqual([null, null, null]);
+  });
+
   it("backfills from the original date, is repeatable, and sets 14-day defaults", async () => {
     await seedDocument(360);
     await seedDocument(24);
@@ -429,6 +688,7 @@ describe("retention against in-memory PostgreSQL", () => {
       log.mockRestore();
     }
     expect(await archivedMetrics()).toEqual({ jobs: [], calls: [] });
+    expect(await archivedJobStats()).toEqual({ stats: [], durations: [] });
     expect(await combinedMetrics()).toEqual(before);
 
     expect(await purgeDocumentIfEligible(doc.id)).toBe("purged");
@@ -440,6 +700,10 @@ describe("retention against in-memory PostgreSQL", () => {
 
   it("rolls back both metric inserts if database deletion fails, then counts a retry only once", async () => {
     const doc = await seedDocument(360);
+    await pg.query(
+      "UPDATE conversion_jobs SET processing_duration_ms=1234,page_count=7 WHERE id=$1",
+      [doc.jobId]
+    );
     const before = await combinedMetrics();
     await pg.exec(`CREATE FUNCTION retention_test_fail_delete() RETURNS trigger
       LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'Synthetic deletion failure'; END $$;
@@ -450,6 +714,7 @@ describe("retention against in-memory PostgreSQL", () => {
       expect(await purgeDocumentIfEligible(doc.id)).toBe("failed");
       expect(blobs.size).toBe(0);
       expect(await archivedMetrics()).toEqual({ jobs: [], calls: [] });
+      expect(await archivedJobStats()).toEqual({ stats: [], durations: [] });
       expect(await combinedMetrics()).toEqual(before);
       expect((await linkedCounts(doc.id, doc.jobId)).documents).toBe(1);
     } finally {
@@ -460,6 +725,7 @@ describe("retention against in-memory PostgreSQL", () => {
     }
     expect(await purgeDocumentIfEligible(doc.id)).toBe("purged");
     const archived = await archivedMetrics();
+    expect((await archivedJobStats()).durations).toHaveLength(1);
     expect(await combinedMetrics()).toEqual(before);
     expect(await purgeDocumentIfEligible(doc.id)).toBe("retained");
     expect(await archivedMetrics()).toEqual(archived);
@@ -510,7 +776,7 @@ describe("retention against in-memory PostgreSQL", () => {
     expect(archived.calls[0].day.toISOString().slice(0, 10)).toBe("2026-01-01");
     const columns =
       await pg.query(`SELECT table_name, column_name, data_type FROM information_schema.columns
-      WHERE table_name IN ('retained_job_metrics', 'retained_model_metrics') ORDER BY table_name, ordinal_position`);
+      WHERE table_name IN ('retained_job_metrics', 'retained_model_metrics', 'retained_job_stats', 'retained_job_duration_metrics') ORDER BY table_name, ordinal_position`);
     expect(
       columns.rows
         .filter((row) => row.table_name === "retained_job_metrics")
@@ -528,13 +794,36 @@ describe("retention against in-memory PostgreSQL", () => {
       "prompt_tokens",
       "completion_tokens",
       "cost_usd",
+      "priced_call_count",
+      "estimated_call_count",
+      "unpriced_call_count",
     ]);
+    expect(
+      columns.rows
+        .filter((row) => row.table_name === "retained_job_stats")
+        .map((row) => row.column_name)
+    ).toEqual([
+      "day",
+      "model",
+      "job_count",
+      "total_tokens",
+      "page_count_sum",
+      "page_measured_job_count",
+    ]);
+    expect(
+      columns.rows
+        .filter((row) => row.table_name === "retained_job_duration_metrics")
+        .map((row) => row.column_name)
+    ).toEqual(["day", "model", "duration_ms", "job_count"]);
     expect(
       columns.rows.some((row) =>
         ["uuid", "jsonb", "timestamp with time zone"].includes(row.data_type)
       )
     ).toBe(false);
-    const serialized = JSON.stringify(archived);
+    const serialized = JSON.stringify({
+      ...archived,
+      ...(await archivedJobStats()),
+    });
     for (const privateValue of [
       doc.id,
       doc.jobId,
@@ -612,7 +901,7 @@ describe("retention against in-memory PostgreSQL", () => {
       costs: await Promise.all([1, 7, 30].map((days) => getCostSummary(days))),
     });
     const before = await readAdmin();
-    expect(before).toEqual({
+    expect(before).toMatchObject({
       status: {
         total: 5,
         success: { count: 3, pct: 60 },

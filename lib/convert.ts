@@ -109,7 +109,7 @@ function incompleteAuditWarning(): AccessibilityError {
   };
 }
 
-/** One LiteLLM call's usage, priced from LiteLLM's /model/info at call time. */
+/** One call's usage, with the price and its provenance captured at call time. */
 export interface ModelCallUsage {
   stage: "convert" | "validate";
   model: string;
@@ -117,6 +117,9 @@ export interface ModelCallUsage {
   completionTokens: number;
   /** Null when pricing couldn't be looked up — tokens are still counted. */
   costUsd: number | null;
+  costSource?: "gateway" | "model-info" | "openai-list-price";
+  cachedPromptTokens?: number;
+  cacheCreationPromptTokens?: number;
 }
 
 /** Returned by convertPdf() on success. */
@@ -146,17 +149,62 @@ async function toModelCallUsage(
   call: LiteLLMCallResult,
   config: Pick<LiteLLMConfig, "baseUrl" | "apiKey">
 ): Promise<ModelCallUsage> {
-  const pricing = await fetchModelPricing(call.model, config);
+  // Optional provider metadata must never make a successful conversion fail
+  // an integer constraint. Inconsistent cache details become an uncached estimate.
+  const details: Pick<
+    LiteLLMCallResult,
+    "cachedPromptTokens" | "cacheCreationPromptTokens"
+  > = {};
+  const counts = [call.cachedPromptTokens, call.cacheCreationPromptTokens];
+  if (
+    counts.every(
+      (value) =>
+        value === undefined ||
+        (Number.isSafeInteger(value) && value >= 0 && value <= 2_147_483_647)
+    ) &&
+    (call.cachedPromptTokens ?? 0) + (call.cacheCreationPromptTokens ?? 0) <=
+      call.promptTokens
+  ) {
+    if (call.cachedPromptTokens !== undefined)
+      details.cachedPromptTokens = call.cachedPromptTokens;
+    if (call.cacheCreationPromptTokens !== undefined)
+      details.cacheCreationPromptTokens = call.cacheCreationPromptTokens;
+  }
+  const reportedCost =
+    typeof call.responseCostUsd === "number" &&
+    Number.isFinite(call.responseCostUsd) &&
+    call.responseCostUsd >= 0
+      ? call.responseCostUsd
+      : undefined;
+  const pricing =
+    reportedCost === undefined
+      ? await fetchModelPricing(call.model, config)
+      : null;
+  const costUsd =
+    reportedCost ??
+    computeCallCostUsd(
+      call.promptTokens,
+      call.completionTokens,
+      pricing,
+      details
+    );
   return {
     stage,
     model: call.model,
     promptTokens: call.promptTokens,
     completionTokens: call.completionTokens,
-    costUsd: computeCallCostUsd(
-      call.promptTokens,
-      call.completionTokens,
-      pricing
-    ),
+    costUsd,
+    ...(costUsd !== null
+      ? {
+          costSource:
+            reportedCost !== undefined
+              ? ("gateway" as const)
+              : pricing?.source === "openai-list-price"
+                ? ("openai-list-price" as const)
+                : ("model-info" as const),
+        }
+      : {}),
+    ...details,
   };
 }
 

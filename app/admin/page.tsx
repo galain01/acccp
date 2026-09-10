@@ -7,6 +7,7 @@ import PendingUsersTable from "@/components/ui/pending-users-table";
 import { listPendingUsersPage } from "@/lib/actions/admin-metrics";
 import { verifyRoleOrRedirect } from "@/lib/auth";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { metricsRange } from "@/lib/metrics-display";
 
 function parsePage(value: string | string[] | undefined): number {
   const raw = Array.isArray(value) ? value[0] : value;
@@ -15,7 +16,13 @@ function parsePage(value: string | string[] | undefined): number {
 }
 
 interface AdminPageProps {
-  searchParams: Promise<{ usersPage?: string; jobsPage?: string }>;
+  searchParams: Promise<{
+    usersPage?: string;
+    jobsPage?: string;
+    range?: string;
+    from?: string;
+    to?: string;
+  }>;
 }
 
 export default async function AdminPage({
@@ -26,6 +33,7 @@ export default async function AdminPage({
   const params = await searchParams;
   const usersPage = parsePage(params.usersPage);
   const jobsPage = parsePage(params.jobsPage);
+  const range = metricsRange(params);
 
   const pendingUsers = await listPendingUsersPage(usersPage);
 
@@ -33,11 +41,11 @@ export default async function AdminPage({
   // and would otherwise always reset the Tabs to the first tab. Seed the
   // uncontrolled Tabs' initial tab from whichever page param is present so
   // paginating the Metrics table doesn't kick the admin back to Users.
-  const defaultTab = params.jobsPage ? "metrics" : "users";
+  const defaultTab = params.jobsPage || params.range ? "metrics" : "users";
 
   return (
-    <main className="flex min-h-full flex-col items-center gap-6 py-12">
-      <div className="flex w-full max-w-4xl flex-col gap-6">
+    <main className="flex min-h-full flex-col items-center gap-6 px-4 py-12">
+      <div className="flex w-full max-w-6xl flex-col gap-6">
         <Button
           render={
             <Link href="/dashboard">
@@ -49,7 +57,7 @@ export default async function AdminPage({
           size="sm"
           className="self-start"
         />
-        <Tabs defaultValue={defaultTab} className="w-full">
+        <Tabs key={defaultTab} defaultValue={defaultTab} className="w-full">
           <TabsList>
             <TabsTrigger value="users">Users</TabsTrigger>
             <TabsTrigger value="metrics">Metrics</TabsTrigger>
@@ -63,7 +71,7 @@ export default async function AdminPage({
             />
           </TabsContent>
           <TabsContent value="metrics">
-            <AdminMetrics jobsPage={jobsPage} />
+            <AdminMetrics jobsPage={jobsPage} range={range} />
           </TabsContent>
         </Tabs>
       </div>
