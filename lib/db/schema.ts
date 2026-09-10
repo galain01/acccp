@@ -315,7 +315,7 @@ export const artifacts = pgTable(
     previewSnippet: text("preview_snippet"),
     isUserDownloadable: boolean("is_user_downloadable").default(true).notNull(),
     expiresAt: timestamp("expires_at", { withTimezone: true, mode: "string" })
-      .default(sql`(now() + '30 days'::interval)`)
+      .default(sql`(now() + '336 hours'::interval)`)
       .notNull(),
     createdAt: timestamp("created_at", { withTimezone: true, mode: "string" })
       .defaultNow()
@@ -493,7 +493,7 @@ export const conversionJobs = pgTable(
     }),
     reviewedByUserId: uuid("reviewed_by_user_id"),
     expiresAt: timestamp("expires_at", { withTimezone: true, mode: "string" })
-      .default(sql`(now() + '30 days'::interval)`)
+      .default(sql`(now() + '336 hours'::interval)`)
       .notNull(),
     errorCode: text("error_code"),
     errorMessage: text("error_message"),

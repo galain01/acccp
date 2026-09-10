@@ -1,8 +1,17 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { PgDialect } from "drizzle-orm/pg-core";
+import type { SQL } from "drizzle-orm";
 
 // ── Mocks ─────────────────────────────────────────────────────────────────────
 
 vi.mock("next/cache", () => ({ revalidatePath: vi.fn() }));
+vi.mock("server-only", () => ({}));
+
+vi.mock("@/lib/document-retention", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/document-retention")>()),
+  withRetainedDocument: vi.fn(),
+  deleteOwnedDocument: vi.fn(),
+}));
 
 vi.mock("@/lib/auth", () => ({
   verifyRoleOrRedirect: vi.fn().mockResolvedValue({ user: { id: "user-1" } }),
@@ -41,7 +50,12 @@ vi.mock("@/lib/storage", () => ({
 
 import { verifyRoleOrRedirect } from "@/lib/auth";
 import { db } from "@/lib/db";
-import { downloadObject, removeObjects } from "@/lib/storage";
+import { downloadObject } from "@/lib/storage";
+import {
+  deleteOwnedDocument,
+  DocumentUnavailableError,
+  withRetainedDocument,
+} from "@/lib/document-retention";
 import { deleteDocument, getDocumentHtml, listDocuments } from "./documents";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -104,6 +118,26 @@ function makeDocRow(
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+beforeEach(() => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date("2026-01-20T10:00:00.000Z"));
+});
+afterEach(() => vi.useRealTimers());
+
+function sqlCondition(condition: SQL) {
+  return new PgDialect().sqlToQuery(condition);
+}
+
+function expectRetainedScope(condition: SQL) {
+  const query = sqlCondition(condition);
+  expect(query.sql).toContain('"documents"."deleted_at" is null');
+  expect(query.sql).toContain('"documents"."created_at"');
+  expect(query.sql).toContain("clock_timestamp()");
+  expect(query.sql).toContain("interval '336 hours'");
+  expect(query.sql).toMatch(/>/);
+  return query;
+}
 
 describe("listDocuments", () => {
   beforeEach(() => vi.clearAllMocks());
@@ -199,11 +233,72 @@ describe("listDocuments", () => {
     );
 
     await expect(listDocuments("session-1")).rejects.toThrow("NEXT_REDIRECT");
+    expect(db.select).not.toHaveBeenCalled();
+  });
+
+  it("scopes document metadata and findings to owner, session, and unexpired undeleted rows", async () => {
+    const documentQuery = makeChain([makeDocRow({ jobId: "job-1" })]);
+    const findingsQuery = makeChain([
+      {
+        jobId: "job-1",
+        severity: "warning",
+        ruleCode: "other",
+        message: "Review heading",
+        suggestion: "Check the original",
+        wcag: null,
+        location: null,
+      },
+    ]);
+    vi.mocked(db.select)
+      .mockReturnValueOnce(documentQuery)
+      .mockReturnValueOnce(findingsQuery);
+
+    const [result] = await listDocuments("session-1");
+
+    expect(result.errors?.[0].message).toBe("Review heading");
+    for (const query of [documentQuery, findingsQuery]) {
+      const condition = expectRetainedScope(query.where.mock.calls[0][0]);
+      expect(condition.sql).toContain('"sessions"."owner_user_id" =');
+      expect(condition.sql).toContain('"documents"."session_id" =');
+      expect(condition.params).toContain("user-1");
+      expect(condition.params).toContain("session-1");
+    }
+    expect(findingsQuery.innerJoin).toHaveBeenCalledTimes(3);
+    expect(sqlCondition(findingsQuery.where.mock.calls[0][0]).params).toContain(
+      "job-1"
+    );
+  });
+
+  it("does not return a filename or findings when it reaches the exact 14-day boundary", async () => {
+    vi.mocked(db.select)
+      .mockReturnValueOnce(
+        makeChain([
+          makeDocRow({
+            id: "expired",
+            jobId: "old-job",
+            uploadedAt: "2026-01-06T10:00:00.000Z",
+          }),
+          makeDocRow({
+            id: "retained",
+            uploadedAt: "2026-01-06T10:00:00.001Z",
+          }),
+        ])
+      )
+      .mockReturnValueOnce(makeChain([]));
+
+    expect((await listDocuments("session-1")).map((doc) => doc.id)).toEqual([
+      "retained",
+    ]);
   });
 });
 
 describe("getDocumentHtml", () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(withRetainedDocument).mockImplementation(async (_id, action) =>
+      action(db as never, { createdAt: "2026-01-15T10:00:00Z" } as never)
+    );
+  });
 
   it("downloads and returns HTML for a document the caller owns", async () => {
     vi.mocked(db.select).mockReturnValue(
@@ -215,6 +310,10 @@ describe("getDocumentHtml", () => {
 
     expect(html).toBe("<p>Hello</p>");
     expect(downloadObject).toHaveBeenCalledWith("session-1/doc-1/output.html");
+    expect(withRetainedDocument).toHaveBeenCalledWith(
+      "doc-1",
+      expect.any(Function)
+    );
   });
 
   it("returns null when no matching artifact row is found (ownership mismatch or missing)", async () => {
@@ -234,89 +333,84 @@ describe("getDocumentHtml", () => {
 
     await expect(getDocumentHtml("doc-1")).rejects.toThrow("storage 503");
   });
+
+  it("queries the owned available HTML artifact inside the locked transaction", async () => {
+    const artifactQuery = makeChain([
+      { storageKey: "session-1/doc-1/output.html" },
+    ]);
+    const tx = { select: vi.fn().mockReturnValue(artifactQuery) };
+    vi.mocked(withRetainedDocument).mockImplementation(async (_id, action) =>
+      action(tx as never, { createdAt: "2026-01-15T10:00:00Z" } as never)
+    );
+    vi.mocked(downloadObject).mockResolvedValue(Buffer.from("<p>Saved</p>"));
+
+    expect(await getDocumentHtml("doc-1")).toBe("<p>Saved</p>");
+    expect(db.select).not.toHaveBeenCalled();
+    const query = expectRetainedScope(artifactQuery.where.mock.calls[0][0]);
+    expect(query.sql).toContain('"sessions"."owner_user_id" =');
+    expect(query.params).toEqual(
+      expect.arrayContaining(["doc-1", "user-1", "html_output", "available"])
+    );
+  });
+
+  it("returns null without touching storage when the locked document expired or was removed", async () => {
+    vi.mocked(withRetainedDocument).mockRejectedValueOnce(
+      new DocumentUnavailableError()
+    );
+
+    expect(await getDocumentHtml("doc-1")).toBeNull();
+    expect(db.select).not.toHaveBeenCalled();
+    expect(downloadObject).not.toHaveBeenCalled();
+  });
+
+  it("rejects HTML if the 14-day limit passes during the locked download", async () => {
+    vi.mocked(db.select).mockReturnValue(
+      makeChain([{ storageKey: "output.html" }])
+    );
+    vi.mocked(withRetainedDocument).mockImplementation(async (_id, action) =>
+      action(db as never, { createdAt: "2026-01-06T10:00:00.001Z" } as never)
+    );
+    vi.mocked(downloadObject).mockImplementation(async () => {
+      vi.setSystemTime(new Date("2026-01-20T10:00:00.001Z"));
+      return Buffer.from("<p>Expired during download</p>");
+    });
+
+    expect(await getDocumentHtml("doc-1")).toBeNull();
+  });
+
+  it("authenticates before locking or reading any document", async () => {
+    vi.mocked(verifyRoleOrRedirect).mockRejectedValueOnce(
+      new Error("NEXT_REDIRECT")
+    );
+    await expect(getDocumentHtml("doc-1")).rejects.toThrow("NEXT_REDIRECT");
+    expect(withRetainedDocument).not.toHaveBeenCalled();
+    expect(downloadObject).not.toHaveBeenCalled();
+  });
 });
 
 describe("deleteDocument", () => {
-  beforeEach(() => vi.clearAllMocks());
-
-  it("soft-deletes the document row and cleans PDF, legacy Word, and HTML blobs", async () => {
-    vi.mocked(db.select).mockReturnValue(
-      makeChain([{ id: "doc-1", sessionId: "session-1" }])
-    );
-    vi.mocked(db.update).mockReturnValue(makeChain(undefined));
-    vi.mocked(removeObjects).mockResolvedValue(undefined);
-
-    await deleteDocument("doc-1");
-
-    expect(db.update).toHaveBeenCalled();
-    expect(removeObjects).toHaveBeenCalledWith([
-      "session-1/doc-1/source.pdf",
-      "session-1/doc-1/source.docx",
-      "session-1/doc-1/output.html",
-    ]);
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(deleteOwnedDocument).mockResolvedValue(undefined);
   });
 
-  it("sets deletedAt on the soft-deleted row", async () => {
-    const updateChain = makeChain(undefined);
-    vi.mocked(db.select).mockReturnValue(
-      makeChain([{ id: "doc-1", sessionId: "session-1" }])
-    );
-    vi.mocked(db.update).mockReturnValue(updateChain);
-    vi.mocked(removeObjects).mockResolvedValue(undefined);
-
+  it("delegates to the shared locked tombstone and retryable cleanup with the authenticated owner", async () => {
     await deleteDocument("doc-1");
 
-    expect(updateChain.set).toHaveBeenCalledWith(
-      expect.objectContaining({ deletedAt: expect.any(String) })
+    expect(verifyRoleOrRedirect).toHaveBeenCalledWith(["instructor", "admin"]);
+    expect(deleteOwnedDocument).toHaveBeenCalledExactlyOnceWith(
+      "doc-1",
+      "user-1"
     );
-  });
-
-  it("returns without error when the document is not found (no-op)", async () => {
-    vi.mocked(db.select).mockReturnValue(makeChain([]));
-
-    await expect(deleteDocument("doc-1")).resolves.toBeUndefined();
     expect(db.update).not.toHaveBeenCalled();
-    expect(removeObjects).not.toHaveBeenCalled();
   });
 
-  it("still resolves when storage cleanup throws after the row is tombstoned", async () => {
-    vi.mocked(db.select).mockReturnValue(
-      makeChain([{ id: "doc-1", sessionId: "session-1" }])
+  it("authenticates before any delete or storage cleanup", async () => {
+    vi.mocked(verifyRoleOrRedirect).mockRejectedValueOnce(
+      new Error("NEXT_REDIRECT")
     );
-    vi.mocked(db.update).mockReturnValue(makeChain(undefined));
-    vi.mocked(removeObjects).mockRejectedValue(new Error("bucket unreachable"));
 
-    // The row is already soft-deleted; a storage error should not surface to the caller.
-    await expect(deleteDocument("doc-1")).resolves.toBeUndefined();
-  });
-
-  it("does not delete blobs when the document belongs to a different user", async () => {
-    // The select query joins sessions and constrains owner_user_id, so a
-    // document owned by another user returns no rows.
-    vi.mocked(db.select).mockReturnValue(makeChain([]));
-
-    await deleteDocument("other-users-doc");
-
-    expect(removeObjects).not.toHaveBeenCalled();
-  });
-
-  it("does not log private provider details when cleanup fails", async () => {
-    vi.mocked(db.select).mockReturnValue(
-      makeChain([{ id: "doc-1", sessionId: "session-1" }])
-    );
-    vi.mocked(db.update).mockReturnValue(makeChain(undefined));
-    vi.mocked(removeObjects).mockRejectedValue(
-      new Error("Authorization: test-service-role-key; private PDF contents")
-    );
-    const log = vi.spyOn(console, "error").mockImplementation(() => {});
-    try {
-      await deleteDocument("doc-1");
-      expect(log).toHaveBeenCalledWith(
-        "[documents] blob cleanup failed for doc-1"
-      );
-      expect(log).toHaveBeenCalledTimes(1);
-    } finally {
-      log.mockRestore();
-    }
+    await expect(deleteDocument("doc-1")).rejects.toThrow("NEXT_REDIRECT");
+    expect(deleteOwnedDocument).not.toHaveBeenCalled();
   });
 });

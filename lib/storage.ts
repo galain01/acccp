@@ -72,8 +72,22 @@ export async function createSignedUrl(
   return data.signedUrl;
 }
 
-export async function removeObjects(keys: string[]): Promise<void> {
+export async function removeObjects(
+  keys: string[],
+  options?: { signal?: AbortSignal }
+): Promise<void> {
   if (keys.length === 0) return;
-  const { error } = await storage.remove(keys);
+  // The SDK's remove method has no per-request signal argument. A scoped
+  // client supplies real cancellation for bounded retention cleanup requests.
+  const requestStorage = options?.signal
+    ? createClient(supabaseUrl!, serviceRoleKey!, {
+        auth: { persistSession: false, autoRefreshToken: false },
+        global: {
+          fetch: (input, init) =>
+            fetch(input, { ...init, signal: options.signal }),
+        },
+      }).storage.from(DOCUMENTS_BUCKET)
+    : storage;
+  const { error } = await requestStorage.remove(keys);
   if (error) throw new Error(`Storage delete failed: ${error.message}`);
 }

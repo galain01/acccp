@@ -1,6 +1,15 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { PgDialect } from "drizzle-orm/pg-core";
 
 // ── Mocks ─────────────────────────────────────────────────────────────────────
+
+vi.mock("server-only", () => ({}));
+vi.mock("@/lib/storage", () => ({
+  removeObjects: vi.fn(),
+  sourceDocxKey: vi.fn(),
+  sourcePdfKey: vi.fn(),
+  htmlOutputKey: vi.fn(),
+}));
 
 vi.mock("@/lib/auth", () => ({
   verifyRoleOrRedirect: vi
@@ -46,10 +55,9 @@ function makeChain<T>(value: T) {
   chain.offset = selfFn();
   chain.innerJoin = selfFn();
   chain.leftJoin = selfFn();
-  (chain as { then: Function }).then = (resolve: Function, reject: Function) =>
-    Promise.resolve(value).then(resolve as never, reject as never);
-  (chain as { catch: Function }).catch = (fn: Function) =>
-    Promise.resolve(value).catch(fn as never);
+  const promise = Promise.resolve(value);
+  chain.then = promise.then.bind(promise);
+  chain.catch = promise.catch.bind(promise);
 
   // Duck-types Drizzle's query builders: `any` satisfies mockReturnValue's
   // builder types while keeping property access for assertions.
@@ -291,7 +299,12 @@ describe("getCostSummary", () => {
 // ── listRecentJobs ────────────────────────────────────────────────────────────
 
 describe("listRecentJobs", () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-20T10:00:00.000Z"));
+  });
+  afterEach(() => vi.useRealTimers());
 
   const JOB_ROW = {
     jobId: "job-1",
@@ -302,6 +315,7 @@ describe("listRecentJobs", () => {
     totalTokens: 500,
     costUsd: "0.0025",
     createdAt: "2026-01-15T10:00:00Z",
+    documentCreatedAt: "2026-01-15T10:00:00Z",
   };
 
   it("returns paginated rows with costUsd coerced to a number", async () => {
@@ -356,6 +370,60 @@ describe("listRecentJobs", () => {
     const result = await listRecentJobs(1, 10);
 
     expect(result.rows[0].costUsd).toBeNull();
+  });
+
+  it("scopes the paginated count and filenames to unexpired undeleted documents", async () => {
+    const countQuery = makeChain([{ value: 1 }]);
+    const jobsQuery = makeChain([JOB_ROW]);
+    vi.mocked(db.select)
+      .mockReturnValueOnce(countQuery)
+      .mockReturnValueOnce(jobsQuery);
+
+    const result = await listRecentJobs();
+
+    expect(verifyRoleOrRedirect).toHaveBeenCalledWith(["admin"]);
+    expect(countQuery.innerJoin).toHaveBeenCalledTimes(1);
+    for (const builder of [countQuery, jobsQuery]) {
+      const query = new PgDialect().sqlToQuery(builder.where.mock.calls[0][0]);
+      expect(query.sql).toContain('"documents"."deleted_at" is null');
+      expect(query.sql).toContain('"documents"."created_at"');
+      expect(query.sql).toContain("clock_timestamp()");
+      expect(query.sql).toContain("interval '336 hours'");
+      expect(query.sql).toMatch(/>/);
+    }
+    expect(result.rows[0]).not.toHaveProperty("documentCreatedAt");
+  });
+
+  it("removes filenames that expire during the query even when the job was recently reconverted", async () => {
+    vi.mocked(db.select)
+      .mockReturnValueOnce(makeChain([{ value: 2 }]))
+      .mockReturnValueOnce(
+        makeChain([
+          {
+            ...JOB_ROW,
+            jobId: "expired",
+            documentCreatedAt: "2026-01-06T10:00:00.000Z",
+          },
+          {
+            ...JOB_ROW,
+            jobId: "retained",
+            documentCreatedAt: "2026-01-06T10:00:00.001Z",
+          },
+        ])
+      );
+
+    expect((await listRecentJobs()).rows.map((row) => row.jobId)).toEqual([
+      "retained",
+    ]);
+  });
+
+  it("does not query document filenames without admin authorization", async () => {
+    vi.mocked(verifyRoleOrRedirect).mockRejectedValueOnce(
+      new Error("NEXT_REDIRECT")
+    );
+
+    await expect(listRecentJobs()).rejects.toThrow("NEXT_REDIRECT");
+    expect(db.select).not.toHaveBeenCalled();
   });
 });
 

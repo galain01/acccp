@@ -140,7 +140,7 @@ export default function ConversionResultDialog({
           <p className="text-sm text-muted-foreground">
             {isLoadingHtml
               ? "Loading converted HTML…"
-              : "The converted HTML for this document could not be loaded."}
+              : "This HTML is unavailable. Saved documents expire after 14 days; re-upload the original to convert it again. If it has not expired or been deleted, try again."}
           </p>
         )}
 

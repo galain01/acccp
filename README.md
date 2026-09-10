@@ -446,6 +446,14 @@ npx tsx lib/convert.ts path/to/file.pdf
 This prints the generated HTML and any accessibility findings to the terminal —
 handy for iterating on the prompts in `lib/prompts/pdf-accessibility.ts`.
 
+### Document retention
+
+Documents expire 14 days after their first saved conversion. The authenticated
+daily purge removes their files and associated database content, including
+snippets and findings. Cleanup must be explicitly enabled on the intended
+production project after a dry run; it is disabled by default. See
+[retention policy, migration and deployment steps](docs/document-retention.md).
+
 ### Conventions
 
 - Branch off `dev`; `main` is the release branch.

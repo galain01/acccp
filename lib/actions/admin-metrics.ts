@@ -4,7 +4,9 @@ import { count, desc, eq, sql } from "drizzle-orm";
 
 import { verifyRoleOrRedirect } from "@/lib/auth";
 import { db } from "@/lib/db";
+import { retainedDocumentCondition } from "@/lib/document-retention";
 import { conversionJobs, documents, modelCalls, users } from "@/lib/db/schema";
+import { isDocumentExpired } from "@/lib/retention";
 import {
   type JobStatusSummary,
   summarizeJobStatusCounts,
@@ -138,7 +140,9 @@ export async function listRecentJobs(
 
   const [{ value: totalCount }] = await db
     .select({ value: count() })
-    .from(conversionJobs);
+    .from(conversionJobs)
+    .innerJoin(documents, eq(documents.id, conversionJobs.documentId))
+    .where(retainedDocumentCondition());
 
   const rows = await db
     .select({
@@ -150,14 +154,17 @@ export async function listRecentJobs(
       totalTokens: sql<number>`coalesce(sum(${modelCalls.promptTokens} + ${modelCalls.completionTokens}), 0)`,
       costUsd: sql<string | null>`sum(${modelCalls.costUsd})`,
       createdAt: conversionJobs.createdAt,
+      documentCreatedAt: documents.createdAt,
     })
     .from(conversionJobs)
     .innerJoin(documents, eq(documents.id, conversionJobs.documentId))
     .innerJoin(users, eq(users.id, conversionJobs.requestedByUserId))
     .leftJoin(modelCalls, eq(modelCalls.jobId, conversionJobs.id))
+    .where(retainedDocumentCondition())
     .groupBy(
       conversionJobs.id,
       documents.originalFilename,
+      documents.createdAt,
       users.email,
       conversionJobs.status,
       conversionJobs.modelName,
@@ -167,11 +174,20 @@ export async function listRecentJobs(
     .limit(pageSize)
     .offset((safePage - 1) * pageSize);
 
+  const now = new Date();
   return {
-    rows: rows.map((row) => ({
-      ...row,
-      costUsd: row.costUsd != null ? Number(row.costUsd) : null,
-    })),
+    rows: rows
+      .filter((row) => !isDocumentExpired(row.documentCreatedAt, now))
+      .map((row) => ({
+        jobId: row.jobId,
+        filename: row.filename,
+        requestedByEmail: row.requestedByEmail,
+        status: row.status,
+        model: row.model,
+        totalTokens: row.totalTokens,
+        costUsd: row.costUsd != null ? Number(row.costUsd) : null,
+        createdAt: row.createdAt,
+      })),
     page: safePage,
     pageSize,
     totalCount,
