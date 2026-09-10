@@ -115,10 +115,11 @@ All read via `process.env` (no `.env.example` in the repo — check `.env` again
 
 ## Tests
 
-- Vitest, `npm run test` (or `test:watch`). Tests live in `test/`, node environment, `@/` alias mapped to the repo root in `vitest.config.ts`.
+- Vitest, `npm run test` (or `test:watch`). Tests live in `test/`, default node environment, `@/` alias mapped to the repo root in `vitest.config.ts`. `document-workspace.test.tsx` uses jsdom with real React components and mocked network calls to cover batch selection, explicit reconversion and duplicate-click prevention.
 - Coverage targets the pure/mockable core: `convert.test.ts` (pipeline with prettier/LiteLLM mocked), `litellm.test.ts` (client + cost math), `pdf-route.test.ts` (Word/PDF orchestration, ownership, persistence and failure ordering), `word-input.test.ts` (input boundaries), `word-to-pdf.test.ts` (renderer contract and safeguards), `metrics-math.test.ts` (admin aggregation), `conversion-status.test.ts` (status mapping). `admin-metrics-render.test.tsx` renders the actual dashboard with synthetic actions; isolated PostgreSQL/WASM integration suites verify retention and historical metrics. No browser end-to-end tests yet.
 
 ## Gotchas
 
-- The document `locked` flag is client-state only (`documents` has no locked column) — locking excludes a document from the next batch Convert run, and resets on reload.
+- Batch Convert selects only unlocked, supported documents with `idle` or `error` status. Successful documents require their explicit per-row Re-convert action, including after reload. Re-convert is disabled while locked or while any conversion is active. Preserve a failed response's saved document ID so retries reuse its source and job.
+- The document `locked` flag is client-state only (`documents` has no locked column) — locking excludes a document from conversion, and resets on reload. Successful status still excludes it from batch Convert after the lock resets.
 - Uploaded files are held in client memory (`UploadedDocument.file`) until first conversion persists them; a document row + storage upload only happens on convert, not on upload.

@@ -2,6 +2,7 @@
 
 import { Lock, LockOpen, X } from "lucide-react";
 import { useState } from "react";
+import { isSupportedDocumentFilename } from "@/lib/document-input";
 import { formatBytes, formatUploadTime } from "@/lib/format";
 import type { ConversionStatus, UploadedDocument } from "@/lib/types/document";
 import { Badge } from "./badge";
@@ -28,6 +29,8 @@ interface DocumentTableProps {
   documents: UploadedDocument[];
   onToggleLock: (docId: string) => void;
   onDeleteDocument: (docId: string) => void | Promise<void>;
+  onReconvert: (docId: string) => void;
+  isProcessing: boolean;
 }
 
 function statusBadge(status: ConversionStatus): React.JSX.Element {
@@ -76,6 +79,8 @@ export default function DocumentTable({
   documents,
   onToggleLock,
   onDeleteDocument,
+  onReconvert,
+  isProcessing,
 }: DocumentTableProps): React.JSX.Element {
   const [selectedDocument, setSelectedDocument] =
     useState<UploadedDocument | null>(null);
@@ -133,18 +138,23 @@ export default function DocumentTable({
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead className="w-10" />
+                <TableHead className="w-10">
+                  <span className="sr-only">Conversion lock</span>
+                </TableHead>
                 <TableHead>Document name</TableHead>
                 <TableHead>Conversion status</TableHead>
                 <TableHead>File size</TableHead>
                 <TableHead>Upload time</TableHead>
-                <TableHead className="w-10" />
+                <TableHead>Actions</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {documents.map((doc) => {
                 const canOpenResult =
                   doc.status === "success" || doc.status === "error";
+                const canReconvert =
+                  doc.status === "success" &&
+                  isSupportedDocumentFilename(doc.name);
 
                 return (
                   <TableRow key={doc.id}>
@@ -157,9 +167,10 @@ export default function DocumentTable({
                               size="icon-sm"
                               aria-label={
                                 doc.locked
-                                  ? "Unlock document for re-conversion"
-                                  : "Lock document to prevent re-conversion"
+                                  ? `Unlock ${doc.name}`
+                                  : `Lock ${doc.name}`
                               }
+                              disabled={isProcessing}
                               onClick={() => onToggleLock(doc.id)}
                             />
                           }
@@ -172,8 +183,8 @@ export default function DocumentTable({
                         </TooltipTrigger>
                         <TooltipContent>
                           {doc.locked
-                            ? "Locked — skipped on re-convert"
-                            : "Prevent re-conversion"}
+                            ? "Locked: skipped during conversion. Unlock to allow conversion."
+                            : "Lock to skip this document during conversion."}
                         </TooltipContent>
                       </Tooltip>
                     </TableCell>
@@ -197,22 +208,50 @@ export default function DocumentTable({
                     <TableCell>{formatBytes(doc.size)}</TableCell>
                     <TableCell>{formatUploadTime(doc.uploadedAt)}</TableCell>
                     <TableCell>
-                      <Tooltip>
-                        <TooltipTrigger
-                          render={
-                            <Button
-                              variant="ghost"
-                              size="icon-sm"
-                              aria-label={`Remove ${doc.name}`}
-                              className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
-                              onClick={() => handleDelete(doc)}
-                            />
-                          }
-                        >
-                          <X className="size-4" />
-                        </TooltipTrigger>
-                        <TooltipContent>Remove document</TooltipContent>
-                      </Tooltip>
+                      <div className="flex items-center gap-2">
+                        {canReconvert && (
+                          <Tooltip>
+                            <TooltipTrigger
+                              render={
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  aria-label={`Re-convert ${doc.name}`}
+                                  disabled={doc.locked || isProcessing}
+                                  focusableWhenDisabled
+                                  className="aria-disabled:opacity-50"
+                                  onClick={() => onReconvert(doc.id)}
+                                />
+                              }
+                            >
+                              Re-convert
+                            </TooltipTrigger>
+                            <TooltipContent>
+                              {doc.locked
+                                ? "Unlock this document to re-convert it."
+                                : isProcessing
+                                  ? "Wait for the current conversion to finish."
+                                  : "Convert this document again and replace its previous result."}
+                            </TooltipContent>
+                          </Tooltip>
+                        )}
+                        <Tooltip>
+                          <TooltipTrigger
+                            render={
+                              <Button
+                                variant="ghost"
+                                size="icon-sm"
+                                aria-label={`Remove ${doc.name}`}
+                                className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                                onClick={() => handleDelete(doc)}
+                              />
+                            }
+                          >
+                            <X className="size-4" />
+                          </TooltipTrigger>
+                          <TooltipContent>Remove document</TooltipContent>
+                        </Tooltip>
+                      </div>
                     </TableCell>
                   </TableRow>
                 );
