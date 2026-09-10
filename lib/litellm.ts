@@ -8,6 +8,8 @@
  *   LITELLM_MODEL      optional override; defaults to gpt-5.6-sol-2026-07-09
  */
 
+import { createHash } from "node:crypto";
+
 export interface LiteLLMConfig {
   baseUrl: string;
   apiKey: string;
@@ -34,6 +36,10 @@ export interface LiteLLMCallResult {
   model: string;
   promptTokens: number;
   completionTokens: number;
+  /** Gateway-reported USD cost, when supplied as a valid response header. */
+  responseCostUsd?: number;
+  cachedPromptTokens?: number;
+  cacheCreationPromptTokens?: number;
   /** Used to avoid saving a truncated document as a successful conversion. */
   finishReason?: string;
 }
@@ -111,14 +117,32 @@ export async function callLiteLLM(
         prompt_tokens?: number;
         completion_tokens?: number;
         total_tokens?: number;
+        prompt_tokens_details?: {
+          cached_tokens?: number;
+          cache_write_tokens?: number;
+          cache_creation_tokens?: number;
+        };
       };
     };
+
+    const responseCostUsd = parseNonnegativeNumber(
+      response.headers.get("x-litellm-response-cost")
+    );
+    const cachedPromptTokens = data.usage?.prompt_tokens_details?.cached_tokens;
+    const cacheCreationPromptTokens =
+      data.usage?.prompt_tokens_details?.cache_write_tokens ??
+      data.usage?.prompt_tokens_details?.cache_creation_tokens;
 
     return {
       content: data.choices[0]?.message.content?.trim() ?? "",
       model: data.model,
       promptTokens: data.usage?.prompt_tokens ?? 0,
       completionTokens: data.usage?.completion_tokens ?? 0,
+      ...(responseCostUsd !== null ? { responseCostUsd } : {}),
+      ...(cachedPromptTokens !== undefined ? { cachedPromptTokens } : {}),
+      ...(cacheCreationPromptTokens !== undefined
+        ? { cacheCreationPromptTokens }
+        : {}),
       ...(data.choices[0]?.finish_reason
         ? { finishReason: data.choices[0].finish_reason }
         : {}),
@@ -135,6 +159,67 @@ export async function callLiteLLM(
 export interface ModelPricing {
   inputCostPerToken: number;
   outputCostPerToken: number;
+  cachedInputCostPerToken?: number;
+  cacheCreationInputCostPerToken?: number;
+  source?: "gateway" | "openai-list-price";
+  sourceUrl?: string;
+  verifiedAt?: string;
+  validUntil?: string;
+  longContext?: {
+    abovePromptTokens: number;
+    inputCostPerToken: number;
+    outputCostPerToken: number;
+    cachedInputCostPerToken?: number;
+    cacheCreationInputCostPerToken?: number;
+  };
+}
+
+function parseNonnegativeNumber(value: unknown): number | null {
+  if (typeof value === "string") {
+    // Number("") and Number(null) are zero; neither means a free API call.
+    if (!/^(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(value.trim()))
+      return null;
+    value = Number(value);
+  }
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : null;
+}
+
+export const PUBLISHED_PRICING_MODELS = [
+  "gpt-5.6-sol-2026-07-09",
+  "gpt-5.6-sol",
+  "gpt-5.6",
+] as const;
+
+/** A dated list-price estimate, never a claim about the gateway's bill. */
+export function getPublishedModelPricing(
+  model: string,
+  at = new Date()
+): ModelPricing | null {
+  if (!PUBLISHED_PRICING_MODELS.some((supported) => supported === model))
+    return null;
+  // The published promotional rates are guaranteed only through Nov 21.
+  const validUntil = "2026-11-22T00:00:00.000Z";
+  if (!Number.isFinite(at.getTime()) || at.getTime() >= Date.parse(validUntil))
+    return null;
+  return {
+    inputCostPerToken: 4 / 1_000_000,
+    outputCostPerToken: 20 / 1_000_000,
+    cachedInputCostPerToken: 0.4 / 1_000_000,
+    cacheCreationInputCostPerToken: 5 / 1_000_000,
+    source: "openai-list-price",
+    sourceUrl: "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+    verifiedAt: "2026-09-10",
+    validUntil,
+    longContext: {
+      abovePromptTokens: 272_000,
+      inputCostPerToken: 8 / 1_000_000,
+      outputCostPerToken: 30 / 1_000_000,
+      cachedInputCostPerToken: 0.8 / 1_000_000,
+      cacheCreationInputCostPerToken: 10 / 1_000_000,
+    },
+  };
 }
 
 const PRICING_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -150,22 +235,29 @@ export function clearModelPricingCache(): void {
 
 /**
  * Looks up per-token pricing for `model` from LiteLLM's /model/info endpoint.
- * Returns null (never throws) if the endpoint or the cost fields are
- * unavailable — cost tracking degrades gracefully; token counts still get
- * recorded either way. Cached for 5 minutes per model since pricing is
- * low-cardinality and slow-changing.
+ * Uses a dated, labeled OpenAI list-price estimate for known Sol IDs when the
+ * gateway has no usable rates. Other unavailable rates remain null. Gateway
+ * results are cached for five minutes per endpoint, credential and model.
  */
 export async function fetchModelPricing(
   model: string,
   config: Pick<LiteLLMConfig, "baseUrl" | "apiKey">
 ): Promise<ModelPricing | null> {
-  const cached = pricingCache.get(model);
+  const cacheKey = createHash("sha256")
+    .update(JSON.stringify([config.baseUrl, config.apiKey, model]))
+    .digest("hex");
+  const cached = pricingCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return cached.value;
 
-  const value = await fetchModelPricingUncached(model, config);
-  pricingCache.set(model, {
+  const value =
+    (await fetchModelPricingUncached(model, config)) ??
+    getPublishedModelPricing(model);
+  pricingCache.set(cacheKey, {
     value,
-    expiresAt: Date.now() + PRICING_CACHE_TTL_MS,
+    expiresAt: Math.min(
+      Date.now() + PRICING_CACHE_TTL_MS,
+      value?.validUntil ? Date.parse(value.validUntil) : Infinity
+    ),
   });
   return value;
 }
@@ -177,6 +269,8 @@ async function fetchModelPricingUncached(
   try {
     const response = await fetch(`${config.baseUrl}/model/info`, {
       headers: { Authorization: `Bearer ${config.apiKey}` },
+      signal: AbortSignal.timeout(5_000),
+      redirect: "error",
     });
     if (!response.ok) return null;
 
@@ -184,28 +278,36 @@ async function fetchModelPricingUncached(
       data?: Array<{
         model_name?: string;
         litellm_params?: { model?: string };
-        model_info?: {
-          input_cost_per_token?: number;
-          output_cost_per_token?: number;
-        };
+        model_info?: Record<string, unknown>;
       }>;
     };
 
-    const entry = data.data?.find(
-      (m) => m.model_name === model || m.litellm_params?.model === model
-    );
+    const entry =
+      data.data?.find((m) => m.model_name === model) ??
+      data.data?.find((m) => m.litellm_params?.model === model);
     const info = entry?.model_info;
-    if (
-      !info ||
-      typeof info.input_cost_per_token !== "number" ||
-      typeof info.output_cost_per_token !== "number"
-    ) {
-      return null;
-    }
+    const inputCostPerToken = parseNonnegativeNumber(
+      info?.input_cost_per_token
+    );
+    const outputCostPerToken = parseNonnegativeNumber(
+      info?.output_cost_per_token
+    );
+    if (inputCostPerToken === null || outputCostPerToken === null) return null;
+    const cachedInputCostPerToken = parseNonnegativeNumber(
+      info?.cache_read_input_token_cost
+    );
+    const cacheCreationInputCostPerToken = parseNonnegativeNumber(
+      info?.cache_creation_input_token_cost
+    );
 
     return {
-      inputCostPerToken: info.input_cost_per_token,
-      outputCostPerToken: info.output_cost_per_token,
+      inputCostPerToken,
+      outputCostPerToken,
+      source: "gateway",
+      ...(cachedInputCostPerToken !== null ? { cachedInputCostPerToken } : {}),
+      ...(cacheCreationInputCostPerToken !== null
+        ? { cacheCreationInputCostPerToken }
+        : {}),
     };
   } catch {
     return null;
@@ -216,11 +318,45 @@ async function fetchModelPricingUncached(
 export function computeCallCostUsd(
   promptTokens: number,
   completionTokens: number,
-  pricing: ModelPricing | null
+  pricing: ModelPricing | null,
+  details: Pick<
+    LiteLLMCallResult,
+    "cachedPromptTokens" | "cacheCreationPromptTokens"
+  > = {}
 ): number | null {
   if (!pricing) return null;
-  return (
-    promptTokens * pricing.inputCostPerToken +
-    completionTokens * pricing.outputCostPerToken
-  );
+  const cached = details.cachedPromptTokens ?? 0;
+  const written = details.cacheCreationPromptTokens ?? 0;
+  if (
+    ![promptTokens, completionTokens, cached, written].every(
+      (value) => Number.isSafeInteger(value) && value >= 0
+    ) ||
+    cached + written > promptTokens
+  )
+    return null;
+  const rates =
+    pricing.longContext && promptTokens > pricing.longContext.abovePromptTokens
+      ? pricing.longContext
+      : pricing;
+  // Preserve the ordinary-input estimate if a gateway omits cache rates. The
+  // response cost, when available, is always preferred by the caller.
+  const cacheReadRate =
+    rates.cachedInputCostPerToken ?? rates.inputCostPerToken;
+  const cacheWriteRate =
+    rates.cacheCreationInputCostPerToken ?? rates.inputCostPerToken;
+  if (
+    [
+      rates.inputCostPerToken,
+      rates.outputCostPerToken,
+      cacheReadRate,
+      cacheWriteRate,
+    ].some((value) => parseNonnegativeNumber(value) === null)
+  )
+    return null;
+  const cost =
+    (promptTokens - cached - written) * rates.inputCostPerToken +
+    cached * cacheReadRate +
+    written * cacheWriteRate +
+    completionTokens * rates.outputCostPerToken;
+  return Number.isFinite(cost) ? cost : null;
 }

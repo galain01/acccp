@@ -1,14 +1,12 @@
 /**
  * GET /api/admin/model-info
  *
- * Live pricing for the currently configured LiteLLM model, straight from
- * LiteLLM's own /model/info — separate from the historical spend stored in
- * model_calls (which is priced at call time so past spend doesn't shift if
- * pricing changes later).
+ * Current gateway rates, or a dated OpenAI list-price estimate for known Sol
+ * model IDs. Historical model_calls costs remain immutable snapshots.
  *
  * Response: application/json
- *   { model: string, inputCostPerToken: number, outputCostPerToken: number }
- *   404 if LiteLLM has no pricing on file for the configured model.
+ *   { model: string, ...ModelPricing } including source and optional cache rates.
+ *   404 if neither source has usable pricing for the configured model.
  */
 
 import { NextResponse } from "next/server";
@@ -38,7 +36,6 @@ export async function GET() {
 
   return NextResponse.json({
     model: config.model,
-    inputCostPerToken: pricing.inputCostPerToken,
-    outputCostPerToken: pricing.outputCostPerToken,
+    ...pricing,
   });
 }

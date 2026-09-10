@@ -483,6 +483,9 @@ export const conversionJobs = pgTable(
     modelName: text("model_name"),
     promptVersion: text("prompt_version"),
     attemptCount: integer("attempt_count").default(0).notNull(),
+    // Latest attempt only; unknown historical measurements remain NULL.
+    processingDurationMs: bigint("processing_duration_ms", { mode: "number" }),
+    pageCount: integer("page_count"),
     startedAt: timestamp("started_at", { withTimezone: true, mode: "string" }),
     completedAt: timestamp("completed_at", {
       withTimezone: true,
@@ -551,6 +554,11 @@ export const conversionJobs = pgTable(
       sql`attempt_count >= 0`
     ),
     check(
+      "conversion_jobs_duration_nonnegative_chk",
+      sql`processing_duration_ms >= 0`
+    ),
+    check("conversion_jobs_page_count_positive_chk", sql`page_count > 0`),
+    check(
       "conversion_jobs_review_consistency_chk",
       sql`((review_status = 'reviewed'::review_status) AND (reviewed_at IS NOT NULL)) OR (review_status <> 'reviewed'::review_status)`
     ),
@@ -565,9 +573,12 @@ export const modelCalls = pgTable(
     model: text().notNull(),
     promptTokens: integer("prompt_tokens").notNull(),
     completionTokens: integer("completion_tokens").notNull(),
-    // Snapshotted at call time from LiteLLM /model/info so historical spend
-    // doesn't shift if pricing changes later. Null when pricing lookup fails.
-    costUsd: numeric("cost_usd", { precision: 12, scale: 6 }),
+    // Snapshotted gateway charge or labeled rate estimate. Existing values never
+    // shift with later prices; NULL means neither a charge nor estimate is known.
+    costUsd: numeric("cost_usd"),
+    costSource: text("cost_source"),
+    cachedPromptTokens: integer("cached_prompt_tokens"),
+    cacheCreationPromptTokens: integer("cache_creation_prompt_tokens"),
     createdAt: timestamp("created_at", { withTimezone: true, mode: "string" })
       .defaultNow()
       .notNull(),
@@ -590,6 +601,18 @@ export const modelCalls = pgTable(
     check(
       "model_calls_completion_tokens_nonnegative_chk",
       sql`completion_tokens >= 0`
+    ),
+    check(
+      "model_calls_cost_source_chk",
+      sql`cost_source in ('gateway', 'model-info', 'openai-list-price')`
+    ),
+    check(
+      "model_calls_cached_tokens_nonnegative_chk",
+      sql`cached_prompt_tokens >= 0`
+    ),
+    check(
+      "model_calls_cache_creation_tokens_nonnegative_chk",
+      sql`cache_creation_prompt_tokens >= 0`
     ),
   ]
 ).enableRLS();
@@ -621,6 +644,11 @@ export const retainedModelMetrics = pgTable(
     // An unrestricted decimal preserves exact sums without a per-call size cap.
     // NULL means no call in this group had known pricing; partial sums stay known.
     costUsd: numeric("cost_usd"),
+    // NULL on groups created before coverage was measured. Mixing old/new
+    // groups must preserve that unknown coverage rather than assume zero.
+    pricedCallCount: bigint("priced_call_count", { mode: "number" }),
+    estimatedCallCount: bigint("estimated_call_count", { mode: "number" }),
+    unpricedCallCount: bigint("unpriced_call_count", { mode: "number" }),
   },
   (table) => [
     primaryKey({ columns: [table.day, table.model, table.stage] }),
@@ -632,6 +660,70 @@ export const retainedModelMetrics = pgTable(
     check(
       "retained_model_metrics_completion_tokens_nonnegative_chk",
       sql`completion_tokens >= 0`
+    ),
+    check(
+      "retained_model_metrics_priced_count_nonnegative_chk",
+      sql`priced_call_count >= 0`
+    ),
+    check(
+      "retained_model_metrics_estimated_count_nonnegative_chk",
+      sql`estimated_call_count >= 0`
+    ),
+    check(
+      "retained_model_metrics_unpriced_count_nonnegative_chk",
+      sql`unpriced_call_count >= 0`
+    ),
+    check(
+      "retained_model_metrics_coverage_consistent_chk",
+      sql`estimated_call_count <= priced_call_count and priced_call_count + unpriced_call_count = call_count`
+    ),
+  ]
+).enableRLS();
+
+// Job cohorts use original job creation day, even if the last attempt happened
+// later. Tokens include every recorded attempt; pages describe the latest one.
+export const retainedJobStats = pgTable(
+  "retained_job_stats",
+  {
+    day: date().notNull(),
+    model: text().notNull(),
+    jobCount: bigint("job_count", { mode: "number" }).notNull(),
+    totalTokens: bigint("total_tokens", { mode: "number" }).notNull(),
+    pageCountSum: bigint("page_count_sum", { mode: "number" }).notNull(),
+    pageMeasuredJobCount: bigint("page_measured_job_count", {
+      mode: "number",
+    }).notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.day, table.model] }),
+    check("retained_job_stats_count_positive_chk", sql`job_count > 0`),
+    check("retained_job_stats_tokens_nonnegative_chk", sql`total_tokens >= 0`),
+    check(
+      "retained_job_stats_pages_consistent_chk",
+      sql`page_measured_job_count >= 0 and page_measured_job_count <= job_count and page_count_sum >= page_measured_job_count`
+    ),
+  ]
+).enableRLS();
+
+// Exact millisecond frequency counts allow weighted median/min/max after purge
+// without retaining identifiers, document content, or absolute event times.
+export const retainedJobDurationMetrics = pgTable(
+  "retained_job_duration_metrics",
+  {
+    day: date().notNull(),
+    model: text().notNull(),
+    durationMs: bigint("duration_ms", { mode: "number" }).notNull(),
+    jobCount: bigint("job_count", { mode: "number" }).notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.day, table.model, table.durationMs] }),
+    check(
+      "retained_job_duration_metrics_duration_nonnegative_chk",
+      sql`duration_ms >= 0`
+    ),
+    check(
+      "retained_job_duration_metrics_count_positive_chk",
+      sql`job_count > 0`
     ),
   ]
 ).enableRLS();

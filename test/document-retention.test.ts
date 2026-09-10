@@ -235,11 +235,11 @@ describe("document purge", () => {
         order: mocks.db.execute.mock.invocationCallOrder[index],
       }))
       .filter(({ sql }) => sql.includes('insert into "retained_'));
-    expect(writes).toHaveLength(2);
+    expect(writes).toHaveLength(4);
     expect(mocks.remove.mock.invocationCallOrder[0]).toBeLessThan(
       writes[0].order
     );
-    expect(writes[1].order).toBeLessThan(
+    expect(writes[3].order).toBeLessThan(
       mocks.db.delete.mock.invocationCallOrder[0]
     );
   });
@@ -266,7 +266,7 @@ describe("document purge", () => {
     queued([document], [{ id: document.id }], []);
     expect(await purgeDocumentIfEligible(document.id)).toBe("purged");
     expect(mocks.db.delete).toHaveBeenCalledExactlyOnceWith(documents);
-    expect(archiveQueries()).toHaveLength(2);
+    expect(archiveQueries()).toHaveLength(4);
   });
 
   it("retains source rows and rolls back if preserving metrics fails", async () => {
@@ -294,7 +294,7 @@ describe("document purge", () => {
       throw new Error("private-delete-details");
     });
     expect(await purgeDocumentIfEligible(document.id)).toBe("failed");
-    expect(archiveQueries()).toHaveLength(2);
+    expect(archiveQueries()).toHaveLength(4);
     expect(mocks.events).toEqual(["begin", "storage", "rollback"]);
     expect(JSON.stringify(vi.mocked(console.error).mock.calls)).not.toContain(
       "private-delete-details"

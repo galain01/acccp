@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { performance } from "node:perf_hooks";
 import { NextRequest } from "next/server";
 import { PgDialect } from "drizzle-orm/pg-core";
 import type { SQL } from "drizzle-orm";
@@ -8,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   auth: vi.fn(),
   convert: vi.fn(),
   renderWord: vi.fn(),
+  countPages: vi.fn(),
   upload: vi.fn(),
   download: vi.fn(),
   remove: vi.fn(),
@@ -24,6 +26,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("@/lib/auth", () => ({ verifyRoleOrUnauthorized: mocks.auth }));
 vi.mock("@/lib/convert", () => ({ convertPdf: mocks.convert }));
+vi.mock("@/lib/pdf-page-count", () => ({ countPdfPages: mocks.countPages }));
 vi.mock("@/lib/word-to-pdf", () => ({
   renderWordToPdf: mocks.renderWord,
   WordToPdfError: class extends Error {
@@ -80,6 +83,9 @@ const usage = {
   model: "test-vision-model",
   promptTokens: 100,
   completionTokens: 50,
+  cachedPromptTokens: 20,
+  cacheCreationPromptTokens: 10,
+  costSource: "gateway" as const,
   costUsd: 0.001,
 };
 
@@ -148,6 +154,10 @@ function artifactValues() {
 describe("document conversion route", () => {
   const inserted = new Map<unknown, ReturnType<typeof chain>>();
   const updated = chain();
+  afterEach(() => {
+    if (vi.isMockFunction(performance.now))
+      vi.mocked(performance.now).mockRestore();
+  });
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -187,6 +197,7 @@ describe("document conversion route", () => {
     mocks.remove.mockResolvedValue(undefined);
     mocks.download.mockResolvedValue(Buffer.from(PDF));
     mocks.renderWord.mockResolvedValue(Buffer.from(PDF));
+    mocks.countPages.mockResolvedValue(8);
     mocks.convert.mockResolvedValue({
       html: "<h2>Course</h2><p>Content</p>",
       errors: [],
@@ -257,6 +268,151 @@ describe("document conversion route", () => {
     ]);
     expect(inserted.get(modelCalls)?.values).toHaveBeenCalledWith([
       { jobId: "job-1", ...usage, costUsd: "0.001" },
+    ]);
+  });
+
+  it("counts the exact rendered PDF and records metrics without changing the Word source", async () => {
+    const rendered = Buffer.from("%PDF-1.7\ndistinct rendered PDF");
+    mocks.renderWord.mockResolvedValueOnce(rendered);
+    mocks.countPages.mockResolvedValueOnce(9);
+    expect(
+      (await POST(request({ name: "course.docx", contents: DOCX }))).status
+    ).toBe(200);
+    expect(mocks.countPages).toHaveBeenCalledExactlyOnceWith(rendered);
+    expect(mocks.convert).toHaveBeenCalledWith(rendered, "course.pdf");
+    expect(inserted.get(conversionJobs)?.values).toHaveBeenCalledWith(
+      expect.objectContaining({ pageCount: 9, processingDurationMs: null })
+    );
+    expect(updated.set).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: "completed",
+        pageCount: 9,
+        processingDurationMs: expect.any(Number),
+      })
+    );
+  });
+
+  it("keeps an unknown page count null while conversion succeeds", async () => {
+    mocks.countPages.mockResolvedValueOnce(null);
+    expect((await POST(request())).status).toBe(200);
+    expect(inserted.get(conversionJobs)?.values).toHaveBeenCalledWith(
+      expect.objectContaining({ pageCount: null })
+    );
+    expect(updated.set).toHaveBeenCalledWith(
+      expect.objectContaining({ status: "completed", pageCount: null })
+    );
+  });
+
+  it("measures from before Word rendering through the last successful metadata write", async () => {
+    let clock = 1_000;
+    const now = vi.spyOn(performance, "now").mockImplementation(() => clock);
+    mocks.renderWord.mockImplementationOnce(async () => {
+      clock += 100;
+      return Buffer.from(PDF);
+    });
+    mocks.countPages.mockImplementationOnce(async () => {
+      clock += 20;
+      return 8;
+    });
+    mocks.upload.mockImplementation(async () => {
+      clock += 30;
+    });
+    mocks.convert.mockImplementationOnce(async () => {
+      clock += 200;
+      return {
+        html: "<h2>Course</h2>",
+        errors: [],
+        model: usage.model,
+        tokensUsed: 150,
+        extractionWarnings: [],
+        calls: [usage],
+      };
+    });
+    const insert = mocks.db.insert.getMockImplementation()!;
+    mocks.db.insert.mockImplementation((table: unknown) => {
+      const builder = insert(table);
+      if (
+        [artifacts, validationFindings, jobEvents, modelCalls].includes(
+          table as typeof artifacts
+        )
+      ) {
+        const completion = Promise.resolve([]).then(() => {
+          clock += 10;
+          return [];
+        });
+        builder.then = completion.then.bind(completion);
+      }
+      return builder;
+    });
+    expect(
+      (await POST(request({ name: "course.docx", contents: DOCX }))).status
+    ).toBe(200);
+    // 100 rendering + 20 parsing + 90 storage + 200 model + 60 metadata.
+    expect(updated.set).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: "completed",
+        processingDurationMs: 470,
+      })
+    );
+    expect(now.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.renderWord.mock.invocationCallOrder[0]
+    );
+    expect(updated.set.mock.invocationCallOrder[0]).toBeGreaterThan(
+      inserted.get(modelCalls)!.values.mock.invocationCallOrder[0]
+    );
+  });
+
+  it("resets the previous successful duration on retry and leaves failed attempts null", async () => {
+    ownedDocument();
+    mocks.convert.mockResolvedValueOnce({
+      error: "Conversion failed",
+      calls: [usage],
+    });
+    expect((await POST(request({ documentId: "doc-1" }))).status).toBe(500);
+    expect(
+      inserted.get(conversionJobs)?.onConflictDoUpdate
+    ).toHaveBeenCalledWith(
+      expect.objectContaining({
+        set: expect.objectContaining({
+          processingDurationMs: null,
+          pageCount: 8,
+        }),
+      })
+    );
+    expect(updated.set).toHaveBeenCalledWith(
+      expect.objectContaining({ status: "failed", processingDurationMs: null })
+    );
+    expect(
+      updated.set.mock.calls.some(([value]) => value.status === "completed")
+    ).toBe(false);
+  });
+
+  it("stores absent cache and cost-source metadata as unknown, preserving confirmed zeroes", async () => {
+    mocks.convert.mockResolvedValueOnce({
+      html: "<h2>Course</h2>",
+      errors: [],
+      model: usage.model,
+      tokensUsed: 150,
+      extractionWarnings: [],
+      calls: [
+        {
+          stage: usage.stage,
+          model: usage.model,
+          promptTokens: 100,
+          completionTokens: 50,
+          costUsd: null,
+          cachedPromptTokens: 0,
+        },
+      ],
+    });
+    expect((await POST(request())).status).toBe(200);
+    expect(inserted.get(modelCalls)?.values).toHaveBeenCalledWith([
+      expect.objectContaining({
+        cachedPromptTokens: 0,
+        cacheCreationPromptTokens: null,
+        costSource: null,
+        costUsd: null,
+      }),
     ]);
   });
 

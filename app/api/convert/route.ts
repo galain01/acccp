@@ -28,6 +28,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import { NextRequest, NextResponse } from "next/server";
 import { and, eq, isNull, sql } from "drizzle-orm";
 
@@ -54,6 +55,7 @@ import {
   withRetainedDocument,
 } from "@/lib/document-retention";
 import { retentionExpiresAt } from "@/lib/retention";
+import { countPdfPages } from "@/lib/pdf-page-count";
 import { db } from "@/lib/db";
 import {
   artifacts,
@@ -116,6 +118,7 @@ async function recordJobFailure(
         updatedAt: failedAt,
         errorCode: code,
         errorMessage: message,
+        processingDurationMs: null,
       })
       .where(eq(conversionJobs.id, jobId));
     await tx.insert(jobEvents).values({
@@ -133,6 +136,9 @@ async function recordJobFailure(
           model: call.model,
           promptTokens: call.promptTokens,
           completionTokens: call.completionTokens,
+          cachedPromptTokens: call.cachedPromptTokens ?? null,
+          cacheCreationPromptTokens: call.cacheCreationPromptTokens ?? null,
+          costSource: call.costSource ?? null,
           costUsd: call.costUsd !== null ? String(call.costUsd) : null,
         }))
       );
@@ -267,12 +273,17 @@ async function convertRequest(req: NextRequest) {
     documentId = "";
   }
 
+  // Measure server processing after source validation, including Word
+  // rendering, page counting, model work, storage and success metadata writes.
+  const processingStartedAt = performance.now();
+  const startedAt = new Date().toISOString();
   const isWord = isDocxFilename(filename);
   const pdfFilename = isWord ? filename.replace(/\.docx$/i, ".pdf") : filename;
   const buffer = isWord
     ? await renderWordToPdf(sourceBuffer, filename)
     : sourceBuffer;
   const sourceMimeType = isWord ? DOCX_MIME_TYPE : PDF_MIME_TYPE;
+  const pageCount = await countPdfPages(buffer);
 
   if (!isReconversion) {
     const [created] = await db
@@ -317,7 +328,6 @@ async function convertRequest(req: NextRequest) {
   }
 
   // conversion_jobs is unique per document, so a re-convert updates in place.
-  const startedAt = new Date().toISOString();
   const job = await withRetainedDocument(documentId, async (tx, document) => {
     const expiresAt = retentionExpiresAt(document.createdAt);
     const [savedJob] = await tx
@@ -330,6 +340,8 @@ async function convertRequest(req: NextRequest) {
         attemptCount: 1,
         provider: PROVIDER,
         expiresAt,
+        pageCount,
+        processingDurationMs: null,
       })
       .onConflictDoUpdate({
         target: conversionJobs.documentId,
@@ -342,6 +354,8 @@ async function convertRequest(req: NextRequest) {
           attemptCount: sql`${conversionJobs.attemptCount} + 1`,
           updatedAt: startedAt,
           expiresAt,
+          pageCount,
+          processingDurationMs: null,
         },
       })
       .returning({ id: conversionJobs.id });
@@ -389,17 +403,7 @@ async function convertRequest(req: NextRequest) {
       }
       await uploadObject(htmlKey, result.html, "text/html; charset=utf-8");
 
-      const completedAt = new Date().toISOString();
-      await tx
-        .update(conversionJobs)
-        .set({
-          status: "completed",
-          completedAt,
-          updatedAt: completedAt,
-          modelName: result.model,
-          expiresAt,
-        })
-        .where(eq(conversionJobs.id, jobId));
+      const artifactsUpdatedAt = new Date().toISOString();
 
       // uq_available_artifact_per_job_type allows one available artifact per type,
       // so a re-convert updates the existing row rather than inserting a second.
@@ -450,7 +454,7 @@ async function convertRequest(req: NextRequest) {
               storageKey: artifact.storageKey,
               fileSizeBytes: artifact.fileSizeBytes,
               previewSnippet: artifact.previewSnippet,
-              createdAt: completedAt,
+              createdAt: artifactsUpdatedAt,
               expiresAt,
             },
           });
@@ -494,9 +498,31 @@ async function convertRequest(req: NextRequest) {
           model: call.model,
           promptTokens: call.promptTokens,
           completionTokens: call.completionTokens,
+          cachedPromptTokens: call.cachedPromptTokens ?? null,
+          cacheCreationPromptTokens: call.cacheCreationPromptTokens ?? null,
+          costSource: call.costSource ?? null,
           costUsd: call.costUsd !== null ? String(call.costUsd) : null,
         }))
       );
+
+      // Complete last so duration includes every successful artifact, finding,
+      // event and model-call write. A rollback leaves no successful duration.
+      const completedAt = new Date().toISOString();
+      await tx
+        .update(conversionJobs)
+        .set({
+          status: "completed",
+          completedAt,
+          updatedAt: completedAt,
+          modelName: result.model,
+          expiresAt,
+          pageCount,
+          processingDurationMs: Math.max(
+            0,
+            Math.round(performance.now() - processingStartedAt)
+          ),
+        })
+        .where(eq(conversionJobs.id, jobId));
     });
   } catch (error) {
     if (error instanceof DocumentUnavailableError) throw error;
