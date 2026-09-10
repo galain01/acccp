@@ -5,7 +5,14 @@ import { count, desc, eq, sql } from "drizzle-orm";
 import { verifyRoleOrRedirect } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { retainedDocumentCondition } from "@/lib/document-retention";
-import { conversionJobs, documents, modelCalls, users } from "@/lib/db/schema";
+import {
+  conversionJobs,
+  documents,
+  modelCalls,
+  retainedJobMetrics,
+  retainedModelMetrics,
+  users,
+} from "@/lib/db/schema";
 import { isDocumentExpired } from "@/lib/retention";
 import {
   type JobStatusSummary,
@@ -23,7 +30,7 @@ async function requireAdmin(): Promise<void> {
 /** Clamps an arbitrary caller-supplied window to a sane range. */
 function clampDays(days: number): number {
   if (!Number.isFinite(days) || days <= 0) return 30;
-  return Math.min(Math.round(days), MAX_WINDOW_DAYS);
+  return Math.max(1, Math.min(Math.round(days), MAX_WINDOW_DAYS));
 }
 
 export interface UserRoleCounts {
@@ -52,12 +59,25 @@ export async function getJobStatusSummary(): Promise<JobStatusSummary> {
   await requireAdmin();
 
   const rows = await db
-    .select({ status: conversionJobs.status, count: count() })
-    .from(conversionJobs)
-    .groupBy(conversionJobs.status);
+    .select({
+      status: sql<string>`metrics.status`,
+      count: sql<string>`sum(metrics.count)`,
+    })
+    // One statement sees either the live job or its retained aggregate. Two
+    // separate reads could double-count or miss a job while purge commits.
+    .from(
+      sql`(
+      select ${conversionJobs.status} as status, count(*) as count
+      from ${conversionJobs} group by ${conversionJobs.status}
+      union all
+      select ${retainedJobMetrics.status} as status, sum(${retainedJobMetrics.jobCount}) as count
+      from ${retainedJobMetrics} group by ${retainedJobMetrics.status}
+    ) metrics`
+    )
+    .groupBy(sql`metrics.status`);
 
   const counts: Record<string, number> = {};
-  for (const row of rows) counts[row.status] = row.count;
+  for (const row of rows) counts[row.status] = Number(row.count);
 
   return summarizeJobStatusCounts(counts);
 }
@@ -67,19 +87,24 @@ export interface TokenUsage {
   totalTokens: number;
 }
 
-/** `days` is a parameter (not hardcoded) so callers can query other windows. */
+/** UTC calendar days including today, matching the retained daily aggregates. */
 export async function getTokenUsage(days = 30): Promise<TokenUsage> {
   await requireAdmin();
   const window = clampDays(days);
 
-  const [row] = await db
-    .select({
-      totalTokens: sql<number>`coalesce(sum(${modelCalls.promptTokens} + ${modelCalls.completionTokens}), 0)`,
-    })
-    .from(modelCalls)
-    .where(
-      sql`${modelCalls.createdAt} >= now() - (${window} * interval '1 day')`
-    );
+  const [row] = await db.select({
+    totalTokens: sql<string>`coalesce(sum(usage.tokens), 0)`,
+  }).from(sql`(
+      select ${modelCalls.promptTokens}::bigint + ${modelCalls.completionTokens} as tokens
+      from ${modelCalls}
+      where (${modelCalls.createdAt} at time zone 'UTC')::date >=
+        (now() at time zone 'UTC')::date - (${window}::integer - 1)
+      union all
+      select ${retainedModelMetrics.promptTokens} + ${retainedModelMetrics.completionTokens} as tokens
+      from ${retainedModelMetrics}
+      where ${retainedModelMetrics.day} >=
+        (now() at time zone 'UTC')::date - (${window}::integer - 1)
+    ) usage`);
 
   return { days: window, totalTokens: Number(row?.totalTokens ?? 0) };
 }
@@ -94,21 +119,22 @@ export async function getCostSummary(days = 30): Promise<CostSummary> {
   await requireAdmin();
   const window = clampDays(days);
 
-  const [windowRow] = await db
-    .select({ cost: sql<string | null>`sum(${modelCalls.costUsd})` })
-    .from(modelCalls)
-    .where(
-      sql`${modelCalls.createdAt} >= now() - (${window} * interval '1 day')`
-    );
-
-  const [allTimeRow] = await db
-    .select({ cost: sql<string | null>`sum(${modelCalls.costUsd})` })
-    .from(modelCalls);
+  const [row] = await db.select({
+    windowCost: sql<string | null>`sum(usage.cost) filter (where usage.day >=
+        (now() at time zone 'UTC')::date - (${window}::integer - 1))`,
+    allTimeCost: sql<string | null>`sum(usage.cost)`,
+  }).from(sql`(
+      select (${modelCalls.createdAt} at time zone 'UTC')::date as day, ${modelCalls.costUsd} as cost
+      from ${modelCalls}
+      union all
+      select ${retainedModelMetrics.day} as day, ${retainedModelMetrics.costUsd} as cost
+      from ${retainedModelMetrics}
+    ) usage`);
 
   return {
     days: window,
-    windowCostUsd: windowRow?.cost != null ? Number(windowRow.cost) : null,
-    allTimeCostUsd: allTimeRow?.cost != null ? Number(allTimeRow.cost) : null,
+    windowCostUsd: row?.windowCost != null ? Number(row.windowCost) : null,
+    allTimeCostUsd: row?.allTimeCost != null ? Number(row.allTimeCost) : null,
   };
 }
 

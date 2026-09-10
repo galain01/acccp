@@ -102,6 +102,11 @@ export default async function AdminMetrics({
 
   return (
     <div className="flex w-full max-w-4xl flex-col gap-6">
+      <p className="text-sm text-muted-foreground">
+        Usage and conversion outcome totals are kept after online document
+        copies expire. Token and cost windows use UTC calendar days, including
+        today. File details below are available for 14 days.
+      </p>
       <div className="grid grid-cols-2 gap-4 @lg:grid-cols-4">
         <Card size="sm">
           <CardHeader>
@@ -156,8 +161,8 @@ export default async function AdminMetrics({
         <Table>
           <TableCaption>
             {recentJobs.rows.length === 0
-              ? "No conversion jobs yet."
-              : `Recent conversion jobs — page ${recentJobs.page} of ${recentJobs.totalPages}.`}
+              ? "No unexpired conversion jobs to display. Historical totals remain above."
+              : `Unexpired conversion jobs — page ${recentJobs.page} of ${recentJobs.totalPages}.`}
           </TableCaption>
           <TableHeader>
             <TableRow>

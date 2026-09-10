@@ -195,6 +195,25 @@ describe("getJobStatusSummary", () => {
     expect(result.success.count).toBe(0);
     expect(result.error.count).toBe(0);
   });
+
+  it("combines current jobs and retained outcome totals in one database snapshot", async () => {
+    const query = makeChain([
+      { status: "completed", count: "12" },
+      { status: "failed", count: "3" },
+    ]);
+    vi.mocked(db.select).mockReturnValue(query);
+    const result = await getJobStatusSummary();
+    expect(result).toEqual({
+      total: 15,
+      success: { count: 12, pct: 80 },
+      error: { count: 3, pct: 20 },
+    });
+    expect(db.select).toHaveBeenCalledTimes(1);
+    const source = new PgDialect().sqlToQuery(query.from.mock.calls[0][0]);
+    expect(source.sql).toContain('"conversion_jobs"');
+    expect(source.sql).toContain('"retained_job_metrics"');
+    expect(source.sql).toContain("union all");
+  });
 });
 
 // ── getTokenUsage ─────────────────────────────────────────────────────────────
@@ -242,6 +261,27 @@ describe("getTokenUsage", () => {
 
     expect((await getTokenUsage()).totalTokens).toBe(0);
   });
+
+  it("combines live calls and retained daily totals with the same UTC day boundary", async () => {
+    const query = makeChain([{ totalTokens: "12345" }]);
+    vi.mocked(db.select).mockReturnValue(query);
+    expect(await getTokenUsage(7)).toEqual({ days: 7, totalTokens: 12345 });
+    expect(db.select).toHaveBeenCalledTimes(1);
+    const source = new PgDialect().sqlToQuery(query.from.mock.calls[0][0]);
+    expect(source.sql).toContain('"model_calls"');
+    expect(source.sql).toContain('"retained_model_metrics"');
+    expect(source.sql).toContain("union all");
+    expect(source.sql.match(/at time zone 'UTC'/g)).toHaveLength(3);
+    expect(source.params).toEqual([7, 7]);
+  });
+
+  it.each([NaN, Infinity, 0.1])(
+    "keeps calendar windows valid for %s",
+    async (days) => {
+      vi.mocked(db.select).mockReturnValue(makeChain([{ totalTokens: "0" }]));
+      expect((await getTokenUsage(days)).days).toBe(days === 0.1 ? 1 : 30);
+    }
+  );
 });
 
 // ── getCostSummary ────────────────────────────────────────────────────────────
@@ -250,9 +290,9 @@ describe("getCostSummary", () => {
   beforeEach(() => vi.clearAllMocks());
 
   it("returns both window and all-time costs when data exists", async () => {
-    vi.mocked(db.select)
-      .mockReturnValueOnce(makeChain([{ cost: "12.5" }])) // window
-      .mockReturnValueOnce(makeChain([{ cost: "100.25" }])); // all-time
+    vi.mocked(db.select).mockReturnValueOnce(
+      makeChain([{ windowCost: "12.5", allTimeCost: "100.25" }])
+    );
 
     const result = await getCostSummary(30);
 
@@ -264,9 +304,9 @@ describe("getCostSummary", () => {
   });
 
   it("returns null for both costs when no model_calls exist", async () => {
-    vi.mocked(db.select)
-      .mockReturnValueOnce(makeChain([{ cost: null }]))
-      .mockReturnValueOnce(makeChain([{ cost: null }]));
+    vi.mocked(db.select).mockReturnValueOnce(
+      makeChain([{ windowCost: null, allTimeCost: null }])
+    );
 
     const result = await getCostSummary();
 
@@ -275,9 +315,9 @@ describe("getCostSummary", () => {
   });
 
   it("can return null window cost while all-time cost is known", async () => {
-    vi.mocked(db.select)
-      .mockReturnValueOnce(makeChain([{ cost: null }]))
-      .mockReturnValueOnce(makeChain([{ cost: "50.0" }]));
+    vi.mocked(db.select).mockReturnValueOnce(
+      makeChain([{ windowCost: null, allTimeCost: "50.0" }])
+    );
 
     const result = await getCostSummary(7);
 
@@ -286,14 +326,43 @@ describe("getCostSummary", () => {
   });
 
   it("uses the default 30-day window when no argument is passed", async () => {
-    vi.mocked(db.select)
-      .mockReturnValueOnce(makeChain([{ cost: "0" }]))
-      .mockReturnValueOnce(makeChain([{ cost: "0" }]));
+    vi.mocked(db.select).mockReturnValueOnce(
+      makeChain([{ windowCost: "0", allTimeCost: "0" }])
+    );
 
     const result = await getCostSummary();
 
     expect(result.days).toBe(30);
   });
+
+  it("uses one live-plus-retained snapshot for window and all-time costs", async () => {
+    const query = makeChain([{ windowCost: "5.00", allTimeCost: "100.00" }]);
+    vi.mocked(db.select).mockReturnValue(query);
+    expect(await getCostSummary(7)).toEqual({
+      days: 7,
+      windowCostUsd: 5,
+      allTimeCostUsd: 100,
+    });
+    expect(db.select).toHaveBeenCalledTimes(1);
+    const source = new PgDialect().sqlToQuery(query.from.mock.calls[0][0]);
+    expect(source.sql).toContain('"model_calls"');
+    expect(source.sql).toContain('"retained_model_metrics"');
+    expect(source.sql).toContain("union all");
+  });
+});
+
+describe("retained admin metric authorization", () => {
+  beforeEach(() => vi.clearAllMocks());
+  it.each([getJobStatusSummary, getTokenUsage, getCostSummary])(
+    "does not read live or retained metrics without admin permission",
+    async (action) => {
+      vi.mocked(verifyRoleOrRedirect).mockRejectedValueOnce(
+        new Error("NEXT_REDIRECT")
+      );
+      await expect(action()).rejects.toThrow("NEXT_REDIRECT");
+      expect(db.select).not.toHaveBeenCalled();
+    }
+  );
 });
 
 // ── listRecentJobs ────────────────────────────────────────────────────────────

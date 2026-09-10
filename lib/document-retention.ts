@@ -16,6 +16,7 @@ import {
 } from "drizzle-orm";
 import { db } from "./db";
 import { artifacts, conversionJobs, documents, sessions } from "./db/schema";
+import { archiveDocumentMetrics } from "./retained-metrics";
 import {
   htmlOutputKey,
   removeObjects,
@@ -228,6 +229,11 @@ async function purgeNextDocument(
       // Do not remove discovery metadata until every canonical and legacy blob
       // deletion succeeds. A partial failure leaves this row for the next run.
       await removeWithinBudget(keys, deadline);
+      // Preserve only anonymous daily totals. This and the cascade commit
+      // together, so failed deletion or retries cannot count a job/call twice.
+      await archiveDocumentMetrics(tx, document.id, () =>
+        boundQueries(tx, deadline - Date.now())
+      );
       await boundQueries(tx, deadline - Date.now());
       // Existing FKs cascade to jobs, artifacts, findings, events and model calls.
       await tx.delete(documents).where(eq(documents.id, document.id));

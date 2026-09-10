@@ -82,6 +82,10 @@ const queued = (...values: unknown[]) => {
   return builders;
 };
 const query = (value: SQL) => new PgDialect().sqlToQuery(value);
+const archiveQueries = () =>
+  mocks.db.execute.mock.calls
+    .map(([statement]) => query(statement))
+    .filter(({ sql }) => sql.includes('insert into "retained_'));
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -198,6 +202,7 @@ describe("document purge", () => {
     expect(mocks.remove).not.toHaveBeenCalled();
     expect(mocks.db.update).not.toHaveBeenCalled();
     expect(mocks.db.delete).not.toHaveBeenCalled();
+    expect(archiveQueries()).toEqual([]);
   });
 
   it("removes all canonical and legacy artifact keys before the document cascade", async () => {
@@ -224,6 +229,19 @@ describe("document purge", () => {
       mocks.db.delete.mock.invocationCallOrder[0]
     );
     expect(mocks.db.delete).toHaveBeenCalledExactlyOnceWith(documents);
+    const writes = mocks.db.execute.mock.calls
+      .map(([statement], index) => ({
+        sql: query(statement).sql,
+        order: mocks.db.execute.mock.invocationCallOrder[index],
+      }))
+      .filter(({ sql }) => sql.includes('insert into "retained_'));
+    expect(writes).toHaveLength(2);
+    expect(mocks.remove.mock.invocationCallOrder[0]).toBeLessThan(
+      writes[0].order
+    );
+    expect(writes[1].order).toBeLessThan(
+      mocks.db.delete.mock.invocationCallOrder[0]
+    );
   });
 
   it("still cleans orphaned sources when a document has no conversion job", async () => {
@@ -240,6 +258,7 @@ describe("document purge", () => {
     );
     expect(await purgeDocumentIfEligible(document.id)).toBe("failed");
     expect(mocks.db.delete).not.toHaveBeenCalled();
+    expect(archiveQueries()).toEqual([]);
     expect(mocks.events).toEqual(["begin", "rollback"]);
     expect(JSON.stringify(vi.mocked(console.error).mock.calls)).not.toContain(
       "private-provider"
@@ -247,6 +266,39 @@ describe("document purge", () => {
     queued([document], [{ id: document.id }], []);
     expect(await purgeDocumentIfEligible(document.id)).toBe("purged");
     expect(mocks.db.delete).toHaveBeenCalledExactlyOnceWith(documents);
+    expect(archiveQueries()).toHaveLength(2);
+  });
+
+  it("retains source rows and rolls back if preserving metrics fails", async () => {
+    queued([document], [{ id: document.id }], []);
+    mocks.db.execute.mockImplementation(async (statement: SQL) => {
+      if (
+        query(statement).sql.includes('insert into "retained_model_metrics"')
+      ) {
+        throw new Error("private-database-details");
+      }
+      return [];
+    });
+    expect(await purgeDocumentIfEligible(document.id)).toBe("failed");
+    expect(mocks.remove).toHaveBeenCalledTimes(1);
+    expect(mocks.db.delete).not.toHaveBeenCalled();
+    expect(mocks.events).toEqual(["begin", "storage", "rollback"]);
+    expect(JSON.stringify(vi.mocked(console.error).mock.calls)).not.toContain(
+      "private-database-details"
+    );
+  });
+
+  it("rolls back aggregate writes if the final cascade fails", async () => {
+    queued([document], [{ id: document.id }], []);
+    mocks.db.delete.mockImplementationOnce(() => {
+      throw new Error("private-delete-details");
+    });
+    expect(await purgeDocumentIfEligible(document.id)).toBe("failed");
+    expect(archiveQueries()).toHaveLength(2);
+    expect(mocks.events).toEqual(["begin", "storage", "rollback"]);
+    expect(JSON.stringify(vi.mocked(console.error).mock.calls)).not.toContain(
+      "private-delete-details"
+    );
   });
 
   it("uses skipLocked so simultaneous cleanup cannot claim the same row", async () => {

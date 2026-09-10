@@ -15,9 +15,31 @@ Admin tables also hide expired document filenames. The daily purge removes:
 - The document row and its cascading jobs, artifacts, preview snippets,
   validation findings, job events, and model-call usage records.
 
-Accounts, authentication records, sessions and their titles remain. Historical
-job/token/cost reports lose the deleted per-document records; this implementation
-does not copy them into another retention store.
+Accounts, authentication records, sessions and their titles remain. **Overall
+admin usage and outcome totals also remain.** Before deleting each document's
+database records, the purge adds their numeric totals to two persistent tables:
+
+- `retained_job_metrics`: UTC day, final/latest job status, and job count.
+- `retained_model_metrics`: UTC day, model, conversion/review stage, call count,
+  input/output tokens, and known cost (nullable when no pricing was available).
+
+These tables contain no filenames, document text, snippets, findings, error
+messages, user/email/instructor identifiers, document/job/session identifiers,
+or exact timestamps. They have no link back to a document or instructor. They
+remain server-side, protected by RLS and admin authorization in the app; the
+document retention sweep does not expire them.
+
+The admin cards combine live records and retained totals in a single SQL
+statement per metric. This prevents a concurrent purge from double-counting or
+temporarily dropping records between separate reads. Usage windows include
+today and the preceding calendar days in UTC, matching the retained daily
+granularity. All-time cost and outcome totals persist beyond 14 days.
+
+Success rate keeps the app's existing definition: the latest job outcome per
+document, not a success rate for every historical reconversion attempt. All
+recorded model calls (including reconversions and failures) contribute tokens
+and cost. Purging a completed document does not turn its outcome into an error.
+Detailed filename/requester rows disappear with expiry; overall totals remain.
 
 ## Cleanup and concurrency
 
@@ -26,9 +48,12 @@ row lock. The database clock is checked after acquiring the lock and again after
 retained-document operations. Model calls run outside transactions; a result
 arriving after expiry/deletion cannot recreate artifacts or return saved HTML.
 
-Storage deletion must succeed before the document row is hard-deleted. Missing
-objects are safe to delete again. If storage or the database fails, the row stays
-discoverable for another attempt. Manual Delete and partial source-upload
+Storage deletion must succeed before metrics are archived and the document row
+is hard-deleted. Both aggregate updates and database deletion share the same
+transaction. If either fails, neither commits; retrying cannot add the totals
+twice. A committed deletion removes the source row, so subsequent runs have
+nothing left to count. Missing objects are safe to delete again. If storage or
+the database fails, the row stays discoverable for another attempt. Manual Delete and partial source-upload
 failures commit a tombstone before trying cleanup, making them eligible for the
 next sweep immediately. Each run is bounded to 200 documents and a 240-second
 budget; locked documents are skipped and remain eligible. Counts and remaining
@@ -68,10 +93,13 @@ database/storage with `acccp`.
       OR created_at <= clock_timestamp() - interval '336 hours';
    ```
 
-3. Apply `0008_fourteen_day_retention.sql` through the normal Drizzle migration
-   process to that database. It changes the two expiry defaults and aligns all
+3. Apply `0008_fourteen_day_retention.sql` and `0009_retained_metrics.sql` through
+   the normal Drizzle migration process to that database, before deploying the
+   new app. Migration 0008 changes the two expiry defaults and aligns all
    existing job/artifact expiry timestamps with their original document. It does
-   not delete data. Use the existing verified-TLS migration setup in the README.
+   not delete data. Migration 0009 creates the aggregate tables without copying
+   or deleting any documents. Use the existing verified-TLS migration setup in
+   the README.
 4. Configure a fresh `CRON_SECRET` only for the original **acccp Production**
    environment. Leave `DOCUMENT_PURGE_ENABLED` unset initially. Keep these values
    out of source control, client variables, shell history and query strings.
@@ -119,8 +147,25 @@ npx vitest run --config test/retention-postgres.config.mjs
 
 It reads no application env files or database URL. The fixture uses the actual
 0007 schema snapshot's enums, table definitions, checks and foreign keys, then
-applies 0008. It omits unrelated indexes/views. The five integration tests cover
+applies 0008 and 0009. It omits unrelated indexes/views. Integration tests cover
 migration reruns/backfill/defaults, expiry visibility, cascades, partial-storage
-failure/retry, ownership and rollback of writes that cross expiry. PGlite runs
+failure/retry, ownership, rollback of writes that cross expiry, and retained
+totals across successful deletion and database rollback/retry. PGlite runs
 one backend, so this does not simulate separate database connections competing
 for a lock; unit tests separately verify the lock/query ordering.
+
+## What users see and what is local
+
+The website's saved document list is loaded from the server. Expired documents
+are omitted on the next page/list load. If none remain, the page says “No saved
+documents available” and explains the 14-day policy. An old tab trying to fetch
+an unavailable HTML result gets an explanatory message and can re-upload the
+original. Already-loaded HTML remains in that tab's memory.
+
+“Local” includes browser memory and browser storage as well as downloaded files
+on a computer. This app currently holds picked files and loaded HTML in React
+memory; it does not provide durable offline document storage in IndexedDB or
+localStorage. That memory can be lost when the page reloads or closes. The purge
+does not clear browser memory, browser storage, or downloaded/original files on
+the user's device. It only removes the server-managed document copies and
+content-bearing database records described above.

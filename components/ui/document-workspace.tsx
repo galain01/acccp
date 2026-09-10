@@ -173,10 +173,11 @@ export default function DocumentWorkspace({
         </h2>
         <FileUpload onFilesSelected={addDocuments} disabled={isProcessing} />
         <p className="text-sm text-muted-foreground">
-          Download the HTML you want to keep. Originals, generated PDFs, and
-          HTML expire 14 days after you first click Convert and the document is
-          saved. Re-converting does not extend this period. Expired files become
-          unavailable immediately and are removed by daily cleanup.
+          Download the HTML you want to keep. Online copies of originals,
+          generated PDFs, and HTML expire 14 days after the document is first
+          saved for conversion. Re-converting does not extend this period.
+          Expired online copies become unavailable and are queued for daily
+          cleanup. Files on your computer are unaffected.
         </p>
       </section>
 

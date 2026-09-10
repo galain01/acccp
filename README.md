@@ -450,7 +450,9 @@ handy for iterating on the prompts in `lib/prompts/pdf-accessibility.ts`.
 
 Documents expire 14 days after their first saved conversion. The authenticated
 daily purge removes their files and associated database content, including
-snippets and findings. Cleanup must be explicitly enabled on the intended
+snippets and findings, while preserving overall daily/model token, cost, and
+conversion-outcome totals without document or instructor identifiers. Cleanup
+must be explicitly enabled on the intended
 production project after a dry run; it is disabled by default. See
 [retention policy, migration and deployment steps](docs/document-retention.md).
 
