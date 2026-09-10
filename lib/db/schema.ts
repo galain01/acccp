@@ -16,6 +16,7 @@ import {
   pgView,
   date,
   pgEnum,
+  primaryKey,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 
@@ -315,7 +316,7 @@ export const artifacts = pgTable(
     previewSnippet: text("preview_snippet"),
     isUserDownloadable: boolean("is_user_downloadable").default(true).notNull(),
     expiresAt: timestamp("expires_at", { withTimezone: true, mode: "string" })
-      .default(sql`(now() + '30 days'::interval)`)
+      .default(sql`(now() + '336 hours'::interval)`)
       .notNull(),
     createdAt: timestamp("created_at", { withTimezone: true, mode: "string" })
       .defaultNow()
@@ -493,7 +494,7 @@ export const conversionJobs = pgTable(
     }),
     reviewedByUserId: uuid("reviewed_by_user_id"),
     expiresAt: timestamp("expires_at", { withTimezone: true, mode: "string" })
-      .default(sql`(now() + '30 days'::interval)`)
+      .default(sql`(now() + '336 hours'::interval)`)
       .notNull(),
     errorCode: text("error_code"),
     errorMessage: text("error_message"),
@@ -588,6 +589,48 @@ export const modelCalls = pgTable(
     check("model_calls_prompt_tokens_nonnegative_chk", sql`prompt_tokens >= 0`),
     check(
       "model_calls_completion_tokens_nonnegative_chk",
+      sql`completion_tokens >= 0`
+    ),
+  ]
+).enableRLS();
+
+// Daily totals survive document deletion without a link back to any person,
+// document, job, source content, or exact event timestamp.
+export const retainedJobMetrics = pgTable(
+  "retained_job_metrics",
+  {
+    day: date().notNull(),
+    status: jobStatus().notNull(),
+    jobCount: bigint("job_count", { mode: "number" }).notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.day, table.status] }),
+    check("retained_job_metrics_count_nonnegative_chk", sql`job_count >= 0`),
+  ]
+).enableRLS();
+
+export const retainedModelMetrics = pgTable(
+  "retained_model_metrics",
+  {
+    day: date().notNull(),
+    model: text().notNull(),
+    stage: modelCallStage().notNull(),
+    callCount: bigint("call_count", { mode: "number" }).notNull(),
+    promptTokens: bigint("prompt_tokens", { mode: "number" }).notNull(),
+    completionTokens: bigint("completion_tokens", { mode: "number" }).notNull(),
+    // An unrestricted decimal preserves exact sums without a per-call size cap.
+    // NULL means no call in this group had known pricing; partial sums stay known.
+    costUsd: numeric("cost_usd"),
+  },
+  (table) => [
+    primaryKey({ columns: [table.day, table.model, table.stage] }),
+    check("retained_model_metrics_count_nonnegative_chk", sql`call_count >= 0`),
+    check(
+      "retained_model_metrics_prompt_tokens_nonnegative_chk",
+      sql`prompt_tokens >= 0`
+    ),
+    check(
+      "retained_model_metrics_completion_tokens_nonnegative_chk",
       sql`completion_tokens >= 0`
     ),
   ]

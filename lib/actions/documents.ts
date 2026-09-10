@@ -1,11 +1,17 @@
 "use server";
 
-import { and, desc, eq, inArray, isNull } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 
 import type { AccessibilityError } from "@/lib/convert";
 import { verifyRoleOrRedirect } from "@/lib/auth";
 import { toConversionStatus } from "@/lib/conversion-status";
 import { db } from "@/lib/db";
+import {
+  deleteOwnedDocument,
+  DocumentUnavailableError,
+  retainedDocumentCondition,
+  withRetainedDocument,
+} from "@/lib/document-retention";
 import {
   artifacts,
   conversionJobs,
@@ -13,13 +19,8 @@ import {
   sessions,
   validationFindings,
 } from "@/lib/db/schema";
-import {
-  downloadObject,
-  htmlOutputKey,
-  removeObjects,
-  sourceDocxKey,
-  sourcePdfKey,
-} from "@/lib/storage";
+import { isDocumentExpired } from "@/lib/retention";
+import { downloadObject } from "@/lib/storage";
 import type { UploadedDocument } from "@/lib/types/document";
 
 // RLS is enabled but has no policies, so ownership is enforced here: every
@@ -51,7 +52,7 @@ export async function listDocuments(
       and(
         eq(documents.sessionId, sessionId),
         eq(sessions.ownerUserId, userId),
-        isNull(documents.deletedAt)
+        retainedDocumentCondition()
       )
     )
     .orderBy(desc(documents.createdAt));
@@ -72,7 +73,20 @@ export async function listDocuments(
         location: validationFindings.location,
       })
       .from(validationFindings)
-      .where(inArray(validationFindings.jobId, jobIds));
+      .innerJoin(
+        conversionJobs,
+        eq(conversionJobs.id, validationFindings.jobId)
+      )
+      .innerJoin(documents, eq(documents.id, conversionJobs.documentId))
+      .innerJoin(sessions, eq(sessions.id, documents.sessionId))
+      .where(
+        and(
+          inArray(validationFindings.jobId, jobIds),
+          eq(documents.sessionId, sessionId),
+          eq(sessions.ownerUserId, userId),
+          retainedDocumentCondition()
+        )
+      );
 
     for (const finding of findingRows) {
       const errors = findingsByJobId.get(finding.jobId) ?? [];
@@ -89,18 +103,22 @@ export async function listDocuments(
     }
   }
 
-  return rows.map((row) => ({
-    id: row.id,
-    documentId: row.id,
-    name: row.name,
-    size: row.size,
-    uploadedAt: new Date(row.uploadedAt),
-    status: toConversionStatus(row.status),
-    // `documents` has no locked column, so the lock resets on reload.
-    locked: false,
-    errorMessage: row.errorMessage ?? undefined,
-    errors: row.jobId ? findingsByJobId.get(row.jobId) : undefined,
-  }));
+  // A second query can cross the expiry boundary after the list was read.
+  const now = new Date();
+  return rows
+    .filter((row) => !isDocumentExpired(row.uploadedAt, now))
+    .map((row) => ({
+      id: row.id,
+      documentId: row.id,
+      name: row.name,
+      size: row.size,
+      uploadedAt: new Date(row.uploadedAt),
+      status: toConversionStatus(row.status),
+      // `documents` has no locked column, so the lock resets on reload.
+      locked: false,
+      errorMessage: row.errorMessage ?? undefined,
+      errors: row.jobId ? findingsByJobId.get(row.jobId) : undefined,
+    }));
 }
 
 /**
@@ -112,58 +130,39 @@ export async function getDocumentHtml(
 ): Promise<string | null> {
   const userId = await requireUserId();
 
-  const [row] = await db
-    .select({ storageKey: artifacts.storageKey })
-    .from(artifacts)
-    .innerJoin(conversionJobs, eq(conversionJobs.id, artifacts.jobId))
-    .innerJoin(documents, eq(documents.id, conversionJobs.documentId))
-    .innerJoin(sessions, eq(sessions.id, documents.sessionId))
-    .where(
-      and(
-        eq(documents.id, documentId),
-        eq(sessions.ownerUserId, userId),
-        eq(artifacts.artifactType, "html_output"),
-        eq(artifacts.artifactStatus, "available"),
-        isNull(documents.deletedAt)
-      )
-    );
+  try {
+    return await withRetainedDocument(documentId, async (tx, document) => {
+      const [row] = await tx
+        .select({ storageKey: artifacts.storageKey })
+        .from(artifacts)
+        .innerJoin(conversionJobs, eq(conversionJobs.id, artifacts.jobId))
+        .innerJoin(documents, eq(documents.id, conversionJobs.documentId))
+        .innerJoin(sessions, eq(sessions.id, documents.sessionId))
+        .where(
+          and(
+            eq(documents.id, documentId),
+            eq(sessions.ownerUserId, userId),
+            eq(artifacts.artifactType, "html_output"),
+            eq(artifacts.artifactStatus, "available"),
+            retainedDocumentCondition()
+          )
+        );
 
-  if (!row) return null;
-  return (await downloadObject(row.storageKey)).toString("utf8");
+      if (!row) return null;
+      const html = await downloadObject(row.storageKey);
+      // Keep the row locked through storage access; expiry can still pass
+      // while the network request is in flight.
+      if (isDocumentExpired(document.createdAt)) return null;
+      return html.toString("utf8");
+    });
+  } catch (error) {
+    if (error instanceof DocumentUnavailableError) return null;
+    throw error;
+  }
 }
 
 export async function deleteDocument(documentId: string): Promise<void> {
   const userId = await requireUserId();
 
-  const [doc] = await db
-    .select({ id: documents.id, sessionId: documents.sessionId })
-    .from(documents)
-    .innerJoin(sessions, eq(sessions.id, documents.sessionId))
-    .where(
-      and(
-        eq(documents.id, documentId),
-        eq(sessions.ownerUserId, userId),
-        isNull(documents.deletedAt)
-      )
-    );
-  if (!doc) return;
-
-  await db
-    .update(documents)
-    .set({ deletedAt: new Date().toISOString() })
-    .where(eq(documents.id, documentId));
-
-  // Best-effort: the row is already tombstoned, so a storage hiccup here should
-  // not surface as a failed delete.
-  try {
-    await removeObjects([
-      sourcePdfKey(doc.sessionId, documentId),
-      sourceDocxKey(doc.sessionId, documentId),
-      htmlOutputKey(doc.sessionId, documentId),
-    ]);
-  } catch {
-    // A storage provider error can include request details; keep those out of
-    // deployment logs while retaining the event needed to retry cleanup.
-    console.error(`[documents] blob cleanup failed for ${documentId}`);
-  }
+  await deleteOwnedDocument(documentId, userId);
 }

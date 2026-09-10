@@ -57,6 +57,20 @@
       "when": 1788886847272,
       "tag": "0007_source_pdf",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1789047515466,
+      "tag": "0008_fourteen_day_retention",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1789048703693,
+      "tag": "0009_retained_metrics",
+      "breakpoints": true
     }
   ]
 }

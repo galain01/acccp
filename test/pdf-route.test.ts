@@ -11,6 +11,8 @@ const mocks = vi.hoisted(() => ({
   upload: vi.fn(),
   download: vi.fn(),
   remove: vi.fn(),
+  withRetainedDocument: vi.fn(),
+  purgeDocumentIfEligible: vi.fn(),
   db: {
     select: vi.fn(),
     insert: vi.fn(),
@@ -34,6 +36,16 @@ vi.mock("@/lib/word-to-pdf", () => ({
   },
 }));
 vi.mock("@/lib/db", () => ({ db: mocks.db }));
+vi.mock("@/lib/document-retention", async () => {
+  const { sql } = await import("drizzle-orm");
+  return {
+    withRetainedDocument: mocks.withRetainedDocument,
+    purgeDocumentIfEligible: mocks.purgeDocumentIfEligible,
+    retainedDocumentCondition: () =>
+      sql`"documents"."deleted_at" is null and "documents"."created_at" > clock_timestamp() - interval '336 hours'`,
+    DocumentUnavailableError: class extends Error {},
+  };
+});
 vi.mock("@/lib/storage", () => ({
   downloadObject: mocks.download,
   uploadObject: mocks.upload,
@@ -47,6 +59,7 @@ vi.mock("@/lib/storage", () => ({
 }));
 
 import { POST } from "@/app/api/convert/route";
+import { DocumentUnavailableError } from "@/lib/document-retention";
 import { WordToPdfError } from "@/lib/word-to-pdf";
 import { WORD_RENDERING_REVIEW_MESSAGE } from "@/lib/word-rendering-review";
 import {
@@ -139,6 +152,18 @@ describe("document conversion route", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     inserted.clear();
+    mocks.withRetainedDocument
+      .mockReset()
+      .mockImplementation(
+        (
+          _id: string,
+          action: (
+            tx: typeof mocks.db,
+            document: { createdAt: string }
+          ) => unknown
+        ) => action(mocks.db, { createdAt: "2026-09-01T00:00:00.000Z" })
+      );
+    mocks.purgeDocumentIfEligible.mockResolvedValue("purged");
     mocks.auth.mockResolvedValue({ session: { user: { id: "user-1" } } });
     mocks.db.select.mockReturnValue(chain([{ id: "session-1" }]));
     mocks.db.insert.mockImplementation((table: unknown) => {
@@ -528,7 +553,7 @@ describe("document conversion route", () => {
     }
   );
 
-  it("removes the new document and uploaded sources if storing the rendered PDF fails", async () => {
+  it("queues the new document for retryable cleanup if storing the rendered PDF fails", async () => {
     mocks.upload
       .mockResolvedValueOnce(undefined)
       .mockRejectedValueOnce(new Error("storage details must stay private"));
@@ -537,11 +562,10 @@ describe("document conversion route", () => {
     );
 
     expect(response.status).toBe(500);
-    expect(mocks.db.delete).toHaveBeenCalledWith(documents);
-    expect(mocks.remove).toHaveBeenCalledWith([
-      "session-1/doc-1/source.docx",
-      "session-1/doc-1/source.pdf",
-    ]);
+    expect(mocks.db.delete).not.toHaveBeenCalledWith(documents);
+    expect(mocks.db.update).toHaveBeenCalledWith(documents);
+    expect(updated.set).toHaveBeenCalledWith({ deletedAt: expect.any(String) });
+    expect(mocks.purgeDocumentIfEligible).toHaveBeenCalledWith("doc-1");
     expect(mocks.db.insert).not.toHaveBeenCalledWith(conversionJobs);
     expect(mocks.convert).not.toHaveBeenCalled();
   });
@@ -702,6 +726,62 @@ describe("document conversion route", () => {
       "confidential-filename.pdf"
     );
   });
+
+  it("anchors both job and artifact expiry to the original document, including reconversion", async () => {
+    ownedDocument();
+    expect((await POST(request({ documentId: "doc-1" }))).status).toBe(200);
+    expect(inserted.get(conversionJobs)?.values).toHaveBeenCalledWith(
+      expect.objectContaining({ expiresAt: "2026-09-15T00:00:00.000Z" })
+    );
+    expect(
+      inserted.get(conversionJobs)?.onConflictDoUpdate
+    ).toHaveBeenCalledWith(
+      expect.objectContaining({
+        set: expect.objectContaining({ expiresAt: "2026-09-15T00:00:00.000Z" }),
+      })
+    );
+    for (const artifact of artifactValues()) {
+      expect(artifact.expiresAt).toBe("2026-09-15T00:00:00.000Z");
+    }
+  });
+
+  it("rejects a saved document that expires before its source is read", async () => {
+    ownedDocument();
+    mocks.withRetainedDocument.mockRejectedValueOnce(
+      new DocumentUnavailableError()
+    );
+    expect((await POST(request({ documentId: "doc-1" }))).status).toBe(410);
+    expect(mocks.download).not.toHaveBeenCalled();
+    expect(mocks.renderWord).not.toHaveBeenCalled();
+    expect(mocks.convert).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    "does not recreate expired/deleted content after the model returns (failed=%s)",
+    async (failed) => {
+      mocks.convert.mockImplementationOnce(async () => {
+        mocks.withRetainedDocument.mockRejectedValueOnce(
+          new DocumentUnavailableError()
+        );
+        return failed
+          ? { error: "Conversion failed", calls: [usage] }
+          : {
+              html: "<h2>Late output</h2>",
+              errors: [],
+              model: usage.model,
+              tokensUsed: 150,
+              calls: [usage],
+              extractionWarnings: [],
+            };
+      });
+      const response = await POST(request());
+      expect(response.status).toBe(410);
+      expect(mocks.upload).toHaveBeenCalledTimes(1); // Original upload only.
+      expect(artifactValues()).toEqual([]);
+      expect(inserted.get(jobEvents)).toBeUndefined();
+      expect(inserted.get(modelCalls)).toBeUndefined();
+    }
+  );
 
   it("keeps storage exception details out of responses and server logs", async () => {
     mocks.upload.mockRejectedValueOnce(

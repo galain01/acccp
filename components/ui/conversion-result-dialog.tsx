@@ -140,7 +140,7 @@ export default function ConversionResultDialog({
           <p className="text-sm text-muted-foreground">
             {isLoadingHtml
               ? "Loading converted HTML…"
-              : "The converted HTML for this document could not be loaded."}
+              : "This online HTML copy is unavailable. Online documents expire after 14 days; re-upload the original to convert it again. Files downloaded to your computer are unaffected. If the online copy has not expired or been deleted, try again."}
           </p>
         )}
 

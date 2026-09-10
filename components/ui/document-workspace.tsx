@@ -172,6 +172,13 @@ export default function DocumentWorkspace({
           Upload documents
         </h2>
         <FileUpload onFilesSelected={addDocuments} disabled={isProcessing} />
+        <p className="text-sm text-muted-foreground">
+          Download the HTML you want to keep. Online copies of originals,
+          generated PDFs, and HTML expire 14 days after the document is first
+          saved for conversion. Re-converting does not extend this period.
+          Expired online copies become unavailable and are queued for daily
+          cleanup. Files on your computer are unaffected.
+        </p>
       </section>
 
       <section>
@@ -185,9 +192,9 @@ export default function DocumentWorkspace({
         )}
         {hasUnsupportedDocuments && (
           <p className="mt-2 text-sm text-muted-foreground">
-            Previous conversions remain available. Only unlocked PDF and .docx
-            documents are converted. Save older .doc files as .docx before
-            uploading.
+            Previous conversions remain available until they expire. Only
+            unlocked PDF and .docx documents are converted. Save older .doc
+            files as .docx before uploading.
           </p>
         )}
         {hasDocuments && isProcessing && (

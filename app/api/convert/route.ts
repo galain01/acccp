@@ -47,6 +47,13 @@ import {
 } from "@/lib/document-input";
 import { renderWordToPdf, WordToPdfError } from "@/lib/word-to-pdf";
 import { withWordRenderingReview } from "@/lib/word-rendering-review";
+import {
+  DocumentUnavailableError,
+  purgeDocumentIfEligible,
+  retainedDocumentCondition,
+  withRetainedDocument,
+} from "@/lib/document-retention";
+import { retentionExpiresAt } from "@/lib/retention";
 import { db } from "@/lib/db";
 import {
   artifacts,
@@ -60,7 +67,6 @@ import {
 import {
   downloadObject,
   htmlOutputKey,
-  removeObjects,
   sourceDocxKey,
   sourcePdfKey,
   uploadObject,
@@ -93,6 +99,7 @@ function json(body: unknown, status: number) {
 }
 
 async function recordJobFailure(
+  documentId: string,
   jobId: string,
   code: string,
   message: string,
@@ -100,7 +107,7 @@ async function recordJobFailure(
   detail?: string
 ) {
   const failedAt = new Date().toISOString();
-  await db.transaction(async (tx) => {
+  await withRetainedDocument(documentId, async (tx) => {
     await tx
       .update(conversionJobs)
       .set({
@@ -186,7 +193,7 @@ async function convertRequest(req: NextRequest) {
         and(
           eq(documents.id, existingDocumentId),
           eq(documents.sessionId, sessionId),
-          isNull(documents.deletedAt)
+          retainedDocumentCondition()
         )
       );
     if (!existing) return json({ error: "Document not found." }, 404);
@@ -203,12 +210,15 @@ async function convertRequest(req: NextRequest) {
       );
     }
     try {
-      sourceBuffer = await downloadObject(
-        isDocxFilename(filename)
-          ? sourceDocxKey(sessionId, documentId)
-          : sourcePdfKey(sessionId, documentId)
+      sourceBuffer = await withRetainedDocument(documentId, async () =>
+        downloadObject(
+          isDocxFilename(filename)
+            ? sourceDocxKey(sessionId, documentId)
+            : sourcePdfKey(sessionId, documentId)
+        )
       );
-    } catch {
+    } catch (error) {
+      if (error instanceof DocumentUnavailableError) throw error;
       console.error(`[api/convert] document=${documentId} source fetch failed`);
       return json({ error: "Could not read the stored document." }, 500);
     }
@@ -281,23 +291,26 @@ async function convertRequest(req: NextRequest) {
     const sourceKey = isWord
       ? sourceDocxKey(sessionId, documentId)
       : sourcePdfKey(sessionId, documentId);
-    // The row is useless without its source, so don't leave one behind.
+    // Every blob write takes the same document lock as the purge. A failed
+    // upload keeps a tombstone until storage cleanup actually succeeds.
     try {
-      await uploadObject(sourceKey, sourceBuffer, sourceMimeType);
-      if (isWord) {
-        await uploadObject(
-          sourcePdfKey(sessionId, documentId),
-          buffer,
-          PDF_MIME_TYPE
-        );
-      }
-    } catch {
-      await db.delete(documents).where(eq(documents.id, documentId));
-      try {
-        await removeObjects([sourceKey, sourcePdfKey(sessionId, documentId)]);
-      } catch {
-        console.error("[api/convert] incomplete source cleanup failed");
-      }
+      await withRetainedDocument(documentId, async () => {
+        await uploadObject(sourceKey, sourceBuffer, sourceMimeType);
+        if (isWord) {
+          await uploadObject(
+            sourcePdfKey(sessionId, documentId),
+            buffer,
+            PDF_MIME_TYPE
+          );
+        }
+      });
+    } catch (error) {
+      if (error instanceof DocumentUnavailableError) throw error;
+      await db
+        .update(documents)
+        .set({ deletedAt: new Date().toISOString() })
+        .where(eq(documents.id, documentId));
+      await purgeDocumentIfEligible(documentId);
       console.error(`[api/convert] document=${documentId} upload failed`);
       return json({ error: "Could not store the uploaded document." }, 500);
     }
@@ -305,29 +318,35 @@ async function convertRequest(req: NextRequest) {
 
   // conversion_jobs is unique per document, so a re-convert updates in place.
   const startedAt = new Date().toISOString();
-  const [job] = await db
-    .insert(conversionJobs)
-    .values({
-      documentId,
-      requestedByUserId: userId,
-      status: "processing",
-      startedAt,
-      attemptCount: 1,
-      provider: PROVIDER,
-    })
-    .onConflictDoUpdate({
-      target: conversionJobs.documentId,
-      set: {
+  const job = await withRetainedDocument(documentId, async (tx, document) => {
+    const expiresAt = retentionExpiresAt(document.createdAt);
+    const [savedJob] = await tx
+      .insert(conversionJobs)
+      .values({
+        documentId,
+        requestedByUserId: userId,
         status: "processing",
         startedAt,
-        completedAt: null,
-        errorCode: null,
-        errorMessage: null,
-        attemptCount: sql`${conversionJobs.attemptCount} + 1`,
-        updatedAt: startedAt,
-      },
-    })
-    .returning({ id: conversionJobs.id });
+        attemptCount: 1,
+        provider: PROVIDER,
+        expiresAt,
+      })
+      .onConflictDoUpdate({
+        target: conversionJobs.documentId,
+        set: {
+          status: "processing",
+          startedAt,
+          completedAt: null,
+          errorCode: null,
+          errorMessage: null,
+          attemptCount: sql`${conversionJobs.attemptCount} + 1`,
+          updatedAt: startedAt,
+          expiresAt,
+        },
+      })
+      .returning({ id: conversionJobs.id });
+    return savedJob;
+  });
   const jobId = job.id;
 
   console.log(`[api/convert] job=${jobId} started`);
@@ -338,6 +357,7 @@ async function convertRequest(req: NextRequest) {
 
   if ("error" in result) {
     await recordJobFailure(
+      documentId,
       jobId,
       "conversion_failed",
       result.error,
@@ -356,131 +376,141 @@ async function convertRequest(req: NextRequest) {
 
   const htmlKey = htmlOutputKey(sessionId, documentId);
   try {
-    if (isReconversion && isWord) {
-      // A failed model attempt must not replace the PDF paired with the last
-      // saved HTML and artifact metadata. Persist this render only on success.
-      await uploadObject(
-        sourcePdfKey(sessionId, documentId),
-        buffer,
-        PDF_MIME_TYPE
+    await withRetainedDocument(documentId, async (tx, document) => {
+      const expiresAt = retentionExpiresAt(document.createdAt);
+      if (isReconversion && isWord) {
+        // A failed model attempt must not replace the PDF paired with the last
+        // saved HTML and artifact metadata. Persist this render only on success.
+        await uploadObject(
+          sourcePdfKey(sessionId, documentId),
+          buffer,
+          PDF_MIME_TYPE
+        );
+      }
+      await uploadObject(htmlKey, result.html, "text/html; charset=utf-8");
+
+      const completedAt = new Date().toISOString();
+      await tx
+        .update(conversionJobs)
+        .set({
+          status: "completed",
+          completedAt,
+          updatedAt: completedAt,
+          modelName: result.model,
+          expiresAt,
+        })
+        .where(eq(conversionJobs.id, jobId));
+
+      // uq_available_artifact_per_job_type allows one available artifact per type,
+      // so a re-convert updates the existing row rather than inserting a second.
+      for (const artifact of [
+        ...(isWord
+          ? [
+              {
+                artifactType: "source_docx" as const,
+                filename,
+                mimeType: DOCX_MIME_TYPE,
+                storageKey: sourceDocxKey(sessionId, documentId),
+                fileSizeBytes: sourceBuffer.byteLength,
+                previewSnippet: null,
+              },
+            ]
+          : []),
+        {
+          artifactType: "source_pdf" as const,
+          filename: pdfFilename,
+          mimeType: PDF_MIME_TYPE,
+          storageKey: sourcePdfKey(sessionId, documentId),
+          fileSizeBytes: buffer.byteLength,
+          previewSnippet: null,
+        },
+        {
+          artifactType: "html_output" as const,
+          filename: filename.replace(/\.(?:pdf|docx)$/i, ".html"),
+          mimeType: "text/html",
+          storageKey: htmlKey,
+          fileSizeBytes: Buffer.byteLength(result.html),
+          previewSnippet: result.html.slice(0, 500),
+        },
+      ]) {
+        await tx
+          .insert(artifacts)
+          .values({
+            jobId,
+            artifactStatus: "available",
+            ...artifact,
+            expiresAt,
+          })
+          .onConflictDoUpdate({
+            target: [artifacts.jobId, artifacts.artifactType],
+            targetWhere: sql`artifact_status = 'available'`,
+            set: {
+              filename: artifact.filename,
+              mimeType: artifact.mimeType,
+              storageKey: artifact.storageKey,
+              fileSizeBytes: artifact.fileSizeBytes,
+              previewSnippet: artifact.previewSnippet,
+              createdAt: completedAt,
+              expiresAt,
+            },
+          });
+      }
+
+      // Findings have no natural key, so replace the previous run's wholesale.
+      await tx
+        .delete(validationFindings)
+        .where(eq(validationFindings.jobId, jobId));
+      if (result.errors.length > 0) {
+        await tx.insert(validationFindings).values(
+          result.errors.map((issue) => ({
+            jobId,
+            severity: issue.severity,
+            ruleCode: issue.type,
+            title: FINDING_TITLES[issue.type] ?? FINDING_TITLES.other,
+            message: issue.message,
+            suggestion: issue.suggestion,
+            wcag: issue.wcag ?? null,
+            location: issue.element ? { element: issue.element } : null,
+          }))
+        );
+      }
+
+      await tx.insert(jobEvents).values({
+        jobId,
+        eventType: "conversion_completed",
+        message: `Converted ${filename}`,
+        metadata: {
+          model: result.model,
+          tokensUsed: result.tokensUsed,
+          findingCount: result.errors.length,
+          extractionWarnings: result.extractionWarnings,
+        },
+      });
+
+      await tx.insert(modelCalls).values(
+        result.calls.map((call) => ({
+          jobId,
+          stage: call.stage,
+          model: call.model,
+          promptTokens: call.promptTokens,
+          completionTokens: call.completionTokens,
+          costUsd: call.costUsd !== null ? String(call.costUsd) : null,
+        }))
       );
-    }
-    await uploadObject(htmlKey, result.html, "text/html; charset=utf-8");
-  } catch {
+    });
+  } catch (error) {
+    if (error instanceof DocumentUnavailableError) throw error;
     const message = "Could not store the converted document. Please try again.";
     await recordJobFailure(
+      documentId,
       jobId,
       "output_storage_failed",
       message,
       result.calls
     );
-    console.error(`[api/convert] job=${jobId} output upload failed`);
+    console.error(`[api/convert] job=${jobId} output persistence failed`);
     return json({ error: message, jobId, documentId }, 500);
   }
-
-  const completedAt = new Date().toISOString();
-  await db.transaction(async (tx) => {
-    await tx
-      .update(conversionJobs)
-      .set({
-        status: "completed",
-        completedAt,
-        updatedAt: completedAt,
-        modelName: result.model,
-      })
-      .where(eq(conversionJobs.id, jobId));
-
-    // uq_available_artifact_per_job_type allows one available artifact per type,
-    // so a re-convert updates the existing row rather than inserting a second.
-    for (const artifact of [
-      ...(isWord
-        ? [
-            {
-              artifactType: "source_docx" as const,
-              filename,
-              mimeType: DOCX_MIME_TYPE,
-              storageKey: sourceDocxKey(sessionId, documentId),
-              fileSizeBytes: sourceBuffer.byteLength,
-              previewSnippet: null,
-            },
-          ]
-        : []),
-      {
-        artifactType: "source_pdf" as const,
-        filename: pdfFilename,
-        mimeType: PDF_MIME_TYPE,
-        storageKey: sourcePdfKey(sessionId, documentId),
-        fileSizeBytes: buffer.byteLength,
-        previewSnippet: null,
-      },
-      {
-        artifactType: "html_output" as const,
-        filename: filename.replace(/\.(?:pdf|docx)$/i, ".html"),
-        mimeType: "text/html",
-        storageKey: htmlKey,
-        fileSizeBytes: Buffer.byteLength(result.html),
-        previewSnippet: result.html.slice(0, 500),
-      },
-    ]) {
-      await tx
-        .insert(artifacts)
-        .values({ jobId, artifactStatus: "available", ...artifact })
-        .onConflictDoUpdate({
-          target: [artifacts.jobId, artifacts.artifactType],
-          targetWhere: sql`artifact_status = 'available'`,
-          set: {
-            filename: artifact.filename,
-            mimeType: artifact.mimeType,
-            storageKey: artifact.storageKey,
-            fileSizeBytes: artifact.fileSizeBytes,
-            previewSnippet: artifact.previewSnippet,
-            createdAt: completedAt,
-          },
-        });
-    }
-
-    // Findings have no natural key, so replace the previous run's wholesale.
-    await tx
-      .delete(validationFindings)
-      .where(eq(validationFindings.jobId, jobId));
-    if (result.errors.length > 0) {
-      await tx.insert(validationFindings).values(
-        result.errors.map((issue) => ({
-          jobId,
-          severity: issue.severity,
-          ruleCode: issue.type,
-          title: FINDING_TITLES[issue.type] ?? FINDING_TITLES.other,
-          message: issue.message,
-          suggestion: issue.suggestion,
-          wcag: issue.wcag ?? null,
-          location: issue.element ? { element: issue.element } : null,
-        }))
-      );
-    }
-
-    await tx.insert(jobEvents).values({
-      jobId,
-      eventType: "conversion_completed",
-      message: `Converted ${filename}`,
-      metadata: {
-        model: result.model,
-        tokensUsed: result.tokensUsed,
-        findingCount: result.errors.length,
-        extractionWarnings: result.extractionWarnings,
-      },
-    });
-
-    await tx.insert(modelCalls).values(
-      result.calls.map((call) => ({
-        jobId,
-        stage: call.stage,
-        model: call.model,
-        promptTokens: call.promptTokens,
-        completionTokens: call.completionTokens,
-        costUsd: call.costUsd !== null ? String(call.costUsd) : null,
-      }))
-    );
-  });
 
   console.log(
     `[api/convert] job=${jobId} completed. errors=${result.errors.length} tokens=${result.tokensUsed}`
@@ -501,6 +531,15 @@ export async function POST(req: NextRequest) {
   try {
     return await convertRequest(req);
   } catch (error) {
+    if (error instanceof DocumentUnavailableError) {
+      return json(
+        {
+          error:
+            "This document has expired or was deleted. Upload it again to start a new conversion.",
+        },
+        410
+      );
+    }
     if (error instanceof WordToPdfError) {
       return json({ error: error.message }, error.status);
     }

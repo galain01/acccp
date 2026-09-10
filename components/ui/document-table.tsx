@@ -100,7 +100,7 @@ export default function DocumentTable({
       <Card>
         <CardHeader>
           <CardTitle>Documents</CardTitle>
-          <CardDescription>No documents uploaded yet</CardDescription>
+          <CardDescription>No saved documents available</CardDescription>
         </CardHeader>
         <CardContent>
           <p className="text-sm text-muted-foreground">
@@ -108,6 +108,11 @@ export default function DocumentTable({
             browse, then click{" "}
             <strong className="font-medium text-foreground">Convert</strong> to
             start the conversion process.
+          </p>
+          <p className="mt-2 text-sm text-muted-foreground">
+            Documents saved online expire after 14 days and disappear from this
+            list when it reloads. Files you downloaded to your computer are
+            unaffected.
           </p>
         </CardContent>
       </Card>
