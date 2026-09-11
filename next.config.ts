@@ -6,6 +6,7 @@ const nextConfig: NextConfig = {
     "/api/convert": [
       "./node_modules/pdf-lib/dist/pdf-lib.min.js",
       "./lib/pdf-rendering-child.mjs",
+      "./lib/pdf-image-alternatives.mjs",
       "./node_modules/pdfjs-dist/package.json",
       "./node_modules/pdfjs-dist/legacy/build/*.mjs",
       "./node_modules/pdfjs-dist/cmaps/**",

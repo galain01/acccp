@@ -57,6 +57,7 @@ const RENDERED: RenderedPdf = {
     height: 1,
     png: TINY_PNG,
     text: null,
+    imageAlternatives: { status: "complete", figures: [] },
   })),
 };
 const SOURCE = { buffer: PDF_BYTES, filename: "test.pdf", rendered: RENDERED };
@@ -561,6 +562,67 @@ describe("validateWithAI", () => {
       secondFinding,
       expect.objectContaining({ type: "other", severity: "warning" }),
     ]);
+  });
+});
+
+describe("existing PDF alternatives in both model stages", () => {
+  it("sends the same exact descriptions to conversion and audit and retains a preservation warning", async () => {
+    callLiteLLMMock.mockReset();
+    fetchModelPricingMock.mockResolvedValue(null);
+    const alternatives = {
+      status: "complete" as const,
+      figures: [
+        {
+          id: "p3-figure1",
+          alt: 'Original "authored" context & meaning.',
+          bounds: { x: 0.1, y: 0.2, width: 0.4, height: 0.3 },
+        },
+      ],
+    };
+    renderPdfPagesMock.mockResolvedValue({
+      ...RENDERED,
+      pages: RENDERED.pages.map((page) => ({
+        ...page,
+        imageAlternatives:
+          page.pageNumber === 3 ? alternatives : page.imageAlternatives,
+      })),
+    });
+    callLiteLLMMock
+      .mockResolvedValueOnce({
+        content:
+          '<div><p>Figure</p><img data-source-image-id="p3-figure1" src="{{PLACEHOLDER:image1.png}}" alt="New description"></div>',
+        model: "test-model",
+        promptTokens: 20,
+        completionTokens: 10,
+      })
+      .mockResolvedValueOnce({
+        content: completedAudit(),
+        model: "test-model",
+        promptTokens: 30,
+        completionTokens: 5,
+      });
+    const result = await convertPdf(PDF_BYTES, "test.pdf");
+    expect("error" in result).toBe(false);
+    if ("error" in result) throw new Error(result.detail);
+    expect(result.errors).toContainEqual(
+      expect.objectContaining({
+        title: "Restore the original image description",
+      })
+    );
+    expect(result.calls).toHaveLength(2);
+    for (const call of callLiteLLMMock.mock.calls) {
+      const sourcePart = (call[1] as LiteLLMContentPart[]).find(
+        (part) =>
+          part.type === "text" &&
+          part.text.includes("Existing figure descriptions")
+      );
+      expect(sourcePart?.type).toBe("text");
+      if (sourcePart?.type !== "text")
+        throw new Error("Descriptions missing from model input");
+      expect(JSON.parse(sourcePart.text.split("\n").at(-1)!)).toEqual(
+        alternatives
+      );
+    }
   });
 });
 
