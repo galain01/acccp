@@ -693,6 +693,17 @@ export const retainedJobStats = pgTable(
     pageMeasuredJobCount: bigint("page_measured_job_count", {
       mode: "number",
     }).notNull(),
+    // Only jobs with at least one call and no unpriced calls contribute. Old
+    // rows have no measured cost; new purges can add a measured subset to them.
+    jobCostUsd: numeric("job_cost_usd"),
+    costMeasuredJobCount: bigint("cost_measured_job_count", { mode: "number" })
+      .default(0)
+      .notNull(),
+    costEstimatedJobCount: bigint("cost_estimated_job_count", {
+      mode: "number",
+    })
+      .default(0)
+      .notNull(),
   },
   (table) => [
     primaryKey({ columns: [table.day, table.model] }),
@@ -701,6 +712,11 @@ export const retainedJobStats = pgTable(
     check(
       "retained_job_stats_pages_consistent_chk",
       sql`page_measured_job_count >= 0 and page_measured_job_count <= job_count and page_count_sum >= page_measured_job_count`
+    ),
+    check(
+      "retained_job_stats_cost_coverage_consistent_chk",
+      sql`cost_estimated_job_count >= 0 and cost_estimated_job_count <= cost_measured_job_count and cost_measured_job_count <= job_count and
+        ((cost_measured_job_count = 0 and job_cost_usd is null) or (cost_measured_job_count > 0 and job_cost_usd is not null))`
     ),
   ]
 ).enableRLS();

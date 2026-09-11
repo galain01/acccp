@@ -52,6 +52,7 @@ function historyFixture(): DashboardHistory {
       date.setUTCDate(date.getUTCDate() + index);
       const measured = index >= 4;
       const hasHistory = index >= 2;
+      const hasCost = index >= 4;
       const succeeded = index !== 0 && index !== 1;
       return {
         day: date.toISOString().slice(0, 10),
@@ -65,6 +66,9 @@ function historyFixture(): DashboardHistory {
         unknownCostCoverage: index === 1,
         statsJobCount: hasHistory ? 1 : 0,
         jobTokens: hasHistory ? (index + 1) * 1000 : 0,
+        jobCostUsd: hasCost ? 0.075 : null,
+        costMeasuredJobCount: hasCost ? 1 : 0,
+        costEstimatedJobCount: index === 4 || index === 5 ? 1 : 0,
         pageCountSum: measured ? 3 : 0,
         pageMeasuredJobCount: measured ? 1 : 0,
         timedJobCount: measured ? 1 : 0,
@@ -87,6 +91,9 @@ function historyFixture(): DashboardHistory {
       unknownCostCoverage: true,
       statsJobCount: 10,
       jobTokens: 75_000,
+      jobCostUsd: 0.6,
+      costMeasuredJobCount: 8,
+      costEstimatedJobCount: 2,
       pageCountSum: 24,
       pageMeasuredJobCount: 8,
       medianDurationMs: 45_000,
@@ -101,6 +108,9 @@ function historyFixture(): DashboardHistory {
         statsJobCount: 10,
         totalTokens: 75_000,
         jobTokens: 75_000,
+        jobCostUsd: 0.6,
+        costMeasuredJobCount: 8,
+        costEstimatedJobCount: 2,
         costUsd: 0.75,
         estimatedCallCount: 2,
         unpricedCallCount: 0,
@@ -118,6 +128,9 @@ function historyFixture(): DashboardHistory {
         statsJobCount: 0,
         totalTokens: 2000,
         jobTokens: 0,
+        jobCostUsd: null,
+        costMeasuredJobCount: 0,
+        costEstimatedJobCount: 0,
         costUsd: 0.02,
         estimatedCallCount: 0,
         unpricedCallCount: 0,
@@ -135,6 +148,9 @@ function historyFixture(): DashboardHistory {
         statsJobCount: 0,
         totalTokens: 1000,
         jobTokens: 0,
+        jobCostUsd: null,
+        costMeasuredJobCount: 0,
+        costEstimatedJobCount: 0,
         costUsd: null,
         estimatedCallCount: 0,
         unpricedCallCount: 1,
@@ -219,7 +235,6 @@ beforeEach(() => {
     instructor: 14,
     admin: 1,
   });
-  vi.mocked(getTokenUsage).mockResolvedValue({ days: 30, totalTokens: 78_000 });
   vi.mocked(listRecentJobs).mockResolvedValue(jobsFixture());
   vi.mocked(getMetricsHistory).mockResolvedValue(historyFixture());
 });
@@ -258,11 +273,56 @@ describe("real admin metrics server rendering", () => {
     expect(text).toContain("Pages in selected jobs 24");
     expect(text).toContain("8 of 12 jobs have page counts");
     expect(text).toContain("Average pages per measured job 3");
-    expect(getTokenUsage).toHaveBeenCalledWith(30);
+    expect(text).toContain("Average cost per job $0.075");
+    expect(text).toContain("8 of 12 jobs have pricing for every recorded call");
+    expect(text).toContain("Includes estimates.");
+    expect(text).not.toContain("Tokens in the last 30 days");
+    expect(getTokenUsage).not.toHaveBeenCalled();
     expect(getMetricsHistory).toHaveBeenCalledWith({
       from: "2026-08-12",
       to: "2026-09-10",
     });
+  });
+
+  it.each([
+    { cost: null, jobs: 0, expected: "Unknown" },
+    { cost: 0, jobs: 1, expected: "$0.00" },
+  ])(
+    "distinguishes missing job pricing from a known zero cost ($expected)",
+    async ({ cost, jobs, expected }) => {
+      const history = historyFixture();
+      history.summary.jobCostUsd = cost;
+      history.summary.costMeasuredJobCount = jobs;
+      history.summary.costEstimatedJobCount = 0;
+      vi.mocked(getMetricsHistory).mockResolvedValue(history);
+      const text = textContent(await renderDashboard());
+      expect(text).toContain(`Average cost per job ${expected}`);
+      expect(text).toContain(
+        `${jobs} of 12 jobs have pricing for every recorded call`
+      );
+      expect(text).not.toContain("Includes estimates.");
+    }
+  );
+
+  it("uses the selected historical range for the job cost average", async () => {
+    const history = historyFixture();
+    history.summary.jobCostUsd = 1.2;
+    history.summary.costMeasuredJobCount = 4;
+    vi.mocked(getMetricsHistory).mockResolvedValue(history);
+    const text = textContent(
+      await renderDashboard({
+        key: "custom",
+        from: "2026-07-01",
+        to: "2026-07-31",
+        label: "2026-07-01 to 2026-07-31",
+      })
+    );
+    expect(text).toContain("Average cost per job $0.30");
+    expect(getMetricsHistory).toHaveBeenCalledWith({
+      from: "2026-07-01",
+      to: "2026-07-31",
+    });
+    expect(getTokenUsage).not.toHaveBeenCalled();
   });
 
   it("renders unknown prices/pages/times as Unknown rather than zero", async () => {

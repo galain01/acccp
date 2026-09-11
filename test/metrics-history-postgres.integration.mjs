@@ -43,11 +43,13 @@ vi.mock("@/lib/storage", () => ({
 
 import * as schema from "@/lib/db/schema";
 import { getMetricsHistory } from "@/lib/actions/metrics-history";
+import { getCostSummary, listRecentJobs } from "@/lib/actions/admin-metrics";
 import { purgeDocumentIfEligible } from "@/lib/document-retention";
 
 let pg;
 let ownerId;
 let sessionId;
+let migratedLegacyCost;
 const range = { from: "2026-09-01", to: "2026-09-03" };
 const sol = "gpt-5.6-sol-2026-07-09";
 
@@ -94,6 +96,20 @@ beforeAll(async () => {
     await pg.exec(
       await readFile(new URL(`../drizzle/${file}`, import.meta.url), "utf8")
     );
+  await pg.exec(`INSERT INTO retained_job_stats
+    (day,model,job_count,total_tokens,page_count_sum,page_measured_job_count)
+    VALUES ('2026-09-01','migration-fixture',3,100,0,0)`);
+  await pg.exec(
+    await readFile(
+      new URL("../drizzle/0011_average_job_cost.sql", import.meta.url),
+      "utf8"
+    )
+  );
+  migratedLegacyCost = (
+    await pg.query(`SELECT job_cost_usd,
+    cost_measured_job_count::int,cost_estimated_job_count::int
+    FROM retained_job_stats WHERE model='migration-fixture'`)
+  ).rows[0];
 });
 
 afterAll(async () => {
@@ -151,12 +167,24 @@ async function call(
     source = "gateway",
     cached = null,
     written = null,
+    stage = "convert",
   } = {}
 ) {
   await pg.query(
     `INSERT INTO model_calls (job_id, stage, model, prompt_tokens, completion_tokens, cost_usd, cost_source, cached_prompt_tokens, cache_creation_prompt_tokens, created_at)
-    VALUES ($1, 'convert', $2, $3, $4, $5, $6, $7, $8, $9)`,
-    [jobId, model, prompt, completion, cost, source, cached, written, day]
+    VALUES ($1, $10, $2, $3, $4, $5, $6, $7, $8, $9)`,
+    [
+      jobId,
+      model,
+      prompt,
+      completion,
+      cost,
+      source,
+      cached,
+      written,
+      day,
+      stage,
+    ]
   );
 }
 
@@ -176,6 +204,14 @@ async function retainedTiming(day, model, duration, weight) {
 }
 
 describe("actual PostgreSQL metrics history", () => {
+  it("migrates existing retained cohorts as unmeasured instead of zero-cost jobs", () => {
+    expect(migratedLegacyCost).toEqual({
+      job_cost_usd: null,
+      cost_measured_job_count: 0,
+      cost_estimated_job_count: 0,
+    });
+  });
+
   it("executes an empty history as one statement with null cost/timing", async () => {
     const history = await getMetricsHistory(range);
     expect(history.daily).toEqual([]);
@@ -184,6 +220,9 @@ describe("actual PostgreSQL metrics history", () => {
       jobCount: 0,
       totalTokens: 0,
       costUsd: null,
+      jobCostUsd: null,
+      costMeasuredJobCount: 0,
+      costEstimatedJobCount: 0,
       medianDurationMs: null,
       timedJobCount: 0,
     });
@@ -256,6 +295,8 @@ describe("actual PostgreSQL metrics history", () => {
       jobCount: 0,
       totalTokens: 30,
       jobTokens: 0,
+      jobCostUsd: null,
+      costMeasuredJobCount: 0,
       timedJobCount: 0,
     });
     const first = await getMetricsHistory({
@@ -266,6 +307,8 @@ describe("actual PostgreSQL metrics history", () => {
       jobCount: 1,
       totalTokens: 0,
       jobTokens: 50,
+      jobCostUsd: 0.02,
+      costMeasuredJobCount: 1,
       pageCountSum: 2,
       medianDurationMs: 300,
     });
@@ -307,14 +350,19 @@ describe("actual PostgreSQL metrics history", () => {
       unknownCostCoverage: true,
       timedJobCount: 0,
       medianDurationMs: null,
+      costMeasuredJobCount: 1,
+      costEstimatedJobCount: 1,
     });
     expect(history.summary.costUsd).toBeCloseTo(0.30558, 12);
+    expect(history.summary.jobCostUsd).toBeCloseTo(0.00558, 12);
     expect(
       history.models.find((row) => row.model === "legacy-model")
     ).toMatchObject({
       jobCount: 0,
       statsJobCount: 0,
       unknownCostCoverage: true,
+      jobCostUsd: null,
+      costMeasuredJobCount: 0,
     });
   });
 
@@ -358,7 +406,10 @@ describe("actual PostgreSQL metrics history", () => {
       pageCountSum: 5,
       estimatedCallCount: 1,
       unpricedCallCount: 1,
+      costMeasuredJobCount: 1,
+      costEstimatedJobCount: 1,
     });
+    expect(before.summary.jobCostUsd).toBeCloseTo(0.01558, 12);
     expect(await purgeDocumentIfEligible(success.id)).toBe("purged");
     expect(await purgeDocumentIfEligible(failure.id)).toBe("purged");
     const after = await getMetricsHistory(range);
@@ -372,6 +423,207 @@ describe("actual PostgreSQL metrics history", () => {
     expect(JSON.stringify(after)).not.toMatch(
       /synthetic-private|fixture@osu|Synthetic fixture/
     );
+  });
+
+  it("includes conversion, audit and failed retries in their job cohort while spend follows each call day", async () => {
+    const retried = await job({ model: "final-model" });
+    await pg.query("UPDATE conversion_jobs SET attempt_count=3 WHERE id=$1", [
+      retried.jobId,
+    ]);
+    for (const [day, model, stage, cost] of [
+      ["2026-09-01", "first-model", "convert", "0.10"],
+      ["2026-09-01", "audit-model", "validate", "0.02"],
+      ["2026-09-02", "first-model", "convert", "0.03"],
+      ["2026-09-03", "final-model", "convert", "0.04"],
+      ["2026-09-03", "audit-model", "validate", "0.01"],
+    ])
+      await call(retried.jobId, {
+        day: `${day}T12:00:00Z`,
+        model,
+        stage,
+        cost,
+      });
+    const failed = await job({ status: "failed", model: "failed-model" });
+    await call(failed.jobId, {
+      day: "2026-09-03T12:00:00Z",
+      model: "failed-model",
+      cost: "0.06",
+    });
+    // This job's call falls inside the selected day, but the job itself does not.
+    const outside = await job({
+      day: "2026-08-31T23:59:59Z",
+      model: "outside-model",
+    });
+    await call(outside.jobId, { model: "outside-model", cost: "0.50" });
+
+    const firstDay = { from: "2026-09-01", to: "2026-09-01" };
+    const read = async () => ({
+      first: await getMetricsHistory(firstDay),
+      full: await getMetricsHistory(range),
+      spend: await getCostSummary(30),
+    });
+    const before = await read();
+    expect(before.first.summary).toMatchObject({
+      jobCount: 2,
+      failedCount: 1,
+      jobCostUsd: 0.26,
+      costMeasuredJobCount: 2,
+      costEstimatedJobCount: 0,
+      costUsd: 0.62,
+    });
+    expect(
+      before.first.summary.jobCostUsd /
+        before.first.summary.costMeasuredJobCount
+    ).toBe(0.13);
+    expect(
+      before.full.daily.map(({ day, costUsd, jobCostUsd }) => ({
+        day,
+        costUsd,
+        jobCostUsd,
+      }))
+    ).toEqual([
+      { day: "2026-09-01", costUsd: 0.62, jobCostUsd: 0.26 },
+      { day: "2026-09-02", costUsd: 0.03, jobCostUsd: null },
+      { day: "2026-09-03", costUsd: 0.11, jobCostUsd: null },
+    ]);
+    expect(before.full.summary.costUsd).toBe(0.76);
+    expect(before.spend).toMatchObject({
+      windowCostUsd: 0.76,
+      allTimeCostUsd: 0.76,
+    });
+    expect(
+      before.full.models.find(({ model }) => model === "first-model")
+    ).toMatchObject({
+      costUsd: 0.13,
+      jobCount: 0,
+      jobCostUsd: null,
+    });
+    expect(
+      before.full.models.find(({ model }) => model === "audit-model").costUsd
+    ).toBe(0.03);
+    expect(
+      before.full.models.find(({ model }) => model === "final-model")
+    ).toMatchObject({
+      costUsd: 0.04,
+      jobCostUsd: 0.2,
+      costMeasuredJobCount: 1,
+    });
+    await pg.query(
+      "UPDATE documents SET created_at=clock_timestamp() WHERE id=$1",
+      [retried.id]
+    );
+    const recent = await listRecentJobs();
+    expect(recent.rows).toHaveLength(1);
+    expect(recent.rows[0]).toMatchObject({
+      jobId: retried.jobId,
+      attemptCount: 3,
+      costUsd: 0.2,
+      estimatedCallCount: 0,
+      unpricedCallCount: 0,
+    });
+    await pg.query(
+      "UPDATE documents SET created_at=clock_timestamp() - interval '20 days' WHERE id=$1",
+      [retried.id]
+    );
+    for (const record of [retried, failed, outside])
+      expect(await purgeDocumentIfEligible(record.id)).toBe("purged");
+    expect(await read()).toEqual(before);
+    expect((await listRecentJobs()).rows).toEqual([]);
+  });
+
+  it("averages only fully priced jobs, retaining explicit zero prices and estimated coverage through purge", async () => {
+    const known = await job();
+    await call(known.jobId, { cost: "0.10" });
+    await call(known.jobId, { stage: "validate", cost: "0.20" });
+    const estimated = await job({ status: "failed" });
+    await call(estimated.jobId, { cost: "0.40", source: "model-info" });
+    await call(estimated.jobId, { stage: "validate", cost: "0.50" });
+    const mixed = await job();
+    await call(mixed.jobId, { cost: "0.70" });
+    await call(mixed.jobId, {
+      stage: "validate",
+      model: "unpriced",
+      cost: null,
+      source: null,
+    });
+    const unpriced = await job();
+    await call(unpriced.jobId, { model: "unpriced", cost: null, source: null });
+    const noCalls = await job({ status: "failed" });
+    const free = await job();
+    await call(free.jobId, { cost: "0", prompt: 0, completion: 0 });
+    const before = await getMetricsHistory(range);
+    expect(before.summary).toMatchObject({
+      jobCount: 6,
+      costUsd: 1.9,
+      jobCostUsd: 1.2,
+      costMeasuredJobCount: 3,
+      costEstimatedJobCount: 1,
+      unpricedCallCount: 2,
+    });
+    expect(
+      before.summary.jobCostUsd / before.summary.costMeasuredJobCount
+    ).toBeCloseTo(0.4, 12);
+    for (const record of [known, estimated, mixed, unpriced, noCalls, free]) {
+      expect(await purgeDocumentIfEligible(record.id)).toBe("purged");
+      expect(await getMetricsHistory(range)).toEqual(before);
+    }
+    expect(await purgeDocumentIfEligible(estimated.id)).toBe("retained");
+    expect(await getMetricsHistory(range)).toEqual(before);
+  });
+
+  it("keeps all-unpriced and no-call cohorts unknown rather than reporting free jobs", async () => {
+    const unknown = await job();
+    await call(unknown.jobId, { model: "unpriced", cost: null, source: null });
+    const noCalls = await job();
+    const before = await getMetricsHistory(range);
+    expect(before.summary).toMatchObject({
+      jobCount: 2,
+      jobCostUsd: null,
+      costMeasuredJobCount: 0,
+      costEstimatedJobCount: 0,
+    });
+    for (const record of [unknown, noCalls])
+      expect(await purgeDocumentIfEligible(record.id)).toBe("purged");
+    expect(await getMetricsHistory(range)).toEqual(before);
+  });
+
+  it("adds new measured subsets to legacy cohorts without inventing old costs", async () => {
+    await retainedTiming("2026-09-01", sol, 500, 4);
+    const legacy = await getMetricsHistory(range);
+    expect(legacy.summary).toMatchObject({
+      jobCount: 4,
+      jobCostUsd: null,
+      costMeasuredJobCount: 0,
+    });
+    const known = await job();
+    await call(known.jobId, { cost: "0.25", source: "model-info" });
+    const free = await job();
+    await call(free.jobId, { cost: "0" });
+    const unpriced = await job();
+    await call(unpriced.jobId, { model: "unpriced", cost: null, source: null });
+    const before = await getMetricsHistory(range);
+    expect(before.summary).toMatchObject({
+      jobCount: 7,
+      jobCostUsd: 0.25,
+      costMeasuredJobCount: 2,
+      costEstimatedJobCount: 1,
+    });
+    for (const record of [unpriced, known, free]) {
+      expect(await purgeDocumentIfEligible(record.id)).toBe("purged");
+      expect(await getMetricsHistory(range)).toEqual(before);
+    }
+    const retained = (
+      await pg.query(`SELECT job_count::int,job_cost_usd,
+      cost_measured_job_count::int,cost_estimated_job_count::int FROM retained_job_stats`)
+    ).rows;
+    expect(retained).toEqual([
+      {
+        job_count: 7,
+        job_cost_usd: "0.25",
+        cost_measured_job_count: 2,
+        cost_estimated_job_count: 1,
+      },
+    ]);
   });
 
   it("includes older retained history only for an unbounded lower range", async () => {

@@ -243,6 +243,12 @@ beforeAll(async () => {
       "utf8"
     )
   );
+  await pg.exec(
+    await readFile(
+      new URL("../drizzle/0011_average_job_cost.sql", import.meta.url),
+      "utf8"
+    )
+  );
 });
 
 afterAll(async () => {
@@ -725,10 +731,18 @@ describe("retention against in-memory PostgreSQL", () => {
     }
     expect(await purgeDocumentIfEligible(doc.id)).toBe("purged");
     const archived = await archivedMetrics();
-    expect((await archivedJobStats()).durations).toHaveLength(1);
+    const archivedStats = await archivedJobStats();
+    expect(archivedStats.durations).toHaveLength(1);
+    expect(archivedStats.stats).toHaveLength(1);
+    expect(archivedStats.stats[0]).toMatchObject({
+      job_cost_usd: "0.001",
+      cost_measured_job_count: 1,
+      cost_estimated_job_count: 1,
+    });
     expect(await combinedMetrics()).toEqual(before);
     expect(await purgeDocumentIfEligible(doc.id)).toBe("retained");
     expect(await archivedMetrics()).toEqual(archived);
+    expect(await archivedJobStats()).toEqual(archivedStats);
   });
 
   it("preserves unknown costs and exact partial sums when groups accumulate", async () => {
@@ -809,6 +823,9 @@ describe("retention against in-memory PostgreSQL", () => {
       "total_tokens",
       "page_count_sum",
       "page_measured_job_count",
+      "job_cost_usd",
+      "cost_measured_job_count",
+      "cost_estimated_job_count",
     ]);
     expect(
       columns.rows

@@ -78,6 +78,13 @@
       "when": 1789053905123,
       "tag": "0010_dashboard_job_metrics",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1789142304219,
+      "tag": "0011_average_job_cost",
+      "breakpoints": true
     }
   ]
 }

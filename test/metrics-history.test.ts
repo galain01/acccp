@@ -87,6 +87,9 @@ describe("admin metrics history", () => {
         unknownCostCoverage: false,
         statsJobCount: 0,
         jobTokens: 0,
+        jobCostUsd: null,
+        costMeasuredJobCount: 0,
+        costEstimatedJobCount: 0,
         pageCountSum: 0,
         pageMeasuredJobCount: 0,
         medianDurationMs: null,
@@ -110,6 +113,9 @@ describe("admin metrics history", () => {
       unknownCostCoverage: true,
       statsJobCount: "6",
       jobTokens: "800",
+      jobCostUsd: "0.5",
+      costMeasuredJobCount: "3",
+      costEstimatedJobCount: "1",
       pageCountSum: "20",
       pageMeasuredJobCount: "4",
       medianDurationMs: "100.5",
@@ -130,12 +136,21 @@ describe("admin metrics history", () => {
       jobCount: 10,
       statsJobCount: 6,
       costUsd: 0.0123,
+      jobCostUsd: 0.5,
+      costMeasuredJobCount: 3,
+      costEstimatedJobCount: 1,
       unknownCostCoverage: true,
       medianDurationMs: 100.5,
       minDurationMs: 0,
     });
     expect(result.daily.map((row) => row.day)).toEqual(["2026-09-01"]);
     expect(result.models[0].model).toBe("synthetic-model");
+    for (const row of [...result.daily, ...result.models])
+      expect(row).toMatchObject({
+        jobCostUsd: 0.5,
+        costMeasuredJobCount: 3,
+        costEstimatedJobCount: 1,
+      });
     expect(result.models[0]).not.toHaveProperty("successCount");
     expect(db.execute).toHaveBeenCalledTimes(1);
   });
