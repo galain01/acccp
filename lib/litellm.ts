@@ -60,6 +60,13 @@ export interface LiteLLMCallResult {
 export type LiteLLMContentPart =
   | { type: "text"; text: string }
   | {
+      type: "image_url";
+      image_url: {
+        url: `data:image/png;base64,${string}`;
+        detail: "high";
+      };
+    }
+  | {
       type: "file";
       file: {
         filename: string;

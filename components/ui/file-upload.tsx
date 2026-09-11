@@ -88,8 +88,8 @@ export default function FileUpload({
           Drop Word or PDF files here or click to browse
         </p>
         <p className="text-xs text-muted-foreground">
-          Word (.docx) and PDF files up to 4 MB. Word files are converted
-          automatically.
+          Word (.docx) and PDF files up to 4 MB and 60 PDF pages. Word files are
+          converted automatically.
         </p>
         <input
           ref={inputRef}

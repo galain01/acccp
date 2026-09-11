@@ -45,13 +45,15 @@ The PDF may have no semantic tags, incorrect tags, scanned pages, or inconsisten
 ## Headings and document structure
 
 - Canvas supplies the page's <h1>. NEVER emit <h1> in the fragment.
-- Examine the whole document before choosing its hierarchy. Identify the title, main sections, and subsections using meaning and visual evidence together, even when the PDF has no heading tags.
+- Examine the whole document before emitting HTML. Identify each heading occurrence's source page, parent section, and semantic rank using meaning, visual grouping, numbering, and surrounding sections together, even when the PDF has no heading tags. Use this outline to assign HTML levels; do not include the outline in the output. Track repeated heading wording by occurrence rather than assuming that identical wording means an identical parent or rank.
 - If a distinct document title appears in the source, preserve it as <h2>, place its main sections at <h3>, and nest their subsections at <h4>, continuing as needed through <h6>. If there is no distinct title, main sections begin at <h2>. Do not invent a title.
 - Apply the same semantic rank consistently across the document. Repair obviously inconsistent visual styling when surrounding content makes the intended parent/child relationship clear.
+- For example, in a titled source, "Archive intake" introduces a section and a smaller "Label checks" heading groups steps within that section: use <h3> and <h4>. A separately introduced, matching-rank "Exhibit rotation" section is an <h3> peer, even though it follows those steps. The relationship depends on content and grouping together, not just size or sequence. These names illustrate structure only; never add them to the converted source.
 - Never deepen by more than one heading level at a time. Returning from a subsection to a shallower heading is allowed.
 - A short bold phrase is not automatically a heading. Keep inline labels, form labels, emphasized instructions, and table headers in their appropriate semantic roles.
+- Keep a title that labels a figure, chart, or table with that item, such as in its caption. Do not promote it to a section heading unless it also introduces a genuine source section beyond that single item.
 - Use headings for actual section boundaries, not bold paragraphs. Preserve their original text. Do not turn ordinary administrative notes into quotations.
-- If a section's parent is ambiguous, use the shallowest hierarchy supported by the context and add a located HEADING REVIEW REQUIRED comment immediately after its heading, naming the relationship the instructor needs to confirm.
+- Do not flatten a subsection into a peer merely because headings share typography or the relationship requires interpretation. If its parent remains genuinely ambiguous after comparing meaning, grouping, numbering, and surrounding sections, choose the best-supported provisional relationship and add a located HEADING REVIEW REQUIRED comment immediately after its heading, naming the relationship the instructor needs to confirm. Do not flag a relationship that the source evidence supports merely because another arrangement is conceivable.
 
 ## Paragraphs, emphasis, and lists
 
@@ -108,7 +110,7 @@ The PDF may have no semantic tags, incorrect tags, scanned pages, or inconsisten
 
 ## Final check
 
-Before returning, check every page for omitted content; confirm reading order, heading hierarchy, list continuity, table associations, link preservation, image positions, and alternatives. Confirm that any accessibility text you added is minimal and supported by the source. Leave the specified, located review comments where the source prevents a reliable decision and beside every image placeholder. Return only the HTML fragment.
+Before returning, check every page for omitted content; confirm reading order, list continuity, table associations, link preservation, image positions, and alternatives. Compare every output heading's parent and rank with the source outline, including relationships that continue across pages; correct unintended flattening or nesting. Confirm that any accessibility text you added is minimal and supported by the source. Leave the specified, located review comments where the source prevents a reliable decision and beside every image placeholder. Return only the HTML fragment.
 `;
 
 export const PDF_ACCESSIBILITY_USER_MESSAGE =

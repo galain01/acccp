@@ -16,7 +16,7 @@ export function isPdfFilename(filename: string): boolean {
   return filename.toLowerCase().endsWith(".pdf");
 }
 
-/** A quick format check, not a full PDF parser. The model provider parses the file. */
+/** A quick format check; bounded server-side parsing/rendering happens afterward. */
 export function isPdfBuffer(buffer: Uint8Array): boolean {
   return (
     buffer.length >= 5 &&
