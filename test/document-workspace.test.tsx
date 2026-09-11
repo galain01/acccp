@@ -180,6 +180,36 @@ afterEach(async () => {
 });
 
 describe("DocumentWorkspace conversion selection", () => {
+  it("distinguishes completed conversions needing review from failed conversions", async () => {
+    await mount([
+      savedDocument("needs-review", "success", {
+        errors: [
+          {
+            type: "missing-alt",
+            severity: "error",
+            message: "The image needs a description.",
+            suggestion: "Describe the image in Canvas.",
+          },
+          {
+            type: "heading-skip",
+            severity: "warning",
+            message: "Check this section heading.",
+            suggestion: "Check its relationship to the previous section.",
+          },
+        ],
+      }),
+      savedDocument("failed", "error", {
+        errorMessage: "Conversion did not complete.",
+      }),
+    ]);
+    expect(row("needs-review.pdf").textContent).toContain("Success");
+    expect(row("needs-review.pdf").textContent).toContain("Needs a fix: 1");
+    expect(row("needs-review.pdf").textContent).toContain("Please check: 1");
+    expect(row("failed.pdf").textContent).toContain("Error");
+    expect(row("failed.pdf").textContent).not.toContain("Needs a fix");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("converts a newly added document without re-sending the first successful document", async () => {
     await mount();
     expect(button("Convert").disabled).toBe(true);
@@ -187,7 +217,7 @@ describe("DocumentWorkspace conversion selection", () => {
     await upload("first.pdf");
     await click(button("Convert"));
     expect(row("first.pdf").textContent).toContain("Success");
-    expect(row("first.pdf").textContent).toContain("1 warning");
+    expect(row("first.pdf").textContent).toContain("Please check: 1");
     expect(button("Convert").disabled).toBe(true);
 
     await upload("second.pdf");

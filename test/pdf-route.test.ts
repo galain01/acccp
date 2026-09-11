@@ -214,9 +214,20 @@ describe("document conversion route", () => {
     const finding = {
       type: "missing-alt",
       severity: "warning",
+      title: "Describe the process diagram",
+      category: "source-review",
       message: "An image needs its description reviewed.",
       suggestion: "Review the image description.",
       wcag: "1.1.1",
+      element: '<img src="chart.png">',
+      location: {
+        scope: "element",
+        sourcePages: [5],
+        printedPageLabel: "3",
+        section: "Results",
+        locator: "first diagram",
+        quote: "Process diagram",
+      },
     };
     mocks.convert.mockResolvedValueOnce({
       html: "<h2>Course</h2>",
@@ -241,7 +252,11 @@ describe("document conversion route", () => {
       Buffer.from(PDF),
       "application/pdf"
     );
-    expect(mocks.convert).toHaveBeenCalledWith(Buffer.from(PDF), "course.PDF");
+    expect(mocks.convert).toHaveBeenCalledWith(
+      Buffer.from(PDF),
+      "course.PDF",
+      8
+    );
     expect(mocks.renderWord).not.toHaveBeenCalled();
     expect(inserted.get(documents)?.values).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -264,7 +279,13 @@ describe("document conversion route", () => {
       }),
     ]);
     expect(inserted.get(validationFindings)?.values).toHaveBeenCalledWith([
-      expect.objectContaining({ ruleCode: "missing-alt", wcag: "1.1.1" }),
+      expect.objectContaining({
+        ruleCode: "missing-alt",
+        wcag: "1.1.1",
+        title: finding.title,
+        category: finding.category,
+        location: { ...finding.location, element: finding.element },
+      }),
     ]);
     expect(inserted.get(modelCalls)?.values).toHaveBeenCalledWith([
       { jobId: "job-1", ...usage, costUsd: "0.001" },
@@ -279,7 +300,7 @@ describe("document conversion route", () => {
       (await POST(request({ name: "course.docx", contents: DOCX }))).status
     ).toBe(200);
     expect(mocks.countPages).toHaveBeenCalledExactlyOnceWith(rendered);
-    expect(mocks.convert).toHaveBeenCalledWith(rendered, "course.pdf");
+    expect(mocks.convert).toHaveBeenCalledWith(rendered, "course.pdf", 9);
     expect(inserted.get(conversionJobs)?.values).toHaveBeenCalledWith(
       expect.objectContaining({ pageCount: 9, processingDurationMs: null })
     );
@@ -295,6 +316,11 @@ describe("document conversion route", () => {
   it("keeps an unknown page count null while conversion succeeds", async () => {
     mocks.countPages.mockResolvedValueOnce(null);
     expect((await POST(request())).status).toBe(200);
+    expect(mocks.convert).toHaveBeenCalledWith(
+      Buffer.from(PDF),
+      "course.pdf",
+      null
+    );
     expect(inserted.get(conversionJobs)?.values).toHaveBeenCalledWith(
       expect.objectContaining({ pageCount: null })
     );
@@ -452,7 +478,11 @@ describe("document conversion route", () => {
     expect(mocks.renderWord.mock.invocationCallOrder[0]).toBeLessThan(
       mocks.db.insert.mock.invocationCallOrder[0]
     );
-    expect(mocks.convert).toHaveBeenCalledWith(Buffer.from(PDF), "course.pdf");
+    expect(mocks.convert).toHaveBeenCalledWith(
+      Buffer.from(PDF),
+      "course.pdf",
+      8
+    );
     expect(inserted.get(documents)?.values).toHaveBeenCalledWith(
       expect.objectContaining({
         originalFilename: "course.DOCX",
@@ -508,7 +538,11 @@ describe("document conversion route", () => {
       Buffer.from(DOCX),
       "course.docx"
     );
-    expect(mocks.convert).toHaveBeenCalledWith(Buffer.from(PDF), "course.pdf");
+    expect(mocks.convert).toHaveBeenCalledWith(
+      Buffer.from(PDF),
+      "course.pdf",
+      8
+    );
     expect(mocks.db.insert).not.toHaveBeenCalledWith(documents);
     expect(mocks.upload.mock.calls.map(([key]) => key)).toEqual([
       "session-1/doc-1/source.pdf",

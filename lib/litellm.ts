@@ -6,6 +6,8 @@
  *   LITELLM_BASE_URL   e.g. https://litellm.cloud.osu.edu
  *   LITELLM_API_KEY    a proxy key with access to the configured model
  *   LITELLM_MODEL      optional override; defaults to gpt-5.6-sol-2026-07-09
+ *   LITELLM_CONVERSION_MODEL optional conversion-stage model override
+ *   LITELLM_AUDIT_MODEL      optional audit-stage model override
  */
 
 import { createHash } from "node:crypto";
@@ -21,11 +23,22 @@ export const DEFAULT_LITELLM_MODEL = "gpt-5.6-sol-2026-07-09";
 /** Contains only diagnostics authored by this client, never a provider body. */
 export class LiteLLMError extends Error {}
 
-export function getLiteLLMConfig(): LiteLLMConfig {
+export function getLiteLLMConfig(
+  stage?: "convert" | "validate"
+): LiteLLMConfig {
   const baseUrl = process.env.LITELLM_BASE_URL;
   const apiKey = process.env.LITELLM_API_KEY;
   // The key grants access; the model field selects what the proxy runs.
-  const model = process.env.LITELLM_MODEL?.trim() || DEFAULT_LITELLM_MODEL;
+  const stageModel =
+    stage === "convert"
+      ? process.env.LITELLM_CONVERSION_MODEL
+      : stage === "validate"
+        ? process.env.LITELLM_AUDIT_MODEL
+        : undefined;
+  const model =
+    stageModel?.trim() ||
+    process.env.LITELLM_MODEL?.trim() ||
+    DEFAULT_LITELLM_MODEL;
   if (!baseUrl) throw new LiteLLMError("Missing env var: LITELLM_BASE_URL");
   if (!apiKey) throw new LiteLLMError("Missing env var: LITELLM_API_KEY");
   return { baseUrl, apiKey, model };

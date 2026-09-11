@@ -34,6 +34,99 @@ function jsonResponse(body: unknown, status = 200): Response {
 // These tests verify that the client is configured correctly and talks to the
 // right endpoint — without making a real call to the LLM.
 
+describe("Independent conversion and audit models", () => {
+  beforeEach(() => {
+    vi.stubEnv("LITELLM_BASE_URL", CONFIG.baseUrl);
+    vi.stubEnv("LITELLM_API_KEY", CONFIG.apiKey);
+    vi.stubEnv("LITELLM_MODEL", undefined);
+    vi.stubEnv("LITELLM_CONVERSION_MODEL", undefined);
+    vi.stubEnv("LITELLM_AUDIT_MODEL", undefined);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("selects each trimmed override independently and preserves the shared connection", () => {
+    vi.stubEnv("LITELLM_MODEL", " shared-model ");
+    vi.stubEnv("LITELLM_CONVERSION_MODEL", " conversion-model \t");
+    vi.stubEnv("LITELLM_AUDIT_MODEL", "\n audit-model ");
+
+    expect(getLiteLLMConfig("convert")).toEqual({
+      ...CONFIG,
+      model: "conversion-model",
+    });
+    expect(getLiteLLMConfig("validate")).toEqual({
+      ...CONFIG,
+      model: "audit-model",
+    });
+    expect(getLiteLLMConfig()).toEqual({ ...CONFIG, model: "shared-model" });
+  });
+
+  it.each([undefined, "", " \t\n "])(
+    "falls back to the shared model when a stage override is %j",
+    (override) => {
+      vi.stubEnv("LITELLM_MODEL", " shared-model ");
+      vi.stubEnv("LITELLM_CONVERSION_MODEL", override);
+      vi.stubEnv("LITELLM_AUDIT_MODEL", override);
+
+      expect(getLiteLLMConfig("convert").model).toBe("shared-model");
+      expect(getLiteLLMConfig("validate").model).toBe("shared-model");
+    }
+  );
+
+  it.each([undefined, "", " \t\n "])(
+    "keeps the current default when the shared and stage overrides are %j",
+    (override) => {
+      vi.stubEnv("LITELLM_MODEL", override);
+      vi.stubEnv("LITELLM_CONVERSION_MODEL", override);
+      vi.stubEnv("LITELLM_AUDIT_MODEL", override);
+
+      expect(getLiteLLMConfig("convert").model).toBe("gpt-5.6-sol-2026-07-09");
+      expect(getLiteLLMConfig("validate").model).toBe("gpt-5.6-sol-2026-07-09");
+      expect(getLiteLLMConfig().model).toBe("gpt-5.6-sol-2026-07-09");
+    }
+  );
+
+  it.each([
+    ["LITELLM_CONVERSION_MODEL", "convert", "validate"],
+    ["LITELLM_AUDIT_MODEL", "validate", "convert"],
+  ] as const)(
+    "%s does not change the other stage or callers without a stage",
+    (variable, selectedStage, otherStage) => {
+      vi.stubEnv(variable, "selected-model");
+
+      expect(getLiteLLMConfig(selectedStage).model).toBe("selected-model");
+      expect(getLiteLLMConfig(otherStage).model).toBe("gpt-5.6-sol-2026-07-09");
+      expect(getLiteLLMConfig().model).toBe("gpt-5.6-sol-2026-07-09");
+    }
+  );
+
+  it("sends the selected stage model in each request", async () => {
+    vi.stubEnv("LITELLM_CONVERSION_MODEL", "conversion-model");
+    vi.stubEnv("LITELLM_AUDIT_MODEL", "audit-model");
+    const fetchMock = vi
+      .fn()
+      .mockImplementation(async () =>
+        jsonResponse({ choices: [{ message: { content: "ok" } }] })
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await callLiteLLM("Convert", "PDF", getLiteLLMConfig("convert"));
+    await callLiteLLM("Audit", "HTML and PDF", getLiteLLMConfig("validate"));
+
+    expect(
+      fetchMock.mock.calls.map((call) =>
+        JSON.parse((call as [string, RequestInit])[1].body as string)
+      )
+    ).toEqual([
+      expect.objectContaining({ model: "conversion-model" }),
+      expect.objectContaining({ model: "audit-model" }),
+    ]);
+  });
+});
+
 describe("AI & LiteLLM connection", () => {
   afterEach(() => {
     vi.unstubAllGlobals();

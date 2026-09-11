@@ -1,5 +1,5 @@
-import "server-only";
-
+// Node-only worker API also supports the standalone conversion CLI. No app
+// credentials are read here; node:worker_threads prevents client bundling.
 import { Worker } from "node:worker_threads";
 import { join } from "node:path";
 import { MAX_FILE_SIZE_BYTES } from "./document-input";

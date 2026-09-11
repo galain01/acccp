@@ -1,5 +1,13 @@
 # Model cost tracking
 
+## Selecting conversion and audit models
+
+The two stages can use independent proxy model IDs. Set `LITELLM_CONVERSION_MODEL` for the PDF-to-HTML stage and `LITELLM_AUDIT_MODEL` for the review stage. Each optional value is trimmed; an unset, empty, or whitespace-only value falls back to `LITELLM_MODEL`, then to the existing `gpt-5.6-sol-2026-07-09` default. Leave both stage overrides unset to keep the current model for both stages. Callers that do not select a stage continue to use `LITELLM_MODEL` or the default.
+
+Both stages use the same server-only `LITELLM_API_KEY` and `LITELLM_BASE_URL`. The key must authorize each selected model, and each model must support the PDF input sent to that stage. Change these optional settings in your local environment or deployment configuration and restart/redeploy to apply them; do not put keys in tracked files. Pricing and token usage remain attached to each call's model and stage, so choosing a different auditor does not reprice past conversions. A model without gateway pricing or a supported published fallback remains unpriced rather than being counted as free.
+
+## Cost sources
+
 For new conversions, prefer the gateway's valid `x-litellm-response-cost` response header, including a reported zero. LiteLLM documents this as the call's USD cost. The app retains only that amount, never unrelated response headers or provider error bodies. If it is absent or invalid, estimate from `/model/info` rates and reported tokens. Missing pricing does not discard token usage. [LiteLLM response headers](https://docs.litellm.ai/docs/proxy/response_headers)
 
 When the gateway cannot supply rates for `gpt-5.6-sol-2026-07-09`, `gpt-5.6-sol`, or `gpt-5.6`, the app uses a labeled OpenAI standard list-price estimate. The dated gateway ID is treated as the Sol family for this estimate; the gateway's actual routing and bill are not independently verified by that name. Other model IDs receive no automatic fallback.

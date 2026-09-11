@@ -1,7 +1,7 @@
 import type { AccessibilityError, ConversionResult } from "./convert";
 
 export const WORD_RENDERING_REVIEW_MESSAGE =
-  "Compare this result with the Word original. Rendering may omit externally linked images and resources or change fonts or layout; the PDF accessibility audit cannot detect content already omitted during rendering.";
+  "Your Word document was first turned into a PDF. That step can leave out pictures linked from another file or change how content is arranged. The automatic check compares the HTML with that PDF, so it cannot detect anything already lost from the Word original.";
 
 /** A successful render alone cannot establish fidelity to the Word original. */
 export function withWordRenderingReview(
@@ -10,9 +10,19 @@ export function withWordRenderingReview(
   const finding: AccessibilityError = {
     type: "other",
     severity: "warning",
+    title: "Compare the converted page with your Word document",
+    category: "source-review",
     message: WORD_RENDERING_REVIEW_MESSAGE,
     suggestion:
-      "Check that all content, images, tables, and reading order match the original. Embed linked images/resources in Word before retrying, or upload a PDF exported from Word.",
+      "Open your original Word document and the converted page side by side. Check that the text, pictures, tables, and their order match. If something is missing, add it in Canvas or save a PDF from Word, check that PDF, and upload it to convert again.",
+    location: {
+      scope: "document",
+      sourcePages: null,
+      printedPageLabel: null,
+      section: null,
+      locator: null,
+      quote: null,
+    },
   };
   return {
     ...result,

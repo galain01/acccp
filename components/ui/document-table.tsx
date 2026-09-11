@@ -62,14 +62,10 @@ function issueBadges(doc: UploadedDocument): React.JSX.Element | null {
   return (
     <div className="mt-1 flex flex-wrap gap-1">
       {errorCount > 0 && (
-        <Badge variant="destructive">
-          {errorCount} {errorCount === 1 ? "error" : "errors"}
-        </Badge>
+        <Badge variant="destructive">Needs a fix: {errorCount}</Badge>
       )}
       {warningCount > 0 && (
-        <Badge variant="warning">
-          {warningCount} {warningCount === 1 ? "warning" : "warnings"}
-        </Badge>
+        <Badge variant="warning">Please check: {warningCount}</Badge>
       )}
     </div>
   );

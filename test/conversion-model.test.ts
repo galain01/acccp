@@ -3,6 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { convertPdf } from "@/lib/convert";
 import { clearModelPricingCache } from "@/lib/litellm";
 
+vi.mock("@/lib/pdf-page-count", () => ({
+  countPdfPages: vi.fn().mockResolvedValue(5),
+}));
+
 const PDF_BYTES = Buffer.from("%PDF-1.7\nmock pdf bytes\n%%EOF");
 
 function jsonResponse(body: unknown): Response {
@@ -16,6 +20,8 @@ describe("conversion model configuration", () => {
     clearModelPricingCache();
     vi.stubEnv("LITELLM_BASE_URL", "https://litellm.test");
     vi.stubEnv("LITELLM_API_KEY", "updated-test-key");
+    vi.stubEnv("LITELLM_CONVERSION_MODEL", undefined);
+    vi.stubEnv("LITELLM_AUDIT_MODEL", undefined);
   });
 
   afterEach(() => {
@@ -94,8 +100,17 @@ describe("conversion model configuration", () => {
       const auditRequest = JSON.parse(requests[2][1]?.body as string);
       expect(auditRequest.messages).toEqual([
         { role: "system", content: expect.any(String) },
-        { role: "user", content: expect.stringContaining(result.html) },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: expect.stringContaining(result.html) },
+            conversionRequest.messages[1].content[1],
+          ],
+        },
       ]);
+      expect(auditRequest.messages[1].content[0].text).toContain(
+        "page count: 5"
+      );
       expect(requests[1][0]).toBe("https://litellm.test/model/info");
       for (const [, options] of requests) {
         expect(options?.headers).toMatchObject({
