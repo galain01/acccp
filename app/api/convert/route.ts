@@ -367,7 +367,7 @@ async function convertRequest(req: NextRequest) {
 
   // Deliberately outside a transaction: this is a multi-second model call and
   // would pin a pooled connection for its whole duration.
-  let result = await convertPdf(buffer, pdfFilename);
+  let result = await convertPdf(buffer, pdfFilename, pageCount);
 
   if ("error" in result) {
     await recordJobFailure(
@@ -470,11 +470,19 @@ async function convertRequest(req: NextRequest) {
             jobId,
             severity: issue.severity,
             ruleCode: issue.type,
-            title: FINDING_TITLES[issue.type] ?? FINDING_TITLES.other,
+            title:
+              issue.title ?? FINDING_TITLES[issue.type] ?? FINDING_TITLES.other,
+            category: issue.category ?? "accessibility",
             message: issue.message,
             suggestion: issue.suggestion,
             wcag: issue.wcag ?? null,
-            location: issue.element ? { element: issue.element } : null,
+            location:
+              issue.location || issue.element
+                ? {
+                    ...issue.location,
+                    ...(issue.element ? { element: issue.element } : {}),
+                  }
+                : null,
           }))
         );
       }

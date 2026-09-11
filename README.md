@@ -54,15 +54,16 @@ project's technical reference for humans.
      substantive text, and produces accessible Canvas HTML. Images remain
      placeholders for manual reinsertion, with proposed alternative text and
      explicit review findings. No image files are uploaded to Canvas.
-   - **Stage 2 — audit**: a second, independent LLM call reviews the generated
-     HTML and returns a structured list of accessibility findings (missing alt
-     text, heading skips, non-descriptive links, table issues, etc.), each
-     tagged with the WCAG criterion it violates.
+   - **Stage 2 — audit**: a second LLM call receives the same PDF and generated
+     HTML to check accessibility and content preservation. Findings identify
+     the physical PDF page, nearby source text, and a plain-language next step.
+     Uncertain pages are labeled unavailable rather than guessed. Technical
+     HTML and supported WCAG references are optional details, not faculty instructions.
    Word conversions also include a manual-review notice: linked content can be
    omitted and fonts or page layout can change during rendering. Compare the
    rendered result with the original even when conversion succeeds.
 4. Click a converted document to open the **result dialog**: the pretty-printed
-   HTML output, the accessibility findings, and buttons to copy the HTML or
+   HTML output, items labeled **Needs a fix** or **Please check**, and buttons to copy the HTML or
    download it as an `.html` file — ready to paste into the Canvas RCE.
 5. Locking a document (padlock icon in the table) excludes it from the next
    Convert run. Re-converting a document overwrites its previous output.
@@ -275,7 +276,12 @@ an existing override (including an old Nano value) takes precedence over the
 code default. Redeploy after changing environment variables.
 
 The conversion, accessibility audit, and admin model-info endpoint all read
-the shared configuration in `lib/litellm.ts`. The standalone quality-check
+the configuration in `lib/litellm.ts`. Optional `LITELLM_CONVERSION_MODEL` and
+`LITELLM_AUDIT_MODEL` overrides select each stage independently; blank or unset
+values fall back to `LITELLM_MODEL`, then the Sol default. Keep both unset to
+establish a baseline with the current model. The admin-only model-info endpoint
+accepts `?stage=convert` or `?stage=validate`. See [source-aware audits](docs/source-aware-audit.md)
+for locations, testing, and retention. The standalone quality-check
 script uses the same configuration; its optional `LITELLM_QUALITY_MODEL`
 override selects only the final quality reviewer and must also be allowed
 by the key. Keep secrets in Vercel or a local git-ignored `.env` file.

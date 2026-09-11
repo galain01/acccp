@@ -4,6 +4,10 @@ import { Info } from "lucide-react";
 import { useEffect, useState } from "react";
 import { getDocumentHtml } from "@/lib/actions/documents";
 import {
+  presentFinding,
+  type AccessibilityError,
+} from "@/lib/accessibility-findings";
+import {
   Accordion,
   AccordionContent,
   AccordionItem,
@@ -23,6 +27,42 @@ import type { UploadedDocument } from "@/lib/types/document";
 function formatIssueType(type: string): string {
   const spaced = type.replace(/-/g, " ");
   return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+}
+
+function FindingLocation({
+  issue,
+  isWord,
+}: {
+  issue: AccessibilityError;
+  isWord: boolean;
+}): React.JSX.Element {
+  const location = issue.location;
+  const pages = location?.sourcePages;
+  const pageLabel = isWord ? "Converted PDF" : "PDF";
+  const source =
+    location?.scope === "document"
+      ? "Whole document"
+      : pages?.length
+        ? `${pageLabel} ${pages.length === 1 ? "page" : "pages"} ${pages.join(", ")}`
+        : "We couldn't identify the source page.";
+  const details = [location?.section, location?.locator].filter(Boolean);
+
+  return (
+    <div className="mt-2">
+      <p>
+        <span className="font-medium">Where:</span> {source}
+        {location?.printedPageLabel &&
+          ` (printed page label: ${location.printedPageLabel})`}
+        {details.length > 0 && ` · ${details.join(" · ")}`}
+      </p>
+      {location?.quote && (
+        <p className="mt-1 break-words">
+          <span className="font-medium">Near this text:</span> “{location.quote}
+          ”
+        </p>
+      )}
+    </div>
+  );
 }
 
 interface ConversionResultDialogProps {
@@ -71,7 +111,7 @@ export default function ConversionResultDialog({
   const html = document.html ?? fetchedHtml ?? undefined;
   const isSuccess = document.status === "success";
   const isError = document.status === "error";
-  const issues = document.errors ?? [];
+  const issues = (document.errors ?? []).map(presentFinding);
   const errorCount = issues.filter(
     (issue) => issue.severity === "error"
   ).length;
@@ -99,7 +139,7 @@ export default function ConversionResultDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-2xl">
+      <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>{document.name}</DialogTitle>
           <DialogDescription>
@@ -108,14 +148,10 @@ export default function ConversionResultDialog({
           {(errorCount > 0 || warningCount > 0) && (
             <div className="flex flex-wrap gap-1">
               {errorCount > 0 && (
-                <Badge variant="destructive">
-                  {errorCount} {errorCount === 1 ? "error" : "errors"}
-                </Badge>
+                <Badge variant="destructive">Needs a fix: {errorCount}</Badge>
               )}
               {warningCount > 0 && (
-                <Badge variant="warning">
-                  {warningCount} {warningCount === 1 ? "warning" : "warnings"}
-                </Badge>
+                <Badge variant="warning">Please check: {warningCount}</Badge>
               )}
             </div>
           )}
@@ -125,10 +161,13 @@ export default function ConversionResultDialog({
           <Info className="mt-0.5 size-4 shrink-0 text-primary" />
           <p>
             <span className="font-semibold text-primary">
-              HTML output should be reviewed
+              Review your converted page
             </span>{" "}
-            before pasting into Canvas. Verify headings, links, tables, and
-            accessibility before publishing.
+            in Canvas before publishing. Compare it with your original document
+            and work through the items below. Page numbers refer to the PDF used
+            for conversion; the Canvas page does not have those page breaks.
+            {/\.docx$/i.test(document.name) &&
+              " The converted PDF may have different page breaks from Word."}
           </p>
         </div>
 
@@ -156,55 +195,6 @@ export default function ConversionResultDialog({
             </div>
 
             <Accordion>
-              {issues.length > 0 && (
-                <AccordionItem value="issues">
-                  <AccordionTrigger>
-                    View accessibility issues ({issues.length})
-                  </AccordionTrigger>
-                  <AccordionContent>
-                    <ul className="flex max-h-64 flex-col gap-3 overflow-auto">
-                      {issues.map((issue, index) => (
-                        <li
-                          key={index}
-                          className="rounded-xl border border-border p-3 text-sm"
-                        >
-                          <div className="flex flex-wrap items-center gap-2">
-                            <Badge
-                              variant={
-                                issue.severity === "error"
-                                  ? "destructive"
-                                  : "warning"
-                              }
-                            >
-                              {issue.severity}
-                            </Badge>
-                            <span className="font-medium">
-                              {formatIssueType(issue.type)}
-                            </span>
-                            {issue.wcag && (
-                              <span className="text-xs text-muted-foreground">
-                                {issue.wcag}
-                              </span>
-                            )}
-                          </div>
-                          <p className="mt-1">{issue.message}</p>
-                          {issue.element && (
-                            <code className="mt-1 block overflow-auto rounded bg-muted px-2 py-1 text-xs">
-                              {issue.element}
-                            </code>
-                          )}
-                          {issue.suggestion && (
-                            <p className="mt-1 text-muted-foreground">
-                              {issue.suggestion}
-                            </p>
-                          )}
-                        </li>
-                      ))}
-                    </ul>
-                  </AccordionContent>
-                </AccordionItem>
-              )}
-
               <AccordionItem value="html-output">
                 <AccordionTrigger>View HTML output</AccordionTrigger>
                 <AccordionContent>
@@ -215,6 +205,60 @@ export default function ConversionResultDialog({
               </AccordionItem>
             </Accordion>
           </div>
+        )}
+
+        {isSuccess && issues.length > 0 && (
+          <section aria-label="Items to review">
+            <h2 className="mb-3 font-medium">
+              Items to review ({issues.length})
+            </h2>
+            <ul className="flex flex-col gap-3">
+              {issues.map((issue, index) => (
+                <li
+                  key={index}
+                  className="rounded-xl border border-border p-3 text-sm"
+                >
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge
+                      variant={
+                        issue.severity === "error" ? "destructive" : "warning"
+                      }
+                    >
+                      {issue.severity === "error"
+                        ? "Needs a fix"
+                        : "Please check"}
+                    </Badge>
+                    <h3 className="font-medium">{issue.title}</h3>
+                  </div>
+                  <FindingLocation
+                    issue={issue}
+                    isWord={/\.docx$/i.test(document.name)}
+                  />
+                  <p className="mt-2 break-words">
+                    <span className="font-medium">What needs attention:</span>{" "}
+                    {issue.message}
+                  </p>
+                  <p className="mt-2 break-words">
+                    <span className="font-medium">What to do:</span>{" "}
+                    {issue.suggestion}
+                  </p>
+                  <details className="mt-3 text-xs text-muted-foreground">
+                    <summary className="cursor-pointer font-medium">
+                      Technical details
+                    </summary>
+                    <p className="mt-2">Rule: {formatIssueType(issue.type)}</p>
+                    {issue.category && <p>Category: {issue.category}</p>}
+                    {issue.wcag && <p>{issue.wcag}</p>}
+                    {issue.element && (
+                      <code className="mt-1 block overflow-auto rounded bg-muted px-2 py-1 whitespace-pre-wrap">
+                        {issue.element}
+                      </code>
+                    )}
+                  </details>
+                </li>
+              ))}
+            </ul>
+          </section>
         )}
       </DialogContent>
     </Dialog>

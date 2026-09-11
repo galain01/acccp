@@ -290,6 +290,118 @@ describe("listDocuments", () => {
       "retained",
     ]);
   });
+
+  it("restores faculty wording and source locations from the saved finding", async () => {
+    const savedLocation = {
+      scope: "element",
+      sourcePages: [5],
+      printedPageLabel: "3",
+      section: "Course schedule",
+      locator: "First row of the table",
+      quote: "Due date",
+    };
+    vi.mocked(db.select)
+      .mockReturnValueOnce(makeChain([makeDocRow({ jobId: "job-1" })]))
+      .mockReturnValueOnce(
+        makeChain([
+          {
+            jobId: "job-1",
+            severity: "error",
+            ruleCode: "no-table-headers",
+            title: "Identify the labels at the top of this table",
+            category: "accessibility",
+            message: "The labels are not connected to their columns.",
+            suggestion:
+              "In Canvas, identify Week and Due date as column headings.",
+            wcag: "WCAG 1.3.1",
+            location: { ...savedLocation, element: "<td>Due date</td>" },
+            pageCount: 8,
+          },
+        ])
+      );
+
+    const [document] = await listDocuments("session-1");
+
+    expect(document.errors?.[0]).toEqual({
+      type: "no-table-headers",
+      severity: "error",
+      title: "Identify the labels at the top of this table",
+      category: "accessibility",
+      message: "The labels are not connected to their columns.",
+      suggestion: "In Canvas, identify Week and Due date as column headings.",
+      wcag: "WCAG 1.3.1",
+      element: "<td>Due date</td>",
+      location: savedLocation,
+    });
+    expect(vi.mocked(db.select).mock.calls[1][0]).toHaveProperty("title");
+    expect(vi.mocked(db.select).mock.calls[1][0]).toHaveProperty("category");
+    expect(vi.mocked(db.select).mock.calls[1][0]).toHaveProperty("pageCount");
+  });
+
+  it("preserves a finding and nearby text when its stored source page is invalid", async () => {
+    vi.mocked(db.select)
+      .mockReturnValueOnce(makeChain([makeDocRow({ jobId: "job-1" })]))
+      .mockReturnValueOnce(
+        makeChain([
+          {
+            jobId: "job-1",
+            severity: "warning",
+            ruleCode: "missing-image",
+            title: "Add the missing chart",
+            category: "source-review",
+            message: "The chart has not been added to the converted page.",
+            suggestion: "Add the chart below Results in Canvas.",
+            wcag: null,
+            pageCount: 8,
+            location: {
+              scope: "element",
+              sourcePages: [99],
+              printedPageLabel: null,
+              section: "Results",
+              locator: "Below the first paragraph",
+              quote: null,
+              element: { invalid: true },
+            },
+          },
+        ])
+      );
+
+    const [document] = await listDocuments("session-1");
+    expect(document.errors).toHaveLength(1);
+    expect(document.errors?.[0].location?.sourcePages).toBeNull();
+    expect(document.errors?.[0].location?.section).toBe("Results");
+    expect(document.errors?.[0].element).toBeUndefined();
+  });
+
+  it("keeps legacy findings with only an HTML excerpt readable after reload", async () => {
+    vi.mocked(db.select)
+      .mockReturnValueOnce(makeChain([makeDocRow({ jobId: "job-1" })]))
+      .mockReturnValueOnce(
+        makeChain([
+          {
+            jobId: "job-1",
+            severity: "info",
+            ruleCode: "heading-skip",
+            title: "heading-skip",
+            category: "historical-category",
+            message: "Review this heading.",
+            suggestion: "Check which section it belongs to.",
+            wcag: null,
+            location: { element: "<h4>Readings</h4>" },
+            pageCount: null,
+          },
+        ])
+      );
+
+    const [document] = await listDocuments("session-1");
+    expect(document.errors?.[0]).toMatchObject({
+      severity: "warning",
+      element: "<h4>Readings</h4>",
+      message: "Review this heading.",
+    });
+    expect(document.errors?.[0].category).toBeUndefined();
+    expect(document.errors?.[0].location).toBeUndefined();
+  });
 });
 
 describe("getDocumentHtml", () => {

@@ -2,7 +2,10 @@
 
 import { and, desc, eq, inArray } from "drizzle-orm";
 
-import type { AccessibilityError } from "@/lib/convert";
+import {
+  readFindingLocation,
+  type AccessibilityError,
+} from "@/lib/accessibility-findings";
 import { verifyRoleOrRedirect } from "@/lib/auth";
 import { toConversionStatus } from "@/lib/conversion-status";
 import { db } from "@/lib/db";
@@ -67,10 +70,13 @@ export async function listDocuments(
         jobId: validationFindings.jobId,
         severity: validationFindings.severity,
         ruleCode: validationFindings.ruleCode,
+        title: validationFindings.title,
+        category: validationFindings.category,
         message: validationFindings.message,
         suggestion: validationFindings.suggestion,
         wcag: validationFindings.wcag,
         location: validationFindings.location,
+        pageCount: conversionJobs.pageCount,
       })
       .from(validationFindings)
       .innerJoin(
@@ -90,14 +96,34 @@ export async function listDocuments(
 
     for (const finding of findingRows) {
       const errors = findingsByJobId.get(finding.jobId) ?? [];
-      const location = finding.location as { element?: string } | null;
+      const storedLocation =
+        finding.location && typeof finding.location === "object"
+          ? (finding.location as Record<string, unknown>)
+          : null;
+      const category = [
+        "accessibility",
+        "canvas",
+        "source-review",
+        "content-fidelity",
+      ].includes(finding.category)
+        ? (finding.category as AccessibilityError["category"])
+        : undefined;
       errors.push({
         type: (finding.ruleCode as AccessibilityError["type"]) ?? "other",
         severity: finding.severity === "info" ? "warning" : finding.severity,
+        title: finding.title ?? undefined,
+        category,
         message: finding.message,
         suggestion: finding.suggestion ?? "",
         wcag: finding.wcag ?? undefined,
-        element: location?.element,
+        element:
+          typeof storedLocation?.element === "string"
+            ? storedLocation.element.slice(0, 240)
+            : undefined,
+        location: readFindingLocation(
+          storedLocation,
+          finding.pageCount ?? undefined
+        ),
       });
       findingsByJobId.set(finding.jobId, errors);
     }

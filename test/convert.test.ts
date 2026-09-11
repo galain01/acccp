@@ -17,6 +17,9 @@ vi.mock("prettier", async () => {
 
 const callLiteLLMMock = vi.fn();
 const fetchModelPricingMock = vi.fn();
+const getLiteLLMConfigMock = vi.fn();
+const countPdfPagesMock = vi.fn().mockResolvedValue(5);
+vi.mock("../lib/pdf-page-count", () => ({ countPdfPages: countPdfPagesMock }));
 
 vi.mock("../lib/litellm", async () => {
   const actual =
@@ -25,7 +28,7 @@ vi.mock("../lib/litellm", async () => {
     ...actual,
     callLiteLLM: callLiteLLMMock,
     fetchModelPricing: fetchModelPricingMock,
-    getLiteLLMConfig: () => TEST_CONFIG,
+    getLiteLLMConfig: getLiteLLMConfigMock,
   };
 });
 
@@ -36,6 +39,12 @@ const TEST_CONFIG: LiteLLMConfig = {
 };
 
 const PDF_BYTES = Buffer.from("%PDF-1.7\nmock pdf bytes\n%%EOF");
+const SOURCE = { buffer: PDF_BYTES, filename: "test.pdf", pageCount: 5 };
+
+beforeEach(() => {
+  getLiteLLMConfigMock.mockReset().mockReturnValue(TEST_CONFIG);
+  countPdfPagesMock.mockClear().mockResolvedValue(5);
+});
 
 const VALID_FINDING: AccessibilityError = {
   type: "missing-alt",
@@ -51,6 +60,156 @@ const { LiteLLMError } = await import("../lib/litellm");
 describe("validateWithAI", () => {
   beforeEach(() => {
     callLiteLLMMock.mockReset();
+  });
+
+  it("sends the exact PDF and measured page count with the output HTML", async () => {
+    callLiteLLMMock.mockResolvedValueOnce({
+      content: "[]",
+      model: "test-model",
+      promptTokens: 10,
+      completionTokens: 2,
+    });
+    await validateWithAI("<p>Course schedule</p>", TEST_CONFIG, SOURCE);
+    expect(callLiteLLMMock.mock.calls[0][1]).toEqual([
+      { type: "text", text: expect.stringContaining("<p>Course schedule</p>") },
+      {
+        type: "file",
+        file: {
+          filename: "test.pdf",
+          file_data: `data:application/pdf;base64,${PDF_BYTES.toString("base64")}`,
+        },
+      },
+    ]);
+    expect(callLiteLLMMock.mock.calls[0][1][0].text).toContain("page count: 5");
+  });
+
+  it.each(["length", "content_filter", "tool_calls"])(
+    "does not accept even valid JSON as a completed audit after %s",
+    async (finishReason) => {
+      const response = {
+        content: "[]",
+        model: "test-model",
+        promptTokens: 10,
+        completionTokens: 2,
+        finishReason,
+      };
+      callLiteLLMMock.mockResolvedValueOnce(response);
+      const result = await validateWithAI(
+        "<p>Course schedule</p>",
+        TEST_CONFIG,
+        SOURCE
+      );
+      expect(result.call).toEqual(response);
+      expect(result.errors).toEqual([
+        expect.objectContaining({
+          title: "The document check is incomplete",
+          location: expect.objectContaining({
+            scope: "document",
+            sourcePages: null,
+          }),
+        }),
+      ]);
+    }
+  );
+
+  it("keeps a usable finding when optional metadata is malformed or not present in the HTML", async () => {
+    callLiteLLMMock.mockResolvedValueOnce({
+      content: JSON.stringify([
+        {
+          ...VALID_FINDING,
+          element: "<h2>Invented</h2>",
+          wcag: 1.1,
+          category: {},
+          title: [],
+          location: {
+            sourcePages: [6],
+            section: "Course schedule",
+            locator: "first row",
+          },
+        },
+      ]),
+      model: "test-model",
+      promptTokens: 10,
+      completionTokens: 2,
+    });
+    const { errors } = await validateWithAI(
+      "<p>Course schedule</p>",
+      TEST_CONFIG,
+      SOURCE
+    );
+    expect(errors).toEqual([
+      {
+        ...VALID_FINDING,
+        location: {
+          scope: "element",
+          sourcePages: null,
+          printedPageLabel: null,
+          section: "Course schedule",
+          locator: "first row",
+          quote: null,
+        },
+      },
+    ]);
+  });
+
+  it("retains a valid source location with a matching HTML snippet", async () => {
+    const location = {
+      scope: "element",
+      sourcePages: [5],
+      printedPageLabel: "3",
+      section: "Course schedule",
+      locator: "first row",
+      quote: "Due date",
+    };
+    const finding = {
+      ...VALID_FINDING,
+      title: "Describe the course diagram",
+      category: "accessibility",
+      element: "<p>Due date</p>",
+      location,
+    };
+    callLiteLLMMock.mockResolvedValueOnce({
+      content: JSON.stringify([finding]),
+      model: "test-model",
+      promptTokens: 10,
+      completionTokens: 2,
+    });
+    const { errors } = await validateWithAI(
+      "<p>Due date</p>",
+      TEST_CONFIG,
+      SOURCE
+    );
+    expect(errors).toEqual([finding]);
+  });
+
+  it("keeps nearby text but withholds unverified page numbers when counting is unavailable", async () => {
+    callLiteLLMMock.mockResolvedValueOnce({
+      content: JSON.stringify([
+        {
+          ...VALID_FINDING,
+          location: {
+            sourcePages: [5],
+            printedPageLabel: "3",
+            quote: "Due date",
+          },
+        },
+      ]),
+      model: "test-model",
+      promptTokens: 10,
+      completionTokens: 2,
+    });
+    const { errors } = await validateWithAI("<p>Due date</p>", TEST_CONFIG, {
+      ...SOURCE,
+      pageCount: null,
+    });
+    expect(errors[0].location).toMatchObject({
+      sourcePages: null,
+      printedPageLabel: null,
+      quote: "Due date",
+    });
+    expect(callLiteLLMMock.mock.calls[0][1][0].text).toContain(
+      "sourcePages must be null"
+    );
   });
 
   it("preserves supported finding types, severities, and optional strings", async () => {
@@ -85,7 +244,11 @@ describe("validateWithAI", () => {
     };
     callLiteLLMMock.mockResolvedValueOnce(response);
 
-    const { errors, call } = await validateWithAI("<p>html</p>", TEST_CONFIG);
+    const { errors, call } = await validateWithAI(
+      '<img src="diagram.png">',
+      TEST_CONFIG,
+      SOURCE
+    );
 
     expect(errors).toEqual(findings);
     expect(call).toEqual(response);
@@ -109,14 +272,21 @@ describe("validateWithAI", () => {
       };
       callLiteLLMMock.mockResolvedValueOnce(response);
 
-      const { errors, call } = await validateWithAI("<p>html</p>", TEST_CONFIG);
+      const { errors, call } = await validateWithAI(
+        "<p>html</p>",
+        TEST_CONFIG,
+        SOURCE
+      );
 
       expect(errors).toEqual([
         expect.objectContaining({
           type: "other",
           severity: "warning",
           message: expect.any(String),
-          suggestion: expect.stringMatching(/review.*manually/i),
+          title: "The document check is incomplete",
+          suggestion: expect.stringMatching(
+            /ask your campus accessibility support team/i
+          ),
         }),
       ]);
       expect(call).toEqual(response);
@@ -131,7 +301,7 @@ describe("validateWithAI", () => {
       completionTokens: 1,
     });
 
-    const { errors } = await validateWithAI("<p>html</p>", TEST_CONFIG);
+    const { errors } = await validateWithAI("<p>html</p>", TEST_CONFIG, SOURCE);
     expect(errors).toEqual([]);
   });
 
@@ -148,8 +318,6 @@ describe("validateWithAI", () => {
     ["a blank suggestion", { ...VALID_FINDING, suggestion: "" }],
     ["a non-string message", { ...VALID_FINDING, message: 42 }],
     ["a non-string suggestion", { ...VALID_FINDING, suggestion: null }],
-    ["a non-string element", { ...VALID_FINDING, element: {} }],
-    ["a non-string WCAG value", { ...VALID_FINDING, wcag: 1.1 }],
   ])(
     "replaces an invalid finding containing %s with a review warning",
     async (_, finding) => {
@@ -160,13 +328,20 @@ describe("validateWithAI", () => {
         completionTokens: 2,
       });
 
-      const { errors } = await validateWithAI("<p>html</p>", TEST_CONFIG);
+      const { errors } = await validateWithAI(
+        "<p>html</p>",
+        TEST_CONFIG,
+        SOURCE
+      );
 
       expect(errors).toEqual([
         expect.objectContaining({
           type: "other",
           severity: "warning",
-          suggestion: expect.stringMatching(/review.*manually/i),
+          title: "The document check is incomplete",
+          suggestion: expect.stringMatching(
+            /ask your campus accessibility support team/i
+          ),
         }),
       ]);
     }
@@ -193,7 +368,11 @@ describe("validateWithAI", () => {
       completionTokens: 2,
     });
 
-    const { errors } = await validateWithAI("<p>html</p>", TEST_CONFIG);
+    const { errors } = await validateWithAI(
+      "<p>html</p><h2></h2>",
+      TEST_CONFIG,
+      SOURCE
+    );
 
     expect(errors).toEqual([
       VALID_FINDING,
@@ -207,6 +386,55 @@ describe("convertPdf", () => {
   beforeEach(() => {
     callLiteLLMMock.mockReset();
     fetchModelPricingMock.mockReset();
+  });
+
+  it("selects each stage independently and keeps its actual model, tokens and cost", async () => {
+    const conversionConfig = { ...TEST_CONFIG, model: "conversion-choice" };
+    const auditConfig = { ...TEST_CONFIG, model: "audit-choice" };
+    getLiteLLMConfigMock.mockImplementation((stage) =>
+      stage === "convert" ? conversionConfig : auditConfig
+    );
+    callLiteLLMMock
+      .mockResolvedValueOnce({
+        content: "<p>converted</p>",
+        model: "conversion-actual",
+        promptTokens: 100,
+        completionTokens: 50,
+        responseCostUsd: 0.012,
+      })
+      .mockResolvedValueOnce({
+        content: "[]",
+        model: "audit-actual",
+        promptTokens: 80,
+        completionTokens: 20,
+        responseCostUsd: 0.002,
+      });
+    const result = await convertPdf(PDF_BYTES, "test.pdf", 5);
+    if ("error" in result) throw new Error(result.error);
+    expect(getLiteLLMConfigMock.mock.calls).toEqual([
+      ["convert"],
+      ["validate"],
+    ]);
+    expect(callLiteLLMMock.mock.calls.map((call) => call[2])).toEqual([
+      conversionConfig,
+      auditConfig,
+    ]);
+    expect(result.model).toBe("conversion-actual");
+    expect(result.calls).toEqual([
+      expect.objectContaining({
+        stage: "convert",
+        model: "conversion-actual",
+        costUsd: 0.012,
+      }),
+      expect.objectContaining({
+        stage: "validate",
+        model: "audit-actual",
+        costUsd: 0.002,
+      }),
+    ]);
+    expect(result.tokensUsed).toBe(250);
+    expect(fetchModelPricingMock).not.toHaveBeenCalled();
+    expect(countPdfPagesMock).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -298,9 +526,11 @@ describe("convertPdf", () => {
         },
       },
     ]);
-    expect(callLiteLLMMock.mock.calls[1][1]).toEqual(
-      expect.stringContaining(result.html)
-    );
+    expect(callLiteLLMMock.mock.calls[1][1]).toEqual([
+      { type: "text", text: expect.stringContaining(result.html) },
+      callLiteLLMMock.mock.calls[0][1][1],
+    ]);
+    expect(callLiteLLMMock.mock.calls[1][1][0].text).toContain("page count: 5");
 
     const tokenSum = result.calls.reduce(
       (sum, call) => sum + call.promptTokens + call.completionTokens,
@@ -613,7 +843,10 @@ describe("convertPdf", () => {
       expect.objectContaining({
         type: "other",
         severity: "warning",
-        suggestion: expect.stringMatching(/review.*manually/i),
+        title: "The document check is incomplete",
+        suggestion: expect.stringMatching(
+          /ask your campus accessibility support team/i
+        ),
       }),
     ]);
     expect(result.calls).toEqual([
@@ -694,7 +927,10 @@ describe("convertPdf", () => {
       expect.objectContaining({
         type: "other",
         severity: "warning",
-        message: expect.stringContaining("page 3; bottom paragraph"),
+        location: expect.objectContaining({
+          sourcePages: [3],
+          locator: "bottom paragraph",
+        }),
       }),
       expect.objectContaining({ type: "missing-link", severity: "warning" }),
     ]);
