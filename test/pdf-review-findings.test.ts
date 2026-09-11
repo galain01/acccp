@@ -265,3 +265,161 @@ describe("merging duplicate source and audit findings", () => {
     );
   });
 });
+
+describe("link findings inside their containing paragraphs", () => {
+  const firstMarker =
+    "<!-- LINK TARGET REQUIRED: PDF page 5; section Resources; near For the field notebook guide, click here; the destination of this link is not available -->";
+  const secondMarker =
+    "<!-- LINK TARGET REQUIRED: PDF page 5; section Resources; near the standalone Click here text; the destination of this link is not available -->";
+  const firstText = "For the field notebook guide, click here.";
+  const html = `<h3>Resources</h3><p>${firstText}${firstMarker}</p><p>Click here${secondMarker}</p>`;
+  const audit = (element: string, title: string): AccessibilityError => ({
+    type: "missing-link",
+    severity: "warning",
+    category: "source-review",
+    title,
+    message: "The destination is missing.",
+    suggestion:
+      "Confirm the destination in the original document and add the link in Canvas.",
+    element,
+    location: {
+      ...location,
+      section: "Resources",
+      locator: title,
+      quote: title,
+      printedPageLabel: "4",
+    },
+  });
+
+  it("takes exact evidence from each containing paragraph instead of a preceding heading or paragraph", () => {
+    const findings = pdfReviewFindings(html, 5);
+    expect(findings.map((finding) => finding.element)).toEqual([
+      `<p>${firstText}`,
+      "<p>Click here",
+    ]);
+    for (const finding of findings) expect(html).toContain(finding.element);
+  });
+
+  it("merges each live-style audit excerpt with exactly its own source marker", () => {
+    const audited = [
+      audit(firstText, "Restore the field notebook link"),
+      audit(`Click here${secondMarker}`, "Restore the standalone link"),
+    ];
+    const merged = mergeFindings(pdfReviewFindings(html, 5), audited, html);
+    expect(merged).toEqual(audited);
+    expect(merged.map((finding) => finding.location?.printedPageLabel)).toEqual(
+      ["4", "4"]
+    );
+  });
+
+  it("keeps separate markers inside one paragraph and matches independent exact text spans", () => {
+    const sameParagraph = `<p>${firstText}${firstMarker} Second destination.${secondMarker}</p>`;
+    const source = pdfReviewFindings(sameParagraph, 5);
+    const audited = [
+      audit(firstText, "First link"),
+      audit("Second destination.", "Second link"),
+    ];
+    expect(source.map((finding) => finding.element)).toEqual([
+      `<p>${firstText}`,
+      "Second destination.",
+    ]);
+    expect(mergeFindings(source, audited, sameParagraph)).toEqual(audited);
+  });
+
+  it("keeps a broad paragraph excerpt ambiguous even after one of its markers has matched", () => {
+    const sameParagraph = `<p>${firstText}${firstMarker} Second destination.${secondMarker}</p>`;
+    const source = pdfReviewFindings(sameParagraph, 5);
+    // Both markers sit within this excerpt; consuming the first match must not
+    // make the broad excerpt falsely identify only the second remaining item.
+    const audited = [
+      audit(firstText, "First link"),
+      audit(sameParagraph, "An unspecified link"),
+    ];
+    const result = mergeFindings(source, audited, sameParagraph);
+    expect(result).toHaveLength(3);
+    expect(result[0]).toEqual(audited[0]);
+    expect(result[1]).toEqual(source[1]);
+    expect(result[2]).toEqual(audited[1]);
+  });
+
+  it("does not merge repeated generic link text in unrelated paragraphs", () => {
+    const repeated = `<p>Click here${firstMarker}</p><p>Click here${secondMarker}</p>`;
+    expect(
+      mergeFindings(
+        pdfReviewFindings(repeated, 5),
+        [audit("Click here", "Unspecified link")],
+        repeated
+      )
+    ).toHaveLength(3);
+  });
+
+  it("does not treat quoted text in comments or an HTML attribute as visible matching evidence", () => {
+    const sample = `<p data-note="unique attribute">Visible link.<!-- LINK TARGET REQUIRED: PDF page 5; section Resources; near unique quoted note; confirm the destination --></p>`;
+    const source = [{ ...audit(sample, "Source item"), location: undefined }];
+    const audited = [
+      audit("unique quoted note", "Comment only"),
+      audit("unique attribute", "Attribute only"),
+    ];
+    expect(mergeFindings(source, audited, sample)).toHaveLength(3);
+  });
+
+  it("does not mistake marker-shaped text inside a quoted attribute for a source marker", () => {
+    expect(
+      pdfReviewFindings(`<p title='${firstMarker}'>Visible text</p>`, 5)
+    ).toEqual([]);
+  });
+
+  it("does not reach backward across loose text to a previous heading", () => {
+    const result = pdfReviewFindings(
+      `<h3>Resources</h3>Loose text without a link.${firstMarker}`,
+      5
+    );
+    expect(result[0].element).toBeUndefined();
+  });
+
+  it.each(["inside", "after"])(
+    "keeps an earlier link separate from a different missing destination when the marker is %s the paragraph",
+    (placement) => {
+      const worksheetMarker =
+        "<!-- LINK TARGET REQUIRED: PDF page 1; section Resources; near the worksheet; its address is unavailable -->";
+      const paragraph = "<p>Read <a>the syllabus</a>, then open the worksheet";
+      const sample =
+        placement === "inside"
+          ? `${paragraph}${worksheetMarker}</p>`
+          : `${paragraph}</p>${worksheetMarker}`;
+      const source = pdfReviewFindings(sample, 5);
+      expect(source[0].element).toBe(", then open the worksheet");
+      const syllabus = audit(
+        "<a>the syllabus</a>",
+        "Restore the syllabus link"
+      );
+      expect(mergeFindings(source, [syllabus], sample)).toEqual([
+        ...source,
+        syllabus,
+      ]);
+    }
+  );
+
+  it("does not confuse an earlier plain-text reference with the item immediately before the marker", () => {
+    const sample = `<p>Read the syllabus, then open the worksheet.${firstMarker}</p>`;
+    const source = pdfReviewFindings(sample, 5);
+    const syllabus = audit("the syllabus", "Restore the syllabus link");
+    const worksheet = audit("the worksheet", "Restore the worksheet link");
+    expect(mergeFindings(source, [syllabus], sample)).toEqual([
+      ...source,
+      syllabus,
+    ]);
+    expect(mergeFindings(source, [worksheet], sample)).toEqual([worksheet]);
+  });
+
+  it("still matches a link followed only by punctuation before its marker", () => {
+    const sample = `<p>Read <a>the worksheet</a>. ${firstMarker}</p>`;
+    const worksheet = audit(
+      "<a>the worksheet</a>",
+      "Restore the worksheet link"
+    );
+    expect(
+      mergeFindings(pdfReviewFindings(sample, 5), [worksheet], sample)
+    ).toEqual([worksheet]);
+  });
+});
