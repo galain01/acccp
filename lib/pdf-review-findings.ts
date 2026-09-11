@@ -47,16 +47,132 @@ function markerLocation(
   )!;
 }
 
-function nearbyElement(html: string, position: number): string | undefined {
-  // Prefer the nearest complete small element; never evaluate source HTML.
-  const before = html.slice(Math.max(0, position - 4000), position);
-  const elements = [
-    ...before.matchAll(
-      /<(a|h[2-6]|p|li|th|td)\b[^>]*>[\s\S]*?<\/\1\s*>|<img\b[^>]*>/gi
-    ),
-  ];
-  const last = elements.at(-1);
-  return last ? boundedText(last[0], 240) : undefined;
+interface HtmlSpan {
+  start: number;
+  end: number;
+}
+interface ElementSpan extends HtmlSpan {
+  tag: string;
+  contentEnd: number;
+}
+interface HtmlIndex {
+  elements: ElementSpan[];
+  comments: HtmlSpan[];
+  text: HtmlSpan[];
+}
+
+/** Index original offsets without executing HTML or reconstructing its markup. */
+function indexHtml(html: string): HtmlIndex {
+  const result: HtmlIndex = { elements: [], comments: [], text: [] };
+  const stack: { tag: string; start: number }[] = [];
+  const eligible = /^(?:a|h[2-6]|p|li|th|td|table|img)$/;
+  const voidTag =
+    /^(?:area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/;
+  let cursor = 0;
+  for (const token of html.matchAll(
+    /<!--[\s\S]*?(?:-->|$)|<![^>]*>|<\/?([a-z][\w:-]*)\b(?:[^<>"']|"[^"]*"|'[^']*')*>/gi
+  )) {
+    if (token.index > cursor)
+      result.text.push({ start: cursor, end: token.index });
+    const end = token.index + token[0].length;
+    if (token[0].startsWith("<!--")) {
+      result.comments.push({ start: token.index, end });
+    } else if (token[1]) {
+      const tag = token[1].toLowerCase();
+      if (token[0].startsWith("</")) {
+        const open = stack.findLastIndex((item) => item.tag === tag);
+        if (open >= 0) {
+          const start = stack[open].start;
+          stack.length = open;
+          if (eligible.test(tag))
+            result.elements.push({ tag, start, end, contentEnd: token.index });
+        }
+      } else if (voidTag.test(tag) || /\/\s*>$/.test(token[0])) {
+        if (eligible.test(tag))
+          result.elements.push({
+            tag,
+            start: token.index,
+            end,
+            contentEnd: end,
+          });
+      } else {
+        stack.push({ tag, start: token.index });
+      }
+    }
+    cursor = end;
+  }
+  if (cursor < html.length)
+    result.text.push({ start: cursor, end: html.length });
+  return result;
+}
+
+function nearbyElement(
+  html: string,
+  position: number,
+  index: HtmlIndex
+): string | undefined {
+  // A completed adjacent link/heading is more specific than its parent. Never
+  // jump across substantive text to a previous paragraph or section heading.
+  const adjacent = index.elements
+    .filter(
+      (element) =>
+        element.end <= position &&
+        html.slice(element.end, position).trim() === ""
+    )
+    .sort((a, b) => b.end - a.end || b.start - a.start)[0];
+  if (adjacent && !/^(?:p|li|th|td|table)$/.test(adjacent.tag))
+    return boundedText(html.slice(adjacent.start, adjacent.end), 240);
+
+  const containing =
+    adjacent ??
+    index.elements
+      .filter(
+        (element) => element.start < position && position < element.contentEnd
+      )
+      .sort((a, b) => b.start - a.start)[0];
+  if (!containing) return undefined;
+  if (adjacent) position = adjacent.contentEnd;
+  // Separate markers within one paragraph must retain separate evidence. Keep
+  // the exact text immediately before this marker, after any previous comment.
+  const previousComment = index.comments
+    .filter(
+      (comment) => comment.end <= position && comment.end > containing.start
+    )
+    .at(-1);
+  const previousLink = index.elements
+    .filter(
+      (element) =>
+        element.tag === "a" &&
+        element.start > containing.start &&
+        element.end <= position
+    )
+    .sort((a, b) => b.end - a.end)[0];
+  // An earlier link in the same paragraph is a different potential finding.
+  // Exclude it when substantive text follows; punctuation alone still belongs
+  // with the preceding link and must not erase the useful evidence.
+  const afterLink =
+    previousLink &&
+    lastContentPosition(
+      { start: previousLink.end, end: position },
+      html,
+      index
+    ) !== undefined
+      ? previousLink.end
+      : 0;
+  const start = Math.max(
+    containing.start,
+    previousComment?.end ?? 0,
+    afterLink,
+    position - 240
+  );
+  const hasText = index.text.some(
+    (text) =>
+      Math.max(start, text.start) < Math.min(position, text.end) &&
+      html
+        .slice(Math.max(start, text.start), Math.min(position, text.end))
+        .trim()
+  );
+  return hasText ? boundedText(html.slice(start, position), 240) : undefined;
 }
 
 function plainFinding(
@@ -83,7 +199,10 @@ export function pdfReviewFindings(
   pageCount: number | null
 ): AccessibilityError[] {
   const findings: AccessibilityError[] = [];
-  const comments = [...html.matchAll(MARKERS)];
+  const index = indexHtml(html);
+  const comments = [...html.matchAll(MARKERS)].filter((comment) =>
+    index.comments.some((span) => span.start === comment.index)
+  );
   const usedImageComments = new Set<number>();
   for (const image of html.matchAll(/<img\b[^>]*>/gi)) {
     if (!image[0].includes("{{PLACEHOLDER:")) continue;
@@ -111,7 +230,7 @@ export function pdfReviewFindings(
     if (usedImageComments.has(comment.index)) continue;
     const marker = comment[1].toUpperCase();
     const location = markerLocation(comment[2], pageCount);
-    const element = nearbyElement(html, comment.index);
+    const element = nearbyElement(html, comment.index, index);
     const type: AccessibilityError["type"] = marker.startsWith("LINK TEXT")
       ? "non-descriptive-link"
       : marker.startsWith("LINK TARGET REVIEW")
@@ -144,33 +263,55 @@ export function pdfReviewFindings(
   return findings;
 }
 
-function normalized(html: string): string {
-  return html.replace(/>\s+</g, "><").replace(/\s+/g, " ").trim();
+function uniqueSpan(snippet: string, html: string): HtmlSpan | undefined {
+  const start = html.indexOf(snippet);
+  return start >= 0 && start === html.lastIndexOf(snippet)
+    ? { start, end: start + snippet.length }
+    : undefined;
+}
+
+function lastContentPosition(
+  span: HtmlSpan,
+  html: string,
+  index: HtmlIndex
+): number | undefined {
+  let last: number | undefined;
+  for (const text of index.text) {
+    const start = Math.max(span.start, text.start),
+      end = Math.min(span.end, text.end);
+    if (start >= end) continue;
+    for (const match of html.slice(start, end).matchAll(/[\p{L}\p{N}\p{S}]/gu))
+      last = start + match.index;
+  }
+  return last;
 }
 
 function sameOccurrence(
   a: AccessibilityError,
   b: AccessibilityError,
-  html: string
+  html: string,
+  index: HtmlIndex
 ): boolean {
   if (a.type !== b.type) return false;
   const placeholder = a.element?.match(/\{\{PLACEHOLDER:[^{}]+\}\}/)?.[0];
   if (
     placeholder &&
     b.element?.includes(placeholder) &&
-    html.indexOf(placeholder) === html.lastIndexOf(placeholder)
+    uniqueSpan(placeholder, html)
   )
     return true;
   if (a.element && b.element) {
-    const left = normalized(a.element),
-      right = normalized(b.element),
-      full = normalized(html);
-    if (
-      left === right &&
-      full.indexOf(left) >= 0 &&
-      full.indexOf(left) === full.lastIndexOf(left)
-    )
-      return true;
+    const left = uniqueSpan(a.element, html),
+      right = uniqueSpan(b.element, html);
+    if (left && right) {
+      // Matching a quotation inside a comment or an attribute is not evidence
+      // that both findings concern the same visible content. Nor is an earlier
+      // reference in the same paragraph: the audit must reach the material
+      // immediately before this source marker, ignoring trailing punctuation.
+      const target = lastContentPosition(left, html, index);
+      if (target !== undefined && right.start <= target && target < right.end)
+        return true;
+    }
   }
   const left = a.location,
     right = b.location;
@@ -194,14 +335,15 @@ export function mergeFindings(
   html: string
 ): AccessibilityError[] {
   const merged = [...source];
+  const htmlIndex = indexHtml(html);
   const matched = new Set<number>();
   for (const finding of audited) {
     const candidates = source
       .map((item, index) =>
-        !matched.has(index) && sameOccurrence(item, finding, html) ? index : -1
+        sameOccurrence(item, finding, html, htmlIndex) ? index : -1
       )
       .filter((index) => index >= 0);
-    if (candidates.length === 1) {
+    if (candidates.length === 1 && !matched.has(candidates[0])) {
       const index = candidates[0];
       matched.add(index);
       merged[index] = {
