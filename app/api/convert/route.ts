@@ -367,7 +367,7 @@ async function convertRequest(req: NextRequest) {
 
   // Deliberately outside a transaction: this is a multi-second model call and
   // would pin a pooled connection for its whole duration.
-  let result = await convertPdf(buffer, pdfFilename, pageCount);
+  let result = await convertPdf(buffer, pdfFilename);
 
   if ("error" in result) {
     await recordJobFailure(
@@ -524,7 +524,7 @@ async function convertRequest(req: NextRequest) {
           updatedAt: completedAt,
           modelName: result.model,
           expiresAt,
-          pageCount,
+          pageCount: result.pageCount ?? pageCount,
           processingDurationMs: Math.max(
             0,
             Math.round(performance.now() - processingStartedAt)

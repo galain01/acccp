@@ -44,18 +44,20 @@ project's technical reference for humans.
    **sessions** (think folders/course contexts), listed in the sidebar. Sessions
    can be created, renamed, and archived; a default session is created
    automatically on first visit.
-2. Inside a session, upload one or more `.docx` or `.pdf` files (up to 4 MB each).
+2. Inside a session, upload one or more `.docx` or `.pdf` files (up to 4 MB each and 60 PDF pages).
    Word uploads require the [Word rendering service](docs/word-to-pdf.md).
 3. Click **Convert**. Word documents are first rendered to PDF by the configured
    service. Each unlocked document then enters the same two-stage AI pipeline:
-   - **Stage 1 — conversion**: the uploaded or rendered PDF is sent to the configured
-     vision-capable model as a file, including text and page images. The model
+   - **Stage 1 — conversion**: the server renders every PDF page and sends the configured
+     vision-capable model the original file plus explicit page images. The model
      infers headings and reading order from content and appearance, preserves
      substantive text, and produces accessible Canvas HTML. Images remain
      placeholders for manual reinsertion, with proposed alternative text and
      explicit review findings. No image files are uploaded to Canvas.
-   - **Stage 2 — audit**: a second LLM call receives the same PDF and generated
-     HTML to check accessibility and content preservation. Findings identify
+   - **Stage 2 — audit**: a second LLM call receives the same PDF and page images,
+     plus generated HTML with heading levels withheld. It establishes source
+     heading relationships independently for comparison with the actual HTML,
+     and checks accessibility and content preservation. Findings identify
      the physical PDF page, nearby source text, and a plain-language next step.
      Uncertain pages are labeled unavailable rather than guessed. Technical
      HTML and supported WCAG references are optional details, not faculty instructions.
@@ -316,7 +318,10 @@ in its allowlist. Keep the bucket private.
 
 The upload limit is 4 MB per file to leave room below Vercel's 4.5 MB multipart
 request limit. Larger uploads would require a separate direct-upload workflow.
-The conversion route uses the Node runtime and a 300-second function duration.
+The conversion route uses Node 24 and a 300-second function duration. PDF rendering
+allows at most 60 pages and rejects unsupported or oversized rendering resources
+before model calls. See [PDF visual input and heading review](docs/pdf-visual-audit.md)
+for deployment tracing, runtime limits, and privacy details.
 
 For the included [Word renderer](docs/word-to-pdf.md#deploy-with-vercel-services),
 set the Vercel project framework to **Services** and configure the renderer's

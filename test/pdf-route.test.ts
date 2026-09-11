@@ -252,11 +252,7 @@ describe("document conversion route", () => {
       Buffer.from(PDF),
       "application/pdf"
     );
-    expect(mocks.convert).toHaveBeenCalledWith(
-      Buffer.from(PDF),
-      "course.PDF",
-      8
-    );
+    expect(mocks.convert).toHaveBeenCalledWith(Buffer.from(PDF), "course.PDF");
     expect(mocks.renderWord).not.toHaveBeenCalled();
     expect(inserted.get(documents)?.values).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -300,7 +296,7 @@ describe("document conversion route", () => {
       (await POST(request({ name: "course.docx", contents: DOCX }))).status
     ).toBe(200);
     expect(mocks.countPages).toHaveBeenCalledExactlyOnceWith(rendered);
-    expect(mocks.convert).toHaveBeenCalledWith(rendered, "course.pdf", 9);
+    expect(mocks.convert).toHaveBeenCalledWith(rendered, "course.pdf");
     expect(inserted.get(conversionJobs)?.values).toHaveBeenCalledWith(
       expect.objectContaining({ pageCount: 9, processingDurationMs: null })
     );
@@ -316,11 +312,7 @@ describe("document conversion route", () => {
   it("keeps an unknown page count null while conversion succeeds", async () => {
     mocks.countPages.mockResolvedValueOnce(null);
     expect((await POST(request())).status).toBe(200);
-    expect(mocks.convert).toHaveBeenCalledWith(
-      Buffer.from(PDF),
-      "course.pdf",
-      null
-    );
+    expect(mocks.convert).toHaveBeenCalledWith(Buffer.from(PDF), "course.pdf");
     expect(inserted.get(conversionJobs)?.values).toHaveBeenCalledWith(
       expect.objectContaining({ pageCount: null })
     );
@@ -328,6 +320,26 @@ describe("document conversion route", () => {
       expect.objectContaining({ status: "completed", pageCount: null })
     );
   });
+
+  it.each([null, 8])(
+    "uses the completed page render count when the preliminary count was %s",
+    async (preliminaryCount) => {
+      mocks.countPages.mockResolvedValueOnce(preliminaryCount);
+      mocks.convert.mockResolvedValueOnce({
+        html: "<h2>Course</h2><p>Content</p>",
+        errors: [],
+        model: usage.model,
+        tokensUsed: 150,
+        extractionWarnings: [],
+        calls: [usage],
+        pageCount: 5,
+      });
+      expect((await POST(request())).status).toBe(200);
+      expect(updated.set).toHaveBeenCalledWith(
+        expect.objectContaining({ status: "completed", pageCount: 5 })
+      );
+    }
+  );
 
   it("measures from before Word rendering through the last successful metadata write", async () => {
     let clock = 1_000;
@@ -478,11 +490,7 @@ describe("document conversion route", () => {
     expect(mocks.renderWord.mock.invocationCallOrder[0]).toBeLessThan(
       mocks.db.insert.mock.invocationCallOrder[0]
     );
-    expect(mocks.convert).toHaveBeenCalledWith(
-      Buffer.from(PDF),
-      "course.pdf",
-      8
-    );
+    expect(mocks.convert).toHaveBeenCalledWith(Buffer.from(PDF), "course.pdf");
     expect(inserted.get(documents)?.values).toHaveBeenCalledWith(
       expect.objectContaining({
         originalFilename: "course.DOCX",
@@ -538,11 +546,7 @@ describe("document conversion route", () => {
       Buffer.from(DOCX),
       "course.docx"
     );
-    expect(mocks.convert).toHaveBeenCalledWith(
-      Buffer.from(PDF),
-      "course.pdf",
-      8
-    );
+    expect(mocks.convert).toHaveBeenCalledWith(Buffer.from(PDF), "course.pdf");
     expect(mocks.db.insert).not.toHaveBeenCalledWith(documents);
     expect(mocks.upload.mock.calls.map(([key]) => key)).toEqual([
       "session-1/doc-1/source.pdf",
