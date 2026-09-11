@@ -33,6 +33,11 @@ interface HistoryJobStats {
   /** Jobs whose token/page cohort measurements are available. */
   statsJobCount: number;
   jobTokens: number;
+  /** All recorded attempts, summed only for jobs with every call priced. */
+  jobCostUsd: number | null;
+  /** Requires at least one recorded call; older retained costs are unmeasured. */
+  costMeasuredJobCount: number;
+  costEstimatedJobCount: number;
   pageCountSum: number;
   pageMeasuredJobCount: number;
   medianDurationMs: number | null;
@@ -126,25 +131,34 @@ export function metricsHistoryQuery(range: MetricsHistoryRange) {
         sum(jobs) filter (where status in ('completed', 'needs_review')) as successes,
         sum(jobs) filter (where status in ('failed', 'expired', 'cancelled')) as failures
       from statuses group by grouping sets ((day), ())
-    ), call_tokens_by_job as (
+    ), call_stats_by_job as (
       select ${modelCalls.jobId} as job_id,
-        sum(${modelCalls.promptTokens}::bigint + ${modelCalls.completionTokens}) as tokens
+        sum(${modelCalls.promptTokens}::bigint + ${modelCalls.completionTokens}) as tokens,
+        sum(${effectiveModelCallCostSql()}) as cost,
+        bool_and(${effectiveModelCallCostSql()} is not null) as cost_measured,
+        bool_or(${estimatedModelCallSql()}) as cost_estimated
       from ${modelCalls} group by ${modelCalls.jobId}
     ), job_stats as (
       select j.day, j.model, count(*) as jobs, sum(coalesce(c.tokens, 0)) as tokens,
-        sum(coalesce(j.pages, 0)) as pages, count(j.pages) as measured_pages
-      from live_jobs j left join call_tokens_by_job c on c.job_id = j.id
+        sum(coalesce(j.pages, 0)) as pages, count(j.pages) as measured_pages,
+        sum(c.cost) filter (where c.cost_measured) as cost,
+        count(*) filter (where c.cost_measured) as measured_cost_jobs,
+        count(*) filter (where c.cost_measured and c.cost_estimated) as estimated_cost_jobs
+      from live_jobs j left join call_stats_by_job c on c.job_id = j.id
       group by j.day, j.model
       union all
       select ${retainedJobStats.day}, ${retainedJobStats.model}, ${retainedJobStats.jobCount},
-        ${retainedJobStats.totalTokens}, ${retainedJobStats.pageCountSum}, ${retainedJobStats.pageMeasuredJobCount}
+        ${retainedJobStats.totalTokens}, ${retainedJobStats.pageCountSum}, ${retainedJobStats.pageMeasuredJobCount},
+        ${retainedJobStats.jobCostUsd}, ${retainedJobStats.costMeasuredJobCount}, ${retainedJobStats.costEstimatedJobCount}
       from ${retainedJobStats}, bounds
       where (bounds.from_day is null or ${retainedJobStats.day} >= bounds.from_day)
         and ${retainedJobStats.day} <= bounds.to_day
     ), stats_totals as (
       select case when grouping(day) = 0 then 'daily' when grouping(model) = 0 then 'model' else 'summary' end as kind,
         case when grouping(day) = 0 then day::text when grouping(model) = 0 then model else '' end as key,
-        sum(jobs) as jobs, sum(tokens) as tokens, sum(pages) as pages, sum(measured_pages) as measured_pages
+        sum(jobs) as jobs, sum(tokens) as tokens, sum(pages) as pages, sum(measured_pages) as measured_pages,
+        sum(cost) as cost, sum(measured_cost_jobs) as measured_cost_jobs,
+        sum(estimated_cost_jobs) as estimated_cost_jobs
       from job_stats group by grouping sets ((day), (model), ())
     ), usage as (
       select (${modelCalls.createdAt} at time zone 'UTC')::date as day,
@@ -206,6 +220,8 @@ export function metricsHistoryQuery(range: MetricsHistoryRange) {
       coalesce(u.estimated, 0) as "estimatedCallCount", coalesce(u.unpriced, 0) as "unpricedCallCount",
       coalesce(u.unknown_coverage, false) as "unknownCostCoverage",
       coalesce(j.jobs, 0) as "statsJobCount", coalesce(j.tokens, 0) as "jobTokens",
+      j.cost as "jobCostUsd", coalesce(j.measured_cost_jobs, 0) as "costMeasuredJobCount",
+      coalesce(j.estimated_cost_jobs, 0) as "costEstimatedJobCount",
       coalesce(j.pages, 0) as "pageCountSum", coalesce(j.measured_pages, 0) as "pageMeasuredJobCount",
       d.median as "medianDurationMs", d.minimum as "minDurationMs", d.maximum as "maxDurationMs",
       coalesce(d.jobs, 0) as "timedJobCount"
@@ -235,6 +251,9 @@ function summaryFromRow(row?: DatabaseRow): DashboardHistorySummary {
     unknownCostCoverage: row?.unknownCostCoverage === true,
     statsJobCount: number("statsJobCount"),
     jobTokens: number("jobTokens"),
+    jobCostUsd: nullable("jobCostUsd"),
+    costMeasuredJobCount: number("costMeasuredJobCount"),
+    costEstimatedJobCount: number("costEstimatedJobCount"),
     pageCountSum: number("pageCountSum"),
     pageMeasuredJobCount: number("pageMeasuredJobCount"),
     medianDurationMs: nullable("medianDurationMs"),
@@ -270,6 +289,9 @@ export async function readMetricsHistory(
         unknownCostCoverage: values.unknownCostCoverage,
         statsJobCount: values.statsJobCount,
         jobTokens: values.jobTokens,
+        jobCostUsd: values.jobCostUsd,
+        costMeasuredJobCount: values.costMeasuredJobCount,
+        costEstimatedJobCount: values.costEstimatedJobCount,
         pageCountSum: values.pageCountSum,
         pageMeasuredJobCount: values.pageMeasuredJobCount,
         medianDurationMs: values.medianDurationMs,

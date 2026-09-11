@@ -76,15 +76,27 @@ export async function archiveDocumentMetrics(
   `);
 
   await beforeQuery?.();
+  // Job costs use the same creation-date cohort as tokens. A job contributes
+  // only when every recorded call has a price, including failed/retried calls.
   await tx.execute(sql`
     insert into ${retainedJobStats}
-      (day, model, job_count, total_tokens, page_count_sum, page_measured_job_count)
+      (day, model, job_count, total_tokens, page_count_sum, page_measured_job_count,
+        job_cost_usd, cost_measured_job_count, cost_estimated_job_count)
     select (${conversionJobs.createdAt} at time zone 'UTC')::date,
       coalesce(nullif(btrim(${conversionJobs.modelName}), ''), 'unknown'), count(*),
-      sum((select coalesce(sum(${modelCalls.promptTokens}::bigint + ${modelCalls.completionTokens}), 0)
-        from ${modelCalls} where ${modelCalls.jobId} = ${conversionJobs.id})),
-      sum(coalesce(${conversionJobs.pageCount}, 0)), count(${conversionJobs.pageCount})
+      sum(coalesce(c.tokens, 0)),
+      sum(coalesce(${conversionJobs.pageCount}, 0)), count(${conversionJobs.pageCount}),
+      sum(c.cost) filter (where c.cost_measured),
+      count(*) filter (where c.cost_measured),
+      count(*) filter (where c.cost_measured and c.cost_estimated)
     from ${conversionJobs}
+    left join lateral (
+      select sum(${modelCalls.promptTokens}::bigint + ${modelCalls.completionTokens}) as tokens,
+        sum(${effectiveModelCallCostSql()}) as cost,
+        bool_and(${effectiveModelCallCostSql()} is not null) as cost_measured,
+        bool_or(${estimatedModelCallSql()}) as cost_estimated
+      from ${modelCalls} where ${modelCalls.jobId} = ${conversionJobs.id}
+    ) c on true
     where ${conversionJobs.documentId} = ${documentId}
     group by 1, 2
     order by 1, 2
@@ -92,7 +104,13 @@ export async function archiveDocumentMetrics(
       job_count = ${retainedJobStats.jobCount} + excluded.job_count,
       total_tokens = ${retainedJobStats.totalTokens} + excluded.total_tokens,
       page_count_sum = ${retainedJobStats.pageCountSum} + excluded.page_count_sum,
-      page_measured_job_count = ${retainedJobStats.pageMeasuredJobCount} + excluded.page_measured_job_count
+      page_measured_job_count = ${retainedJobStats.pageMeasuredJobCount} + excluded.page_measured_job_count,
+      job_cost_usd = case
+        when ${retainedJobStats.jobCostUsd} is null and excluded.job_cost_usd is null then null
+        else coalesce(${retainedJobStats.jobCostUsd}, 0) + coalesce(excluded.job_cost_usd, 0)
+      end,
+      cost_measured_job_count = ${retainedJobStats.costMeasuredJobCount} + excluded.cost_measured_job_count,
+      cost_estimated_job_count = ${retainedJobStats.costEstimatedJobCount} + excluded.cost_estimated_job_count
   `);
 
   await beforeQuery?.();

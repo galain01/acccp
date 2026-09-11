@@ -1,9 +1,5 @@
 import Link from "next/link";
-import {
-  getTokenUsage,
-  getUserRoleCounts,
-  listRecentJobs,
-} from "@/lib/actions/admin-metrics";
+import { getUserRoleCounts, listRecentJobs } from "@/lib/actions/admin-metrics";
 import { getMetricsHistory } from "@/lib/actions/metrics-history";
 import {
   costQualifier,
@@ -74,9 +70,8 @@ export default async function AdminMetrics({
   jobsPage: number;
   range: MetricsRange;
 }) {
-  const [roleCounts, tokens30, recentJobs, history] = await Promise.all([
+  const [roleCounts, recentJobs, history] = await Promise.all([
     getUserRoleCounts(),
-    getTokenUsage(30),
     listRecentJobs(jobsPage),
     getMetricsHistory({ from: range.from, to: range.to }),
   ]);
@@ -194,7 +189,8 @@ export default async function AdminMetrics({
             (summary.costUsd === null
               ? "No priced calls in this period."
               : "Gateway-reported model charges.")}{" "}
-          Excludes hosting and storage.
+          Includes conversion, audit and all retries, including recorded charges
+          from failed attempts. Excludes hosting and storage.
         </MetricCard>
         <MetricCard
           title="Median successful job time"
@@ -217,10 +213,18 @@ export default async function AdminMetrics({
           job.
         </MetricCard>
         <MetricCard
-          title="Tokens in the last 30 days"
-          value={formatNumber(tokens30.totalTokens)}
+          title="Average cost per job"
+          value={formatUsd(
+            summary.costMeasuredJobCount && summary.jobCostUsd !== null
+              ? summary.jobCostUsd / summary.costMeasuredJobCount
+              : null
+          )}
         >
-          Always the most recent 30 UTC days, regardless of the selected period.
+          All attempts for jobs created in this period.{" "}
+          {formatNumber(summary.costMeasuredJobCount)} of{" "}
+          {formatNumber(summary.jobCount)} jobs have pricing for every recorded
+          call. {summary.costEstimatedJobCount > 0 && "Includes estimates. "}
+          Excludes hosting and storage.
         </MetricCard>
         <MetricCard
           title="Average pages per measured job"
@@ -238,11 +242,11 @@ export default async function AdminMetrics({
       </div>
       <p className="text-sm text-muted-foreground">
         Job statistics group documents by the date their first conversion job
-        was created. Usage and cost group calls by the date they ran. Successful
-        job time covers server processing through rendering, conversion and
-        saving for the latest attempt; it excludes the browser upload.
-        Historical list-price estimates assume uncached input when cache details
-        were not recorded.
+        was created. Token and model cost totals group calls by the date they
+        ran. Successful job time covers server processing through rendering,
+        conversion and saving for the latest attempt; it excludes the browser
+        upload. Historical list-price estimates assume uncached input when cache
+        details were not recorded.
       </p>
       <MetricsTrend days={history.daily} from={range.from} to={range.to} />
       <section className="min-w-0" aria-labelledby="metrics-models">
@@ -251,8 +255,9 @@ export default async function AdminMetrics({
         </h3>
         <Table>
           <TableCaption>
-            Usage includes all calls. Jobs, pages and timing use each job’s
-            latest model; older totals may lack model attribution.
+            Spending follows each call’s model, including conversion, audit and
+            retries. Job counts, averages, pages and timing use the last saved
+            conversion model; older totals may lack model attribution.
           </TableCaption>
           <TableHeader>
             <TableRow>
@@ -320,8 +325,9 @@ export default async function AdminMetrics({
         </h3>
         <p className="text-sm text-muted-foreground">
           Unexpired documents from the last 14 days, independent of the history
-          filter. Job tokens and cost include all attempts; pages and successful
-          processing time describe the latest attempt.
+          filter. Job tokens and cost include conversion, audit and all attempts
+          across models; pages and successful processing time describe the
+          latest attempt.
         </p>
         <Table>
           <TableCaption>
