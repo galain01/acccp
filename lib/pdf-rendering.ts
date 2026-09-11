@@ -3,6 +3,20 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { MAX_FILE_SIZE_BYTES } from "./document-input";
 
+export interface PdfImageAlternative {
+  /** Generated per-page occurrence ID, never a source-supplied identifier. */
+  id: string;
+  alt: string;
+  /** Measured region in the rendered page; top-left origin, normalized 0..1. */
+  bounds: { x: number; y: number; width: number; height: number } | null;
+}
+
+export interface PdfImageAlternatives {
+  /** Complete describes extraction, not the quality of the source descriptions. */
+  status: "complete" | "unavailable";
+  figures: PdfImageAlternative[];
+}
+
 export interface RenderedPdfPage {
   pageNumber: number;
   width: number;
@@ -10,6 +24,7 @@ export interface RenderedPdfPage {
   png: Buffer;
   /** Null means optional text extraction was unavailable or exceeded its bounds. */
   text: string | null;
+  imageAlternatives: PdfImageAlternatives;
 }
 
 export interface RenderedPdf {
@@ -31,6 +46,11 @@ export const PDF_RENDERING_LIMITS = Object.freeze({
   maxTotalPngBytes: 24 * 1024 * 1024,
   maxPageTextChars: 100_000,
   maxTotalTextChars: 500_000,
+  maxFiguresPerPage: 100,
+  maxFigures: 500,
+  maxAltChars: 8_000,
+  maxPageAltChars: 32_000,
+  maxTotalAltChars: 128_000,
   maxStderrBytes: 16 * 1024,
 });
 
@@ -47,11 +67,76 @@ const MAX_STDIN_BYTES = Math.ceil(MAX_FILE_SIZE_BYTES / 3) * 4 + 64;
 const MAX_STDOUT_BYTES =
   Math.ceil(PDF_RENDERING_LIMITS.maxTotalPngBytes / 3) * 4 +
   PDF_RENDERING_LIMITS.maxTotalTextChars * 6 +
+  PDF_RENDERING_LIMITS.maxTotalAltChars * 6 +
+  PDF_RENDERING_LIMITS.maxFigures * 256 +
   64 * 1024;
 const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseImageAlternatives(
+  value: unknown,
+  pageNumber: number,
+  budget: { figures: number; chars: number }
+): PdfImageAlternatives {
+  const unavailable: PdfImageAlternatives = {
+    status: "unavailable",
+    figures: [],
+  };
+  const limits = PDF_RENDERING_LIMITS;
+  if (
+    !isRecord(value) ||
+    value.status !== "complete" ||
+    !Array.isArray(value.figures) ||
+    value.figures.length > limits.maxFiguresPerPage ||
+    budget.figures + value.figures.length > limits.maxFigures
+  )
+    return unavailable;
+  const figures: PdfImageAlternative[] = [];
+  let chars = 0;
+  for (const [index, figure] of value.figures.entries()) {
+    if (
+      !isRecord(figure) ||
+      figure.id !== `p${pageNumber}-figure${index + 1}` ||
+      typeof figure.alt !== "string" ||
+      figure.alt.length > limits.maxAltChars
+    )
+      return unavailable;
+    chars += figure.alt.length;
+    if (
+      chars > limits.maxPageAltChars ||
+      budget.chars + chars > limits.maxTotalAltChars
+    )
+      return unavailable;
+    let bounds: PdfImageAlternative["bounds"] = null;
+    if (figure.bounds !== null) {
+      const box = figure.bounds;
+      if (
+        !isRecord(box) ||
+        ![box.x, box.y, box.width, box.height].every(
+          (n) => typeof n === "number" && Number.isFinite(n) && n >= 0 && n <= 1
+        )
+      )
+        return unavailable;
+      const { x, y, width, height } = box as NonNullable<
+        PdfImageAlternative["bounds"]
+      >;
+      if (
+        width <= 0 ||
+        height <= 0 ||
+        x + width > 1.000001 ||
+        y + height > 1.000001
+      )
+        return unavailable;
+      bounds = { x, y, width, height };
+    }
+    figures.push({ id: figure.id as string, alt: figure.alt, bounds });
+  }
+  budget.figures += figures.length;
+  budget.chars += chars;
+  return { status: "complete", figures };
 }
 
 function parseResult(value: unknown): RenderedPdf {
@@ -71,6 +156,7 @@ function parseResult(value: unknown): RenderedPdf {
   let totalBytes = 0;
   let totalPixels = 0;
   let totalTextChars = 0;
+  const alternativeBudget = { figures: 0, chars: 0 };
   const pages = value.pages.map((page: unknown, index): RenderedPdfPage => {
     if (!isRecord(page)) throw new PdfRenderingError();
     const { pageNumber, width, height, png: encoded, text } = page;
@@ -109,7 +195,12 @@ function parseResult(value: unknown): RenderedPdf {
     ) {
       throw new PdfRenderingError();
     }
-    return { pageNumber, width, height, png, text };
+    const imageAlternatives = parseImageAlternatives(
+      page.imageAlternatives,
+      pageNumber,
+      alternativeBudget
+    );
+    return { pageNumber, width, height, png, text, imageAlternatives };
   });
   return { pageCount: value.pageCount, pages };
 }
@@ -148,6 +239,7 @@ export async function renderPdfPages(buffer: Buffer): Promise<RenderedPdf> {
           "--permission",
           "--allow-addons",
           `--allow-fs-read=${childPath}`,
+          `--allow-fs-read=${join(root, "lib", "pdf-image-alternatives.mjs")}`,
           `--allow-fs-read=${join(root, "node_modules", "pdf-lib", "dist", "pdf-lib.min.js")}`,
           `--allow-fs-read=${join(root, "node_modules", "pdfjs-dist")}`,
           `--allow-fs-read=${join(root, "node_modules", "@napi-rs")}`,

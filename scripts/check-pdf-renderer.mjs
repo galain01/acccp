@@ -10,7 +10,7 @@ import {
 } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
-import { PDFDocument, rgb } from "pdf-lib";
+import { PDFDocument, PDFHexString, PDFName, PDFOperator, rgb } from "pdf-lib";
 import { createCanvas, loadImage } from "@napi-rs/canvas";
 
 const app = process.cwd();
@@ -30,7 +30,7 @@ try {
     )
       continue;
     if (
-      !/^(?:lib[/\\]pdf-rendering-child\.mjs|node_modules[/\\](?:pdfjs-dist|@napi-rs)[/\\]|node_modules[/\\]pdf-lib[/\\]dist[/\\]pdf-lib\.min\.js$)/.test(
+      !/^(?:lib[/\\]pdf-(?:rendering-child|image-alternatives)\.mjs|node_modules[/\\](?:pdfjs-dist|@napi-rs)[/\\]|node_modules[/\\]pdf-lib[/\\]dist[/\\]pdf-lib\.min\.js$)/.test(
         sub
       )
     )
@@ -41,6 +41,10 @@ try {
     copied++;
   }
   const pdf = await PDFDocument.create();
+  const structure = pdf.context.obj({ Type: PDFName.of("StructTreeRoot") });
+  const structureRef = pdf.context.register(structure);
+  const figureRefs = [];
+  const parentEntries = [];
   const colors = [
     [1, 0, 0],
     [0, 0, 1],
@@ -48,6 +52,12 @@ try {
   ];
   for (const [index, color] of colors.entries()) {
     const page = pdf.addPage([200, 200]);
+    page.pushOperators(
+      PDFOperator.of("BDC", [
+        PDFName.of("Figure"),
+        pdf.context.obj({ MCID: 0 }),
+      ])
+    );
     page.drawRectangle({
       x: 50,
       y: 50,
@@ -55,8 +65,29 @@ try {
       height: 100,
       color: rgb(...color),
     });
+    page.pushOperators(PDFOperator.of("EMC"));
     page.drawText(`Runtime page ${index + 1}`, { x: 10, y: 180, size: 10 });
+    page.node.set(PDFName.of("StructParents"), pdf.context.obj(index));
+    const figureRef = pdf.context.register(
+      pdf.context.obj({
+        Type: PDFName.of("StructElem"),
+        S: PDFName.of("Figure"),
+        P: structureRef,
+        Pg: page.ref,
+        K: 0,
+        Alt: PDFHexString.fromText(`Runtime figure ${index + 1} description`),
+      })
+    );
+    figureRefs.push(figureRef);
+    parentEntries.push(index, pdf.context.obj([figureRef]));
   }
+  structure.set(PDFName.of("K"), pdf.context.obj(figureRefs));
+  structure.set(
+    PDFName.of("ParentTree"),
+    pdf.context.register(pdf.context.obj({ Nums: parentEntries }))
+  );
+  pdf.catalog.set(PDFName.of("StructTreeRoot"), structureRef);
+  pdf.catalog.set(PDFName.of("MarkInfo"), pdf.context.obj({ Marked: true }));
   const request = JSON.stringify({
     pdf: Buffer.from(await pdf.save()).toString("base64"),
   });
@@ -69,6 +100,7 @@ try {
         "--permission",
         "--allow-addons",
         `--allow-fs-read=${childPath}`,
+        `--allow-fs-read=${join(target, "lib/pdf-image-alternatives.mjs")}`,
         `--allow-fs-read=${join(target, "node_modules/pdf-lib/dist/pdf-lib.min.js")}`,
         `--allow-fs-read=${join(target, "node_modules/pdfjs-dist")}`,
         `--allow-fs-read=${join(target, "node_modules/@napi-rs")}`,
@@ -124,6 +156,22 @@ try {
       !page.text?.includes(`Runtime page ${index + 1}`)
     )
       throw new Error("Traced PDF renderer lost page text or order");
+    const alternatives = page.imageAlternatives;
+    const figure = alternatives?.figures?.[0];
+    if (
+      alternatives?.status !== "complete" ||
+      alternatives.figures.length !== 1 ||
+      figure?.alt !== `Runtime figure ${index + 1} description` ||
+      figure?.id !== `p${index + 1}-figure1` ||
+      !figure.bounds ||
+      Math.abs(figure.bounds.x - 0.25) > 0.02 ||
+      Math.abs(figure.bounds.y - 0.25) > 0.02 ||
+      Math.abs(figure.bounds.width - 0.5) > 0.02 ||
+      Math.abs(figure.bounds.height - 0.5) > 0.02
+    )
+      throw new Error(
+        "Traced PDF renderer lost authored image descriptions or their locations"
+      );
     const img = await loadImage(Buffer.from(page.png, "base64"));
     const canvas = createCanvas(img.width, img.height);
     const context = canvas.getContext("2d");
@@ -142,7 +190,7 @@ try {
       throw new Error("Traced PDF renderer lost page graphics");
   }
   console.log(
-    `[pdf-renderer] Traced runtime passed: ${process.platform}/${process.arch}, ${process.version}, 3 pages, text and vector pixels, ${copied} runtime assets.`
+    `[pdf-renderer] Traced runtime passed: ${process.platform}/${process.arch}, ${process.version}, 3 pages, text, vector pixels and located image alternatives, ${copied} runtime assets.`
   );
 } finally {
   // Only remove the exact temporary build directory allocated above.

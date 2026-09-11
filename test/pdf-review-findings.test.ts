@@ -76,6 +76,11 @@ describe("source review markers", () => {
       "missing-image",
       "missing-alt",
     ]);
+    expect(results[1].title).toBe("Check this image's description");
+    expect(results[1].message).not.toContain("needs a description");
+    expect(results[1].suggestion).toContain(
+      "Keep useful author-provided context"
+    );
   });
 
   it("expands a bounded page range for a table continued across pages", () => {

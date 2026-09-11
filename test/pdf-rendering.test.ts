@@ -246,6 +246,70 @@ describe("PDF visual rendering in the real child process", () => {
 });
 
 describe("renderer process boundaries", () => {
+  it.each([
+    ["missing metadata", undefined],
+    [
+      "an invalid occurrence ID",
+      {
+        status: "complete",
+        figures: [{ id: "p99-figure1", alt: "Authored", bounds: null }],
+      },
+    ],
+    [
+      "out-of-page bounds",
+      {
+        status: "complete",
+        figures: [
+          {
+            id: "p1-figure1",
+            alt: "Authored",
+            bounds: { x: 0.9, y: 0.2, width: 0.4, height: 0.2 },
+          },
+        ],
+      },
+    ],
+    [
+      "a truncated-limit violation",
+      {
+        status: "complete",
+        figures: [{ id: "p1-figure1", alt: "x".repeat(8001), bounds: null }],
+      },
+    ],
+  ])(
+    "treats %s as unavailable descriptions while retaining a valid rendered page",
+    async (_, metadata) => {
+      const png = await createCanvas(1, 1).encode("png");
+      const child = fakeChild();
+      const pending = renderPdfPages(Buffer.from("%PDF-test"));
+      child.stdout.emit(
+        "data",
+        Buffer.from(
+          JSON.stringify({
+            ok: true,
+            pageCount: 1,
+            pages: [
+              {
+                pageNumber: 1,
+                width: 1,
+                height: 1,
+                png: png.toString("base64"),
+                text: "",
+                imageAlternatives: metadata,
+              },
+            ],
+          })
+        )
+      );
+      child.emit("close", 0);
+      const result = await pending;
+      expect(result.pages[0].png).toEqual(png);
+      expect(result.pages[0].imageAlternatives).toEqual({
+        status: "unavailable",
+        figures: [],
+      });
+    }
+  );
+
   it("rejects invalid and oversized inputs before spawning", async () => {
     const spawn = vi.mocked(childProcess.spawn);
     await expect(

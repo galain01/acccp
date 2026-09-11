@@ -15,13 +15,16 @@ either model call; there is no silent text-only fallback.
    PDF.js and a native canvas library render pages in memory. No new external
    rendering service is contacted, and no temporary document files are written.
 3. Original PDF bytes and page PNGs go to the existing configured LiteLLM gateway
-   for conversion, then again for audit. This does not add a new model provider.
+   for conversion, then again for audit. Existing authored figure descriptions
+   and measured page regions are extracted from PDF tags and supplied to both
+   stages as source JSON; see [image descriptions](pdf-image-descriptions.md).
+   This does not add a new model provider.
 4. The audit receives heading occurrence IDs and text. Original heading levels and
    converter comments are withheld to reduce copying of the converter's choices.
    It returns a source outline plus other findings. The application validates
    coverage and compares source parents with measured HTML parents. Exact source
    offsets recover original HTML excerpts where masking changed the audit input.
-5. Page PNGs, extracted page text, and the source outline are request-local. They
+5. Page PNGs, extracted page text/figure descriptions, and the source outline are request-local. They
    are not added to storage, database records, or permanent metrics. Original
    documents, converted PDF/HTML, and resulting findings retain the existing
    ownership checks and 14-day deletion policy. Downloaded local copies remain

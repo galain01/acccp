@@ -245,7 +245,15 @@ export function pdfReviewFindings(
                 ? "heading-skip"
                 : "other";
     const finding = plainFinding(type, location, element);
-    if (marker.startsWith("SOURCE TEXT")) {
+    if (marker.startsWith("IMAGE DESCRIPTION")) {
+      finding.title = "Check this image's description";
+      finding.message =
+        "The converter flagged this image's written description for review.";
+      if (location.locator)
+        finding.message += ` Check this detail: ${location.locator}.`;
+      finding.suggestion =
+        "Compare the description with the same image in your original document. Keep useful author-provided context, clarify any specific problem noted here, and add a description in Canvas if one is missing.";
+    } else if (marker.startsWith("SOURCE TEXT")) {
       finding.title = "Check this material against the original";
       finding.message =
         "The converter could not reliably read or preserve the meaning of this material.";

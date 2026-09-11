@@ -25,6 +25,7 @@ import {
   type RenderedPdf,
 } from "./pdf-rendering";
 import { pdfModelInput } from "./pdf-model-input";
+import { pdfImageReviewFindings } from "./pdf-image-review";
 import {
   extractHtmlHeadings,
   prepareHeadingAuditDocument,
@@ -305,7 +306,10 @@ export async function convertPdf(
       };
     }
     const html = await formatHtml(conversionCall.content);
-    const sourceFindings = pdfReviewFindings(html, pageCount);
+    const sourceFindings = [
+      ...pdfReviewFindings(html, pageCount),
+      ...pdfImageReviewFindings(html, rendered),
+    ];
     console.log("[convert] Stage 2: Validating accessibility...");
     const { errors: validationErrors, call: validationCall } =
       await validateWithAI(html, auditConfig, { buffer, filename, rendered });

@@ -27,6 +27,7 @@ const RENDERED: RenderedPdf = {
       "base64"
     ),
     text: null,
+    imageAlternatives: { status: "complete", figures: [] },
   })),
 };
 const COMPLETED_AUDIT = JSON.stringify({
