@@ -1336,7 +1336,38 @@ describe("convertPdf", () => {
     expect(result.html).toContain("  <p>one</p>");
   });
 
-  it("falls back to the unformatted HTML if formatting fails", async () => {
+  it("compacts formatted closing tags before the audit and returned output", async () => {
+    callLiteLLMMock
+      .mockResolvedValueOnce({
+        content:
+          '<div><p>See <a href="https://example.org/resources/accessible-teaching-and-learning-materials">the course guide</a>, then <em>read this emphasized passage with enough words to make the formatter wrap the sentence</em>.</p></div>',
+        model: "test-model",
+        promptTokens: 100,
+        completionTokens: 50,
+      })
+      .mockResolvedValueOnce({
+        content: completedAudit(),
+        model: "test-model",
+        promptTokens: 30,
+        completionTokens: 10,
+      });
+    fetchModelPricingMock.mockResolvedValue(null);
+
+    const result = await convertPdf(PDF_BYTES, "test.pdf");
+
+    if ("error" in result)
+      throw new Error(`expected success, got: ${result.error}`);
+    expect(result.html).not.toMatch(/<\/(?:a|em)\s+>/);
+    expect(result.html).toContain("the course guide</a>,");
+    expect(result.html).toContain("sentence</em>.");
+    expect(callLiteLLMMock.mock.calls[1][1][0].text.endsWith(result.html)).toBe(
+      true
+    );
+    expect(callLiteLLMMock).toHaveBeenCalledTimes(2);
+    expect(result.tokensUsed).toBe(190);
+  });
+
+  it("compacts closing tags on the formatting fallback without logging source", async () => {
     const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
     prettierFormatMock.mockRejectedValueOnce(
@@ -1344,7 +1375,7 @@ describe("convertPdf", () => {
     );
     callLiteLLMMock
       .mockResolvedValueOnce({
-        content: "<p>converted</p>",
+        content: '<p>Read <a href="https://example.org">the guide</a\n >.</p>',
         model: "test-model",
         promptTokens: 100,
         completionTokens: 50,
@@ -1361,7 +1392,12 @@ describe("convertPdf", () => {
 
     if ("error" in result)
       throw new Error(`expected success, got: ${result.error}`);
-    expect(result.html).toBe("<p>converted</p>");
+    expect(result.html).toBe(
+      '<p>Read <a href="https://example.org">the guide</a>.</p>'
+    );
+    expect(callLiteLLMMock.mock.calls[1][1][0].text.endsWith(result.html)).toBe(
+      true
+    );
     expect(JSON.stringify(warning.mock.calls)).not.toContain(
       "private-document-text"
     );

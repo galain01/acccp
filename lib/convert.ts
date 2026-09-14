@@ -47,6 +47,7 @@ import {
   type JobDiagnostic,
 } from "./job-diagnostics";
 import * as prettier from "prettier";
+import { normalizeCanvasClosingTags } from "./canvas-html";
 import {
   PDF_ACCESSIBILITY_SYSTEM_PROMPT,
   PDF_ACCESSIBILITY_USER_MESSAGE,
@@ -168,14 +169,15 @@ async function toModelCallUsage(
 }
 
 async function formatHtml(html: string): Promise<string> {
+  let formatted = html;
   try {
-    return await prettier.format(html, { parser: "html" });
+    formatted = await prettier.format(html, { parser: "html" });
   } catch {
     console.warn(
       "[convert] HTML formatting failed, returning unformatted output."
     );
-    return html;
   }
+  return normalizeCanvasClosingTags(formatted);
 }
 
 // ─── Stage 2: AI validation ───────────────────────────────────────────────────
