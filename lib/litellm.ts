@@ -11,6 +11,12 @@
  */
 
 import { createHash } from "node:crypto";
+import {
+  createJobDiagnostic,
+  describeJobDiagnostic,
+  type DiagnosticCode,
+  type JobDiagnostic,
+} from "./job-diagnostics";
 
 export interface LiteLLMConfig {
   baseUrl: string;
@@ -21,7 +27,15 @@ export interface LiteLLMConfig {
 export const DEFAULT_LITELLM_MODEL = "gpt-5.6-sol-2026-07-09";
 
 /** Contains only diagnostics authored by this client, never a provider body. */
-export class LiteLLMError extends Error {}
+export class LiteLLMError extends Error {
+  readonly diagnostic?: JobDiagnostic;
+
+  constructor(message: string, diagnostic?: JobDiagnostic) {
+    super(message);
+    this.name = "LiteLLMError";
+    if (diagnostic) this.diagnostic = createJobDiagnostic(diagnostic);
+  }
+}
 
 export function getLiteLLMConfig(
   stage?: "convert" | "validate"
@@ -39,8 +53,15 @@ export function getLiteLLMConfig(
     stageModel?.trim() ||
     process.env.LITELLM_MODEL?.trim() ||
     DEFAULT_LITELLM_MODEL;
-  if (!baseUrl) throw new LiteLLMError("Missing env var: LITELLM_BASE_URL");
-  if (!apiKey) throw new LiteLLMError("Missing env var: LITELLM_API_KEY");
+  const diagnostic = createJobDiagnostic({
+    stage: "conversion",
+    code: "provider_configuration",
+    model,
+  });
+  if (!baseUrl)
+    throw new LiteLLMError("Missing env var: LITELLM_BASE_URL", diagnostic);
+  if (!apiKey)
+    throw new LiteLLMError("Missing env var: LITELLM_API_KEY", diagnostic);
   return { baseUrl, apiKey, model };
 }
 
@@ -76,19 +97,116 @@ export type LiteLLMContentPart =
 
 export type LiteLLMUserMessage = string | LiteLLMContentPart[];
 
-function providerErrorReason(status: number): string {
-  // Error bodies may echo document text, filenames, or upstream credentials in
-  // arbitrary formats. Do not forward or log them, even after pattern redaction.
-  if (status === 401 || status === 403)
-    return "Check the API key and its access to the configured model.";
-  if (status === 404) return "Check the proxy URL and configured model ID.";
-  if (status === 400 || status === 413 || status === 422)
-    return "Check that the configured model supports this input and that the PDF is readable and within provider limits.";
-  if (status === 429)
-    return "The provider rate limit or quota was reached. Check available quota and try again later.";
-  if (status >= 500)
-    return "The model provider is temporarily unavailable. Please try again later.";
-  return "The model provider rejected the request. Check the proxy configuration.";
+function providerStatusCode(status: number): DiagnosticCode {
+  if (status === 401 || status === 403) return "provider_auth";
+  if (status === 404) return "provider_model_not_found";
+  if (status === 413) return "provider_payload_limit";
+  if (status === 429) return "provider_rate_or_quota";
+  if (status >= 500) return "provider_unavailable";
+  return "provider_request_rejected";
+}
+
+const MAX_ERROR_BODY_BYTES = 16_384;
+const ERROR_BODY_TIMEOUT_MS = 1_500;
+
+// Only exact documented codes/types are understood. Never inspect error.message:
+// it can contain source text, filenames, credentials, URLs or nested exceptions.
+// LiteLLM's generic throttling_error also covers budgets, so it is deliberately
+// absent. Sources: litellm/proxy/_types.py (ProxyErrorTypes), litellm/exceptions.py,
+// and OpenAI's openai-api-troubleshooting skill in openai/openai-developers-for-cursor.
+const PROVIDER_ERROR_CODES = new Map<string, DiagnosticCode>([
+  ["budget_exceeded", "provider_budget"],
+  ["insufficient_quota", "provider_quota"],
+  ["rate_limit_exceeded", "provider_rate_limit"],
+  ["invalid_api_key", "provider_auth"],
+  ["model_not_found", "provider_model_not_found"],
+  ["token_not_found_in_db", "provider_auth"],
+  ["key_model_access_denied", "provider_auth"],
+  ["team_model_access_denied", "provider_auth"],
+  ["user_model_access_denied", "provider_auth"],
+  ["org_model_access_denied", "provider_auth"],
+]);
+
+function providerBodyCode(value: unknown): DiagnosticCode | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value))
+    return;
+  const error = (value as Record<string, unknown>).error;
+  if (error === null || typeof error !== "object" || Array.isArray(error))
+    return;
+  const known = ["code", "type"].flatMap((key) => {
+    const item = (error as Record<string, unknown>)[key];
+    const mapped =
+      typeof item === "string" && item.length <= 64
+        ? PROVIDER_ERROR_CODES.get(item)
+        : undefined;
+    return mapped ? [mapped] : [];
+  });
+  // Conflicting recognized fields are not enough evidence for a precise cause.
+  return known.length && known.every((code) => code === known[0])
+    ? known[0]
+    : undefined;
+}
+
+/** Read at most a small error envelope; discard oversized, slow or invalid bodies. */
+async function readProviderErrorCode(
+  response: Response
+): Promise<DiagnosticCode | undefined> {
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    reader = response.body?.getReader();
+    if (!reader) return;
+    const bodyReader = reader;
+    const contentLength = response.headers.get("content-length");
+    if (
+      contentLength &&
+      /^\d+$/.test(contentLength) &&
+      Number(contentLength) > MAX_ERROR_BODY_BYTES
+    )
+      return;
+    const read = async () => {
+      const chunks: Uint8Array[] = [];
+      let size = 0;
+      while (true) {
+        const { done, value } = await bodyReader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > MAX_ERROR_BODY_BYTES) return;
+        chunks.push(value);
+      }
+      const bytes = new Uint8Array(size);
+      let offset = 0;
+      for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      return providerBodyCode(JSON.parse(new TextDecoder().decode(bytes)));
+    };
+    return await Promise.race([
+      read(),
+      new Promise<undefined>((resolve) => {
+        timeout = setTimeout(() => resolve(undefined), ERROR_BODY_TIMEOUT_MS);
+      }),
+    ]);
+  } catch {
+    return;
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+    if (reader) void reader.cancel().catch(() => undefined);
+  }
+}
+
+function providerDiagnosticHeaders(response: Response): Partial<JobDiagnostic> {
+  const retryAfter = response.headers.get("retry-after");
+  // LiteLLM documents x-litellm-call-id as its request ID; accept UUIDs only.
+  // https://docs.litellm.ai/docs/proxy/response_headers
+  return createJobDiagnostic({
+    providerRequestId: response.headers.get("x-litellm-call-id"),
+    retryAfterSeconds:
+      retryAfter && /^\d{1,5}$/.test(retryAfter)
+        ? Number(retryAfter)
+        : undefined,
+  });
 }
 
 export async function callLiteLLM(
@@ -96,6 +214,16 @@ export async function callLiteLLM(
   userMessage: LiteLLMUserMessage,
   config: LiteLLMConfig
 ): Promise<LiteLLMCallResult> {
+  const startedAt = performance.now();
+  const diagnosticFor = (code: DiagnosticCode, received?: Response) =>
+    createJobDiagnostic({
+      ...(received ? providerDiagnosticHeaders(received) : {}),
+      stage: "conversion",
+      code,
+      model: config.model,
+      elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      ...(received ? { httpStatus: received.status } : {}),
+    });
   let response: Response;
   try {
     response = await fetch(`${config.baseUrl}/chat/completions`, {
@@ -114,20 +242,35 @@ export async function callLiteLLM(
     });
   } catch {
     throw new LiteLLMError(
-      "Could not connect to the model provider. Check the proxy URL and network access."
+      "Could not connect to the model provider. Check the proxy URL and network access.",
+      diagnosticFor("provider_connection")
     );
   }
 
   if (!response.ok) {
+    const code =
+      (await readProviderErrorCode(response)) ??
+      providerStatusCode(response.status);
+    const diagnostic = diagnosticFor(code, response);
     throw new LiteLLMError(
-      `LiteLLM error ${response.status}: ${providerErrorReason(response.status)}`
+      `LiteLLM error ${response.status}: ${describeJobDiagnostic(diagnostic)}`,
+      diagnostic
     );
   }
 
   // JSON parse errors can include snippets of the response. Never let those
   // exceptions escape to the conversion result or CLI output.
+  let rawData: unknown;
   try {
-    const data = (await response.json()) as {
+    rawData = await response.json();
+  } catch {
+    throw new LiteLLMError(
+      "The model provider returned a response the app could not read. Please try again.",
+      diagnosticFor("provider_invalid_json", response)
+    );
+  }
+  try {
+    const data = rawData as {
       choices: Array<{
         message: { content: string | null };
         finish_reason?: string;
@@ -144,6 +287,13 @@ export async function callLiteLLM(
         };
       };
     };
+    if (
+      !data ||
+      !Array.isArray(data.choices) ||
+      typeof data.model !== "string" ||
+      !data.model.trim()
+    )
+      throw new Error("Unexpected response structure");
 
     const responseCostUsd = parseNonnegativeNumber(
       response.headers.get("x-litellm-response-cost")
@@ -169,7 +319,8 @@ export async function callLiteLLM(
     };
   } catch {
     throw new LiteLLMError(
-      "The model provider returned an invalid response. Please try again."
+      "The model provider returned an invalid response. Please try again.",
+      diagnosticFor("provider_invalid_response", response)
     );
   }
 }

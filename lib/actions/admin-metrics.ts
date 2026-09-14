@@ -14,6 +14,7 @@ import {
   users,
 } from "@/lib/db/schema";
 import { isDocumentExpired } from "@/lib/retention";
+import { readJobDiagnostic, type JobDiagnostic } from "@/lib/job-diagnostics";
 import {
   effectiveModelCallCostSql,
   estimatedModelCallSql,
@@ -164,6 +165,50 @@ export interface RecentJobRow {
   attemptCount: number;
   estimatedCallCount: number;
   unpricedCallCount: number;
+  failure: RecentJobFailure | null;
+}
+
+export interface RecentJobFailure {
+  diagnostic: JobDiagnostic | null;
+  occurredAt: string | null;
+}
+
+function currentFailure(row: {
+  status: string;
+  startedAt: string | null;
+  createdAt: string;
+  attemptCount: number;
+  failureEvent: unknown;
+}): RecentJobFailure | null {
+  if (row.status !== "failed") return null;
+  const unavailable = { diagnostic: null, occurredAt: null };
+  try {
+    const event = row.failureEvent;
+    if (!event || typeof event !== "object" || Array.isArray(event))
+      return unavailable;
+    const { createdAt, diagnostic: stored } = event as Record<string, unknown>;
+    const startedAt =
+      row.startedAt ?? (row.attemptCount <= 1 ? row.createdAt : null);
+    if (typeof createdAt !== "string" || !startedAt) return unavailable;
+    const eventTime = Date.parse(createdAt);
+    const attemptTime = Date.parse(startedAt);
+    if (
+      !Number.isFinite(eventTime) ||
+      !Number.isFinite(attemptTime) ||
+      eventTime < attemptTime
+    )
+      return unavailable;
+    const diagnostic = readJobDiagnostic(stored);
+    if (
+      !diagnostic ||
+      (diagnostic.attemptNumber !== undefined &&
+        diagnostic.attemptNumber !== row.attemptCount)
+    )
+      return unavailable;
+    return { diagnostic, occurredAt: new Date(eventTime).toISOString() };
+  } catch {
+    return unavailable;
+  }
 }
 
 export async function listRecentJobs(
@@ -197,7 +242,26 @@ export async function listRecentJobs(
       processingDurationMs: conversionJobs.processingDurationMs,
       attemptCount: conversionJobs.attemptCount,
       createdAt: conversionJobs.createdAt,
+      startedAt: conversionJobs.startedAt,
       documentCreatedAt: documents.createdAt,
+      documentDeletedAt: documents.deletedAt,
+      // One bounded event per displayed job, in the same snapshot as its current
+      // status/attempt. Never fetch legacy message/detail strings or all metadata.
+      failureEvent: sql<unknown>`case when ${conversionJobs.status} = 'failed' then (
+        select jsonb_build_object(
+          'createdAt', failure.created_at,
+          'diagnostic', case
+            when octet_length((failure.metadata -> 'diagnostic')::text) <= 4096
+            then failure.metadata -> 'diagnostic' else null end
+        )
+        from job_events failure
+        where failure.job_id = ${conversionJobs.id}
+          and failure.event_type in ('conversion_failed', 'output_storage_failed')
+          and failure.created_at >= coalesce(${conversionJobs.startedAt},
+            case when ${conversionJobs.attemptCount} <= 1 then ${conversionJobs.createdAt} else null end)
+        order by failure.created_at desc, failure.id desc
+        limit 1
+      ) else null end`,
     })
     .from(conversionJobs)
     .innerJoin(documents, eq(documents.id, conversionJobs.documentId))
@@ -208,6 +272,7 @@ export async function listRecentJobs(
       conversionJobs.id,
       documents.originalFilename,
       documents.createdAt,
+      documents.deletedAt,
       users.email,
       conversionJobs.status,
       conversionJobs.modelName,
@@ -220,7 +285,11 @@ export async function listRecentJobs(
   const now = new Date();
   return {
     rows: rows
-      .filter((row) => !isDocumentExpired(row.documentCreatedAt, now))
+      .filter(
+        (row) =>
+          !row.documentDeletedAt &&
+          !isDocumentExpired(row.documentCreatedAt, now)
+      )
       .map((row) => ({
         jobId: row.jobId,
         filename: row.filename,
@@ -238,6 +307,7 @@ export async function listRecentJobs(
         estimatedCallCount: Number(row.estimatedCallCount ?? 0),
         unpricedCallCount: Number(row.unpricedCallCount ?? 0),
         createdAt: row.createdAt,
+        failure: currentFailure(row),
       })),
     page: safePage,
     pageSize,

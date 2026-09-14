@@ -279,12 +279,19 @@ describe("DocumentWorkspace conversion selection", () => {
       json: async () => ({
         documentId: "saved-before-model-error",
         error: "Conversion failed.",
+        detail:
+          "PDF page preparation stopped on PDF page 5. An image exceeds the processing limit.",
       }),
     } as Response);
     await mount();
     await upload("retry.pdf");
     await click(button("Convert"));
     expect(row("retry.pdf").textContent).toContain("Error");
+    await click(button("retry.pdf"));
+    expect(
+      document.body.querySelector('[role="dialog"]')?.textContent
+    ).toContain("PDF page 5");
+    await click(button("Close", document.body));
     expect(button("Convert").disabled).toBe(false);
 
     await click(button("Convert"));

@@ -56,6 +56,12 @@ import {
 } from "@/lib/document-retention";
 import { retentionExpiresAt } from "@/lib/retention";
 import { countPdfPages } from "@/lib/pdf-page-count";
+import { recordFailureCount } from "@/lib/failure-metrics";
+import {
+  createJobDiagnostic,
+  describeJobDiagnostic,
+  type JobDiagnostic,
+} from "@/lib/job-diagnostics";
 import { db } from "@/lib/db";
 import {
   artifacts,
@@ -104,10 +110,13 @@ async function recordJobFailure(
   documentId: string,
   jobId: string,
   code: string,
-  message: string,
-  calls: ModelCallUsage[] = [],
-  detail?: string
+  diagnostic: JobDiagnostic,
+  calls: ModelCallUsage[] = []
 ) {
+  // Rebuild from the strict contract at the persistence boundary. Never save
+  // exception messages, arbitrary provider fields or unvalidated diagnostics.
+  const safeDiagnostic = createJobDiagnostic(diagnostic);
+  const message = describeJobDiagnostic(safeDiagnostic);
   const failedAt = new Date().toISOString();
   await withRetainedDocument(documentId, async (tx) => {
     await tx
@@ -116,7 +125,7 @@ async function recordJobFailure(
         status: "failed",
         completedAt: failedAt,
         updatedAt: failedAt,
-        errorCode: code,
+        errorCode: safeDiagnostic.code,
         errorMessage: message,
         processingDurationMs: null,
       })
@@ -124,9 +133,11 @@ async function recordJobFailure(
     await tx.insert(jobEvents).values({
       jobId,
       eventType: code,
+      createdAt: failedAt,
       message,
-      metadata: { detail: detail ?? null },
+      metadata: { detail: message, diagnostic: safeDiagnostic },
     });
+    await recordFailureCount(tx, safeDiagnostic, failedAt);
     // Model work remains billable when conversion or output storage fails.
     if (calls.length > 0) {
       await tx.insert(modelCalls).values(
@@ -279,9 +290,31 @@ async function convertRequest(req: NextRequest) {
   const startedAt = new Date().toISOString();
   const isWord = isDocxFilename(filename);
   const pdfFilename = isWord ? filename.replace(/\.docx$/i, ".pdf") : filename;
-  const buffer = isWord
-    ? await renderWordToPdf(sourceBuffer, filename)
-    : sourceBuffer;
+  let buffer: Buffer;
+  try {
+    buffer = isWord
+      ? await renderWordToPdf(sourceBuffer, filename)
+      : sourceBuffer;
+  } catch (error) {
+    if (!(error instanceof WordToPdfError)) throw error;
+    // Word rendering precedes document/job creation. Keep that behavior and
+    // any earlier saved job, but count the failed attempt without identifiers.
+    const diagnostic = createJobDiagnostic({
+      ...error.diagnostic,
+      stage: "word_to_pdf",
+      code: error.diagnostic?.code ?? "word_rejected",
+      elapsedMs: Math.max(
+        0,
+        Math.round(performance.now() - processingStartedAt)
+      ),
+    });
+    try {
+      await recordFailureCount(db, diagnostic, new Date().toISOString());
+    } catch {
+      console.error("[api/convert] Word failure total could not be saved");
+    }
+    return json({ error: describeJobDiagnostic(diagnostic) }, error.status);
+  }
   const sourceMimeType = isWord ? DOCX_MIME_TYPE : PDF_MIME_TYPE;
   const pageCount = await countPdfPages(buffer);
 
@@ -358,7 +391,10 @@ async function convertRequest(req: NextRequest) {
           processingDurationMs: null,
         },
       })
-      .returning({ id: conversionJobs.id });
+      .returning({
+        id: conversionJobs.id,
+        attemptNumber: conversionJobs.attemptCount,
+      });
     return savedJob;
   });
   const jobId = job.id;
@@ -370,25 +406,27 @@ async function convertRequest(req: NextRequest) {
   let result = await convertPdf(buffer, pdfFilename);
 
   if ("error" in result) {
+    const diagnostic = createJobDiagnostic({
+      ...result.diagnostic,
+      attemptNumber: job.attemptNumber,
+    });
+    const detail = describeJobDiagnostic(diagnostic);
     await recordJobFailure(
       documentId,
       jobId,
       "conversion_failed",
-      result.error,
-      result.calls,
-      result.detail
+      diagnostic,
+      result.calls
     );
 
-    console.error(`[api/convert] job=${jobId} failed: ${result.error}`);
-    return json(
-      { error: result.error, detail: result.detail, jobId, documentId },
-      500
-    );
+    console.error(`[api/convert] job=${jobId} failed: ${diagnostic.code}`);
+    return json({ error: "Conversion failed", detail, jobId, documentId }, 500);
   }
 
   if (isWord) result = withWordRenderingReview(result);
 
   const htmlKey = htmlOutputKey(sessionId, documentId);
+  const savingStartedAt = performance.now();
   try {
     await withRetainedDocument(documentId, async (tx, document) => {
       const expiresAt = retentionExpiresAt(document.createdAt);
@@ -534,12 +572,18 @@ async function convertRequest(req: NextRequest) {
     });
   } catch (error) {
     if (error instanceof DocumentUnavailableError) throw error;
-    const message = "Could not store the converted document. Please try again.";
+    const diagnostic = createJobDiagnostic({
+      stage: "save_output",
+      code: "output_storage_failed",
+      attemptNumber: job.attemptNumber,
+      elapsedMs: Math.max(0, Math.round(performance.now() - savingStartedAt)),
+    });
+    const message = describeJobDiagnostic(diagnostic);
     await recordJobFailure(
       documentId,
       jobId,
       "output_storage_failed",
-      message,
+      diagnostic,
       result.calls
     );
     console.error(`[api/convert] job=${jobId} output persistence failed`);

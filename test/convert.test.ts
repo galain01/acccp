@@ -3,6 +3,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AccessibilityError } from "@/lib/convert";
 import type { LiteLLMConfig, LiteLLMContentPart } from "@/lib/litellm";
 import type { RenderedPdf } from "@/lib/pdf-rendering";
+import {
+  createJobDiagnostic,
+  describeJobDiagnostic,
+} from "@/lib/job-diagnostics";
 
 // Defaults to the real formatter so most tests exercise actual pretty-printing;
 // individual tests can override with mockRejectedValueOnce/mockImplementationOnce.
@@ -1050,15 +1054,23 @@ describe("convertPdf", () => {
   );
 
   it("keeps controlled provider diagnostics but omits arbitrary exception text", async () => {
+    const diagnostic = createJobDiagnostic({
+      stage: "conversion",
+      code: "provider_auth",
+      httpStatus: 401,
+    });
     callLiteLLMMock.mockRejectedValueOnce(
-      new LiteLLMError(
-        "LiteLLM error 401: Check the API key and its access to the configured model."
-      )
+      new LiteLLMError("private-document-text; upstream-secret", diagnostic)
     );
     expect(await convertPdf(PDF_BYTES, "test.pdf")).toMatchObject({
       error: "Conversion failed",
-      detail:
-        "LiteLLM error 401: Check the API key and its access to the configured model.",
+      detail: describeJobDiagnostic(diagnostic),
+      diagnostic: {
+        code: "provider_auth",
+        stage: "conversion",
+        httpStatus: 401,
+        model: TEST_CONFIG.model,
+      },
     });
     callLiteLLMMock.mockRejectedValueOnce(
       new Error("private-document-text; upstream-secret")
@@ -1066,6 +1078,47 @@ describe("convertPdf", () => {
     const failure = await convertPdf(PDF_BYTES, "test.pdf");
     expect(JSON.stringify(failure)).not.toContain("private-document-text");
     expect(JSON.stringify(failure)).not.toContain("upstream-secret");
+  });
+
+  it("identifies an audit failure separately and preserves conversion charges", async () => {
+    const auditConfig = { ...TEST_CONFIG, model: "audit-test-model" };
+    getLiteLLMConfigMock
+      .mockReturnValueOnce(TEST_CONFIG)
+      .mockReturnValueOnce(auditConfig);
+    callLiteLLMMock
+      .mockResolvedValueOnce({
+        content: "<p>Converted</p>",
+        model: TEST_CONFIG.model,
+        promptTokens: 10,
+        completionTokens: 20,
+        responseCostUsd: 0.02,
+      })
+      .mockRejectedValueOnce(
+        new LiteLLMError(
+          "secret response body",
+          createJobDiagnostic({
+            stage: "conversion",
+            code: "provider_quota",
+            httpStatus: 429,
+            providerRequestId: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+          })
+        )
+      );
+    const result = await convertPdf(PDF_BYTES, "private-source.pdf");
+    expect(result).toMatchObject({
+      diagnostic: {
+        stage: "audit",
+        code: "provider_quota",
+        model: "audit-test-model",
+        httpStatus: 429,
+      },
+      calls: [{ stage: "convert", costUsd: 0.02 }],
+    });
+    expect(JSON.stringify(result)).not.toContain("secret response body");
+    expect(JSON.stringify(result)).not.toContain("private-source.pdf");
+    if (!("error" in result)) throw new Error("Expected failure");
+    expect(result.detail).toContain("Accessibility check");
+    expect(result.detail).not.toContain("aaaaaaaa-bbbb");
   });
 
   it("preserves converted HTML, valid findings, and usage when some audit entries are invalid", async () => {

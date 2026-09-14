@@ -4,6 +4,12 @@ import { NextRequest } from "next/server";
 import { PgDialect } from "drizzle-orm/pg-core";
 import type { SQL } from "drizzle-orm";
 import { createHash } from "node:crypto";
+import {
+  createJobDiagnostic,
+  describeJobDiagnostic,
+} from "@/lib/job-diagnostics";
+
+vi.mock("server-only", () => ({}));
 
 const mocks = vi.hoisted(() => ({
   auth: vi.fn(),
@@ -27,16 +33,11 @@ const mocks = vi.hoisted(() => ({
 vi.mock("@/lib/auth", () => ({ verifyRoleOrUnauthorized: mocks.auth }));
 vi.mock("@/lib/convert", () => ({ convertPdf: mocks.convert }));
 vi.mock("@/lib/pdf-page-count", () => ({ countPdfPages: mocks.countPages }));
-vi.mock("@/lib/word-to-pdf", () => ({
+vi.mock("@/lib/word-to-pdf", async () => ({
+  ...(await vi.importActual<typeof import("@/lib/word-to-pdf")>(
+    "@/lib/word-to-pdf"
+  )),
   renderWordToPdf: mocks.renderWord,
-  WordToPdfError: class extends Error {
-    constructor(
-      message: string,
-      public readonly status: number
-    ) {
-      super(message);
-    }
-  },
 }));
 vi.mock("@/lib/db", () => ({ db: mocks.db }));
 vi.mock("@/lib/document-retention", async () => {
@@ -68,6 +69,7 @@ import { WORD_RENDERING_REVIEW_MESSAGE } from "@/lib/word-rendering-review";
 import {
   artifacts,
   conversionJobs,
+  dailyFailureMetrics,
   documents,
   jobEvents,
   modelCalls,
@@ -155,6 +157,7 @@ describe("document conversion route", () => {
   const inserted = new Map<unknown, ReturnType<typeof chain>>();
   const updated = chain();
   afterEach(() => {
+    vi.useRealTimers();
     if (vi.isMockFunction(performance.now))
       vi.mocked(performance.now).mockRestore();
   });
@@ -181,7 +184,7 @@ describe("document conversion route", () => {
         table === documents
           ? [{ id: "doc-1" }]
           : table === conversionJobs
-            ? [{ id: "job-1" }]
+            ? [{ id: "job-1", attemptNumber: 2 }]
             : [];
       const builder = chain(result);
       inserted.set(table, builder);
@@ -632,7 +635,7 @@ describe("document conversion route", () => {
     expect(updated.set).toHaveBeenCalledWith(
       expect.objectContaining({
         status: "failed",
-        errorCode: "conversion_failed",
+        errorCode: "unknown_error",
       })
     );
     expect(inserted.get(modelCalls)?.values).toHaveBeenCalledWith([
@@ -652,9 +655,13 @@ describe("document conversion route", () => {
 
       expect(response.status).toBe(status);
       expect(await response.json()).toEqual({
-        error: "Word rendering unavailable.",
+        error: describeJobDiagnostic(
+          createJobDiagnostic({ stage: "word_to_pdf", code: "word_rejected" })
+        ),
       });
-      expect(mocks.db.insert).not.toHaveBeenCalled();
+      expect(mocks.db.insert).toHaveBeenCalledExactlyOnceWith(
+        dailyFailureMetrics
+      );
       expect(mocks.db.update).not.toHaveBeenCalled();
       expect(mocks.db.delete).not.toHaveBeenCalled();
       expect(mocks.upload).not.toHaveBeenCalled();
@@ -671,7 +678,9 @@ describe("document conversion route", () => {
     const response = await POST(request({ documentId: "doc-1" }));
 
     expect(response.status).toBe(503);
-    expect(mocks.db.insert).not.toHaveBeenCalled();
+    expect(mocks.db.insert).toHaveBeenCalledExactlyOnceWith(
+      dailyFailureMetrics
+    );
     expect(mocks.db.update).not.toHaveBeenCalled();
     expect(mocks.upload).not.toHaveBeenCalled();
     expect(mocks.remove).not.toHaveBeenCalled();
@@ -904,13 +913,95 @@ describe("document conversion route", () => {
     expect(updated.set).toHaveBeenCalledWith(
       expect.objectContaining({
         status: "failed",
-        errorMessage: "Conversion failed",
+        errorMessage: describeJobDiagnostic(createJobDiagnostic(null)),
       })
     );
     expect(inserted.get(modelCalls)?.values).toHaveBeenCalledWith([
       { jobId: "job-1", ...usage, costUsd: "0.001" },
     ]);
     expect(mocks.upload).toHaveBeenCalledTimes(1);
+  });
+
+  it("saves controlled diagnostics and anonymous counts while keeping support fields admin-only", async () => {
+    mocks.convert.mockResolvedValueOnce({
+      error: "private provider error",
+      detail: "document contents and secret-key",
+      diagnostic: {
+        version: 1,
+        stage: "audit",
+        code: "provider_rate_limit",
+        httpStatus: 429,
+        model: "test-model",
+        retryAfterSeconds: 15,
+        providerRequestId: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        attemptNumber: 999,
+        sourceText: "document contents and secret-key",
+      },
+      calls: [usage],
+    });
+    const response = await POST(request());
+    const body = await response.json();
+    expect(response.status).toBe(500);
+    expect(body.detail).toContain("Accessibility check");
+    expect(body.detail).toContain("15 seconds");
+    expect(body).not.toHaveProperty("diagnostic");
+    expect(JSON.stringify(body)).not.toContain("aaaaaaaa-bbbb");
+    const event = inserted.get(jobEvents)?.values.mock.calls[0][0];
+    expect(event).toMatchObject({
+      eventType: "conversion_failed",
+      metadata: {
+        diagnostic: {
+          stage: "audit",
+          code: "provider_rate_limit",
+          attemptNumber: 2,
+          providerRequestId: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        },
+      },
+    });
+    expect(inserted.get(dailyFailureMetrics)?.values).toHaveBeenCalledWith({
+      day: expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/),
+      stage: "audit",
+      code: "provider_rate_limit",
+      failureCount: 1,
+    });
+    const savedAndLogged = JSON.stringify([
+      event,
+      body,
+      vi.mocked(console.error).mock.calls,
+      updated.set.mock.calls,
+    ]);
+    expect(savedAndLogged).not.toContain("document contents");
+    expect(savedAndLogged).not.toContain("secret-key");
+    expect(savedAndLogged).not.toContain("private provider error");
+    expect(inserted.get(modelCalls)?.values).toHaveBeenCalledWith([
+      { jobId: "job-1", ...usage, costUsd: "0.001" },
+    ]);
+  });
+
+  it("keeps the failure event and its aggregate on the same UTC day across a lock wait", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-01T23:59:59.999Z"));
+    let lockCount = 0;
+    mocks.withRetainedDocument.mockImplementation((_id, action) => {
+      if (++lockCount === 3)
+        vi.setSystemTime(new Date("2026-09-02T00:00:00.001Z"));
+      return action(mocks.db, { createdAt: "2026-09-01T00:00:00.000Z" });
+    });
+    mocks.convert.mockResolvedValueOnce({
+      error: "Conversion failed",
+      diagnostic: createJobDiagnostic({
+        stage: "audit",
+        code: "provider_quota",
+      }),
+      calls: [],
+    });
+    expect((await POST(request())).status).toBe(500);
+    expect(inserted.get(jobEvents)?.values.mock.calls[0][0].createdAt).toBe(
+      "2026-09-01T23:59:59.999Z"
+    );
+    expect(inserted.get(dailyFailureMetrics)?.values.mock.calls[0][0].day).toBe(
+      "2026-09-01"
+    );
   });
 
   it("does not log filenames during successful conversions", async () => {

@@ -50,6 +50,9 @@ import {
   withRetainedDocument,
 } from "@/lib/document-retention";
 import * as schema from "@/lib/db/schema";
+import { recordFailureCount } from "@/lib/failure-metrics";
+import { getFailureSummary } from "@/lib/actions/failure-metrics";
+import { createJobDiagnostic } from "@/lib/job-diagnostics";
 import {
   getCostSummary,
   getJobStatusSummary,
@@ -249,6 +252,12 @@ beforeAll(async () => {
       "utf8"
     )
   );
+  await pg.exec(
+    await readFile(
+      new URL("../drizzle/0012_saved_error_details.sql", import.meta.url),
+      "utf8"
+    )
+  );
 });
 
 afterAll(async () => {
@@ -260,7 +269,7 @@ afterEach(() => {
 
 beforeEach(async () => {
   await pg.exec(
-    "TRUNCATE users, retained_job_metrics, retained_model_metrics, retained_job_stats, retained_job_duration_metrics CASCADE"
+    "TRUNCATE users, retained_job_metrics, retained_model_metrics, retained_job_stats, retained_job_duration_metrics, daily_failure_metrics CASCADE"
   );
   blobs.clear();
   fixture.remove.mockReset();
@@ -942,5 +951,124 @@ describe("retention against in-memory PostgreSQL", () => {
     expect(await readAdmin()).toEqual(before);
     expect(await purgeExpiredDocuments()).toMatchObject({ purged: 0 });
     expect(await readAdmin()).toEqual(before);
+  });
+});
+
+describe("anonymous failure history", () => {
+  const diagnostic = createJobDiagnostic({
+    stage: "audit",
+    code: "provider_rate_limit",
+    httpStatus: 429,
+    providerRequestId: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    model: "synthetic-model",
+    pageNumber: 5,
+    attemptNumber: 1,
+  });
+
+  it("keeps daily counts through purge while cascading every detailed event", async () => {
+    const document = await seedDocument(1);
+    const failedAt = new Date().toISOString();
+    const day = failedAt.slice(0, 10);
+    await withRetainedDocument(document.id, async (tx) => {
+      await tx
+        .insert(schema.jobEvents)
+        .values({
+          jobId: document.jobId,
+          eventType: "conversion_failed",
+          message: "Controlled explanation",
+          metadata: { diagnostic },
+        });
+      await recordFailureCount(tx, diagnostic, failedAt);
+      await recordFailureCount(
+        tx,
+        { ...diagnostic, attemptNumber: 2 },
+        failedAt
+      );
+    });
+    const before = await getFailureSummary({ from: day, to: day });
+    expect(before).toEqual([
+      { stage: "audit", code: "provider_rate_limit", count: 2 },
+    ]);
+    const stored = (await pg.query("SELECT * FROM daily_failure_metrics")).rows;
+    expect(Object.keys(stored[0]).sort()).toEqual([
+      "code",
+      "day",
+      "failure_count",
+      "stage",
+    ]);
+    expect(JSON.stringify(stored)).not.toMatch(
+      /synthetic-model|aaaaaaaa|pageNumber|attemptNumber/
+    );
+    await pg.query("UPDATE documents SET deleted_at = now() WHERE id=$1", [
+      document.id,
+    ]);
+    expect(await purgeDocumentIfEligible(document.id)).toBe("purged");
+    expect((await linkedCounts(document.id, document.jobId)).job_events).toBe(
+      0
+    );
+    expect(await getFailureSummary({ from: day, to: day })).toEqual(before);
+    await purgeDocumentIfEligible(document.id);
+    expect(await getFailureSummary({ from: day, to: day })).toEqual(before);
+  });
+
+  it("rolls back the event and its count together", async () => {
+    const document = await seedDocument(1);
+    await expect(
+      withRetainedDocument(document.id, async (tx) => {
+        await tx
+          .insert(schema.jobEvents)
+          .values({
+            jobId: document.jobId,
+            eventType: "conversion_failed",
+            message: "Controlled explanation",
+            metadata: { diagnostic },
+          });
+        await recordFailureCount(tx, diagnostic, new Date().toISOString());
+        throw new Error("Synthetic failure before commit");
+      })
+    ).rejects.toThrow("Synthetic failure before commit");
+    expect(
+      (await pg.query("SELECT * FROM daily_failure_metrics")).rows
+    ).toEqual([]);
+    expect(
+      (
+        await pg.query(
+          "SELECT * FROM job_events WHERE event_type='conversion_failed'"
+        )
+      ).rows
+    ).toEqual([]);
+  });
+
+  it("uses the event's UTC day and honors inclusive selected date ranges", async () => {
+    const document = await seedDocument(1);
+    await pg.exec("SET TIME ZONE 'America/New_York'");
+    await withRetainedDocument(document.id, async (tx) => {
+      for (const time of [
+        "2026-09-01T23:59:59.999Z",
+        "2026-09-02T00:00:00.000Z",
+        "2026-09-03T00:00:00.000Z",
+      ])
+        await recordFailureCount(tx, diagnostic, time);
+    });
+    expect(
+      await getFailureSummary({ from: "2026-09-02", to: "2026-09-02" })
+    ).toEqual([{ stage: "audit", code: "provider_rate_limit", count: 1 }]);
+    expect(await getFailureSummary({ from: null, to: "2026-09-02" })).toEqual([
+      { stage: "audit", code: "provider_rate_limit", count: 2 },
+    ]);
+  });
+
+  it("enforces allowlisted categories and positive counts in the database", async () => {
+    for (const [stage, code, count] of [
+      ["private source text", "provider_quota", 1],
+      ["audit", "upstream-secret", 1],
+      ["audit", "provider_quota", 0],
+    ])
+      await expect(
+        pg.query(
+          "INSERT INTO daily_failure_metrics VALUES ('2026-09-01',$1,$2,$3)",
+          [stage, code, count]
+        )
+      ).rejects.toThrow();
   });
 });

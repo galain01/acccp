@@ -283,7 +283,10 @@ describe("Word renderer bounded responses", () => {
     vi.useFakeTimers();
     fetchMock.mockReturnValue(new Promise(() => {}));
     const pending = renderWordToPdf(word, "file.docx");
-    const assertion = expect(pending).rejects.toMatchObject({ status: 504 });
+    const assertion = expect(pending).rejects.toMatchObject({
+      status: 504,
+      diagnostic: { stage: "word_to_pdf", code: "word_timeout" },
+    });
     await vi.advanceTimersByTimeAsync(60_000);
     await assertion;
     expect(fetchMock.mock.calls[0][1]?.signal?.aborted).toBe(true);
@@ -294,7 +297,10 @@ describe("Word renderer bounded responses", () => {
     const cancel = vi.fn();
     fetchMock.mockResolvedValue(new Response(new ReadableStream({ cancel })));
     const pending = renderWordToPdf(word, "file.docx");
-    const assertion = expect(pending).rejects.toMatchObject({ status: 504 });
+    const assertion = expect(pending).rejects.toMatchObject({
+      status: 504,
+      diagnostic: { stage: "word_to_pdf", code: "word_timeout" },
+    });
     await vi.advanceTimersByTimeAsync(60_000);
     await assertion;
     expect(fetchMock.mock.calls[0][1]?.signal?.aborted).toBe(true);

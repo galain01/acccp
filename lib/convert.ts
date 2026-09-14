@@ -40,6 +40,12 @@ import {
 import { pdfReviewFindings, mergeFindings } from "./pdf-review-findings";
 export type { AccessibilityError } from "./accessibility-findings";
 import { validatePdfInput } from "./document-input";
+import {
+  createJobDiagnostic,
+  describeJobDiagnostic,
+  type DiagnosticStage,
+  type JobDiagnostic,
+} from "./job-diagnostics";
 import * as prettier from "prettier";
 import {
   PDF_ACCESSIBILITY_SYSTEM_PROMPT,
@@ -91,6 +97,8 @@ export interface ConversionResult {
 export interface ConversionError {
   error: string;
   detail?: string;
+  /** Controlled fields only; provider/document text must never be persisted. */
+  diagnostic?: JobDiagnostic;
   /** Usage incurred before the failure, if any — still billable. */
   calls?: ModelCallUsage[];
 }
@@ -268,11 +276,41 @@ export async function convertPdf(
   if (inputError) return { error: inputError, calls: [] };
 
   const calls: ModelCallUsage[] = [];
+  let stage: DiagnosticStage = "conversion";
+  let stageStartedAt = performance.now();
+  let model: string | undefined;
+  const failure = (
+    code: JobDiagnostic["code"],
+    details?: JobDiagnostic
+  ): ConversionError => {
+    const diagnostic = createJobDiagnostic({
+      ...details,
+      code,
+      stage,
+      model:
+        stage === "conversion" || stage === "audit"
+          ? (model ?? details?.model)
+          : undefined,
+      elapsedMs: Math.max(0, Math.round(performance.now() - stageStartedAt)),
+    });
+    return {
+      error: "Conversion failed",
+      detail: describeJobDiagnostic(diagnostic),
+      diagnostic,
+      calls,
+    };
+  };
   try {
     const config = getLiteLLMConfig("convert");
+    stage = "audit";
     const auditConfig = getLiteLLMConfig("validate");
+    stage = "pdf_render";
+    stageStartedAt = performance.now();
     const rendered = await renderPdfPages(buffer);
     const pageCount = rendered.pageCount;
+    stage = "conversion";
+    model = config.model;
+    stageStartedAt = performance.now();
     console.log("[convert] Stage 1: Converting PDF...");
     const conversionCall = await callLiteLLM(
       PDF_ACCESSIBILITY_SYSTEM_PROMPT,
@@ -287,23 +325,17 @@ export async function convertPdf(
       conversionCall.finishReason === "length" ||
       conversionCall.finishReason === "content_filter"
     ) {
-      return {
-        error: "Conversion failed",
-        detail:
-          "The model did not complete the PDF conversion. Try a smaller document or review the provider limits.",
-        calls,
-      };
+      return failure(
+        conversionCall.finishReason === "length"
+          ? "model_output_limit"
+          : "model_content_filter"
+      );
     }
     if (
       !conversionCall.content.trim() ||
       !/<(?:div|section|p|h[2-6])(?:\s|>)/i.test(conversionCall.content)
     ) {
-      return {
-        error: "Conversion failed",
-        detail:
-          "The model did not return an HTML conversion. Check that the PDF is readable and not password-protected.",
-        calls,
-      };
+      return failure("model_invalid_output");
     }
     const html = await formatHtml(conversionCall.content);
     const sourceFindings = [
@@ -311,6 +343,9 @@ export async function convertPdf(
       ...pdfImageReviewFindings(html, rendered),
     ];
     console.log("[convert] Stage 2: Validating accessibility...");
+    stage = "audit";
+    model = auditConfig.model;
+    stageStartedAt = performance.now();
     const { errors: validationErrors, call: validationCall } =
       await validateWithAI(html, auditConfig, { buffer, filename, rendered });
     calls.push(await toModelCallUsage("validate", validationCall, auditConfig));
@@ -332,14 +367,11 @@ export async function convertPdf(
       extractionWarnings: sourceFindings.map((finding) => finding.message),
     };
   } catch (err) {
-    return {
-      error: "Conversion failed",
-      detail:
-        err instanceof LiteLLMError || err instanceof PdfRenderingError
-          ? err.message
-          : "An unexpected conversion error occurred. Please try again.",
-      calls,
-    };
+    const diagnostic =
+      err instanceof LiteLLMError || err instanceof PdfRenderingError
+        ? err.diagnostic
+        : undefined;
+    return failure(diagnostic?.code ?? "unknown_error", diagnostic);
   }
 }
 

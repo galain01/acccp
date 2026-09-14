@@ -2,6 +2,11 @@
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { MAX_FILE_SIZE_BYTES } from "./document-input";
+import {
+  createJobDiagnostic,
+  describeJobDiagnostic,
+  type JobDiagnostic,
+} from "./job-diagnostics";
 
 export interface PdfImageAlternative {
   /** Generated per-page occurrence ID, never a source-supplied identifier. */
@@ -55,12 +60,43 @@ export const PDF_RENDERING_LIMITS = Object.freeze({
 });
 
 export class PdfRenderingError extends Error {
-  constructor() {
-    super(
-      "This PDF could not be rendered within the supported limits. Re-export a fresh PDF of up to 60 pages, or try a smaller or simpler PDF."
+  readonly diagnostic: JobDiagnostic;
+
+  constructor(diagnostic?: JobDiagnostic) {
+    const safe = createJobDiagnostic(
+      diagnostic ?? { stage: "pdf_render", code: "unknown_error" }
     );
+    super(describeJobDiagnostic(safe));
     this.name = "PdfRenderingError";
+    this.diagnostic = safe;
   }
+}
+
+// The child uses a fixed, data-only failure protocol; no library exception text.
+const PDF_FAILURE_CODES = [
+  "pdf_invalid",
+  "pdf_password",
+  "pdf_page_limit",
+  "pdf_image_limit",
+  "pdf_complexity_limit",
+  "pdf_render_warning",
+  "pdf_page_failed",
+  "pdf_output_limit",
+  "pdf_timeout",
+  "pdf_worker_failed",
+  "pdf_protocol_error",
+  "unknown_error",
+] as const;
+type PdfFailureCode = (typeof PDF_FAILURE_CODES)[number];
+
+function renderingError(
+  code: PdfFailureCode,
+  pageNumber?: number,
+  elapsedMs?: number
+): PdfRenderingError {
+  return new PdfRenderingError(
+    createJobDiagnostic({ stage: "pdf_render", code, pageNumber, elapsedMs })
+  );
 }
 
 const MAX_STDIN_BYTES = Math.ceil(MAX_FILE_SIZE_BYTES / 3) * 4 + 64;
@@ -74,6 +110,27 @@ const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseFailure(value: Record<string, unknown>): JobDiagnostic {
+  if (
+    value.ok !== false ||
+    !PDF_FAILURE_CODES.includes(value.code as PdfFailureCode) ||
+    Object.keys(value).some(
+      (key) => !["ok", "code", "pageNumber"].includes(key)
+    ) ||
+    (value.pageNumber !== undefined &&
+      (typeof value.pageNumber !== "number" ||
+        !Number.isSafeInteger(value.pageNumber) ||
+        value.pageNumber < 1 ||
+        value.pageNumber > PDF_RENDERING_LIMITS.maxPages))
+  )
+    throw renderingError("pdf_protocol_error");
+  return createJobDiagnostic({
+    stage: "pdf_render",
+    code: value.code,
+    pageNumber: value.pageNumber,
+  });
 }
 
 function parseImageAlternatives(
@@ -151,14 +208,14 @@ function parseResult(value: unknown): RenderedPdf {
     !Array.isArray(value.pages) ||
     value.pages.length !== value.pageCount
   ) {
-    throw new PdfRenderingError();
+    throw renderingError("pdf_protocol_error");
   }
   let totalBytes = 0;
   let totalPixels = 0;
   let totalTextChars = 0;
   const alternativeBudget = { figures: 0, chars: 0 };
   const pages = value.pages.map((page: unknown, index): RenderedPdfPage => {
-    if (!isRecord(page)) throw new PdfRenderingError();
+    if (!isRecord(page)) throw renderingError("pdf_protocol_error");
     const { pageNumber, width, height, png: encoded, text } = page;
     if (
       pageNumber !== index + 1 ||
@@ -177,7 +234,7 @@ function parseResult(value: unknown): RenderedPdf {
       (text !== null && typeof text !== "string") ||
       (typeof text === "string" && text.length > limits.maxPageTextChars)
     ) {
-      throw new PdfRenderingError();
+      throw renderingError("pdf_protocol_error");
     }
     const png = Buffer.from(encoded, "base64");
     totalBytes += png.length;
@@ -193,7 +250,7 @@ function parseResult(value: unknown): RenderedPdf {
       png.readUInt32BE(16) !== width ||
       png.readUInt32BE(20) !== height
     ) {
-      throw new PdfRenderingError();
+      throw renderingError("pdf_protocol_error");
     }
     const imageAlternatives = parseImageAlternatives(
       page.imageAlternatives,
@@ -211,16 +268,18 @@ function parseResult(value: unknown): RenderedPdf {
  * deadline. Native memory is isolated from the parent JS heap, not OS-sandboxed.
  */
 export async function renderPdfPages(buffer: Buffer): Promise<RenderedPdf> {
+  const started = performance.now();
+  const elapsed = () => Math.max(0, Math.round(performance.now() - started));
   if (
     !Buffer.isBuffer(buffer) ||
     buffer.length > MAX_FILE_SIZE_BYTES ||
     buffer.subarray(0, 5).toString("ascii") !== "%PDF-"
   ) {
-    throw new PdfRenderingError();
+    throw renderingError("pdf_invalid", undefined, elapsed());
   }
   const request = JSON.stringify({ pdf: buffer.toString("base64") });
   if (Buffer.byteLength(request) > MAX_STDIN_BYTES)
-    throw new PdfRenderingError();
+    throw renderingError("pdf_invalid", undefined, elapsed());
   const root = process.cwd();
   const childPath = join(root, "lib", "pdf-rendering-child.mjs");
   const env: NodeJS.ProcessEnv = { NODE_ENV: "production" };
@@ -248,47 +307,76 @@ export async function renderPdfPages(buffer: Buffer): Promise<RenderedPdf> {
         { env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] }
       );
     } catch {
-      reject(new PdfRenderingError());
+      reject(renderingError("pdf_worker_failed", undefined, elapsed()));
       return;
     }
     let closed = false;
-    let failed = false;
+    let failureCode: PdfFailureCode | undefined;
     let stdoutBytes = 0;
     let stderrBytes = 0;
     const chunks: Buffer[] = [];
-    const stop = () => {
+    const stop = (code: PdfFailureCode) => {
       if (closed) return;
-      failed = true;
+      // Preserve the first observed failure instead of replacing a timeout with
+      // a subsequent pipe error caused by terminating the same worker.
+      failureCode ??= code;
       child.stdin?.destroy();
       // SIGKILL maps to forceful process termination on Windows as well.
       child.kill("SIGKILL");
     };
-    const timer = setTimeout(stop, PDF_RENDERING_LIMITS.timeoutMs);
+    const timer = setTimeout(
+      () => stop("pdf_timeout"),
+      PDF_RENDERING_LIMITS.timeoutMs
+    );
     child.stdout?.on("data", (chunk: Buffer) => {
       stdoutBytes += chunk.length;
-      if (stdoutBytes > MAX_STDOUT_BYTES) stop();
-      else if (!failed) chunks.push(chunk);
+      if (stdoutBytes > MAX_STDOUT_BYTES) stop("pdf_output_limit");
+      else if (!failureCode) chunks.push(chunk);
     });
     child.stderr?.on("data", (chunk: Buffer) => {
       // Discard native/library output privately; never retain document errors.
       stderrBytes += chunk.length;
-      if (stderrBytes > PDF_RENDERING_LIMITS.maxStderrBytes) stop();
+      if (stderrBytes > PDF_RENDERING_LIMITS.maxStderrBytes)
+        stop("pdf_worker_failed");
     });
-    child.on("error", stop);
-    child.stdin?.on("error", stop);
+    child.on("error", () => stop("pdf_worker_failed"));
+    child.stdin?.on("error", () => stop("pdf_worker_failed"));
     child.once("close", (code) => {
       closed = true;
       clearTimeout(timer);
-      if (failed || code !== 0) {
-        reject(new PdfRenderingError());
+      if (failureCode) {
+        reject(renderingError(failureCode, undefined, elapsed()));
+        return;
+      }
+      if (stdoutBytes === 0 && code !== 0) {
+        reject(renderingError("pdf_worker_failed", undefined, elapsed()));
         return;
       }
       try {
-        resolve(
-          parseResult(JSON.parse(Buffer.concat(chunks).toString("utf8")))
+        const value: unknown = JSON.parse(
+          Buffer.concat(chunks).toString("utf8")
         );
-      } catch {
-        reject(new PdfRenderingError());
+        if (isRecord(value) && value.ok === false) {
+          if (stdoutBytes > 512) throw renderingError("pdf_protocol_error");
+          throw new PdfRenderingError(
+            createJobDiagnostic({
+              ...parseFailure(value),
+              elapsedMs: elapsed(),
+            })
+          );
+        }
+        if (code !== 0) throw renderingError("pdf_worker_failed");
+        resolve(parseResult(value));
+      } catch (error) {
+        const diagnostic =
+          error instanceof PdfRenderingError
+            ? error.diagnostic
+            : { stage: "pdf_render", code: "pdf_protocol_error" };
+        reject(
+          new PdfRenderingError(
+            createJobDiagnostic({ ...diagnostic, elapsedMs: elapsed() })
+          )
+        );
       }
     });
     // Await close even on failure: rejection never leaves a renderer running.

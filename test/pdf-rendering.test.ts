@@ -2,7 +2,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import * as childProcess from "node:child_process";
-import { PDFDocument, PDFName, StandardFonts, rgb } from "pdf-lib";
+import {
+  PDFDocument,
+  PDFName,
+  PDFOperator,
+  PDFOperatorNames,
+  StandardFonts,
+  rgb,
+} from "pdf-lib";
 import { createCanvas, loadImage } from "@napi-rs/canvas";
 import {
   PDF_RENDERING_LIMITS,
@@ -73,6 +80,17 @@ function fakeChild() {
   return child;
 }
 
+async function renderingFailure(
+  pending: Promise<unknown>
+): Promise<PdfRenderingError> {
+  const error: unknown = await pending.then(
+    () => null,
+    (error: unknown) => error
+  );
+  expect(error).toBeInstanceOf(PdfRenderingError);
+  return error as PdfRenderingError;
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   vi.useRealTimers();
@@ -121,9 +139,13 @@ describe("PDF visual rendering in the real child process", () => {
   }, 15_000);
 
   it("rejects the whole document above the page limit", async () => {
-    await expect(renderPdfPages(await makePdf(61))).rejects.toBeInstanceOf(
-      PdfRenderingError
-    );
+    const error = await renderingFailure(renderPdfPages(await makePdf(61)));
+    expect(error.diagnostic).toMatchObject({
+      version: 1,
+      stage: "pdf_render",
+      code: "pdf_page_limit",
+    });
+    expect(error.diagnostic).not.toHaveProperty("pageNumber");
   }, 15_000);
 
   it("rejects oversized embedded images instead of returning a page with the image omitted", async () => {
@@ -135,11 +157,11 @@ describe("PDF visual rendering in the real child process", () => {
     context.fillRect(0, 0, 3000, 3000);
     const image = await pdf.embedPng(await canvas.encode("png"));
     page.drawImage(image, { x: 0, y: 0, width: 200, height: 200 });
-    const error = await renderPdfPages(Buffer.from(await pdf.save())).then(
-      () => null,
-      (error: unknown) => error
+    const error = await renderingFailure(
+      renderPdfPages(Buffer.from(await pdf.save()))
     );
-    expect(error).toBeInstanceOf(PdfRenderingError);
+    expect(error.diagnostic.code).toBe("pdf_image_limit");
+    expect(error.diagnostic).not.toHaveProperty("pageNumber");
   }, 15_000);
 
   it("does not turn optional oversized text into truncated verification evidence", async () => {
@@ -166,7 +188,7 @@ describe("PDF visual rendering in the real child process", () => {
       // demonstrates preflight coverage rather than a downstream decode failure.
       await expect(
         renderPdfPages(Buffer.from(await pdf.save()))
-      ).rejects.toBeInstanceOf(PdfRenderingError);
+      ).rejects.toMatchObject({ diagnostic: { code: "pdf_image_limit" } });
     }
   );
 
@@ -187,7 +209,7 @@ describe("PDF visual rendering in the real child process", () => {
     );
     await expect(
       renderPdfPages(Buffer.from(await pdf.save()))
-    ).rejects.toBeInstanceOf(PdfRenderingError);
+    ).rejects.toMatchObject({ diagnostic: { code: "pdf_image_limit" } });
   });
 
   it("rejects aggregate declared image pixels before decoding unused streams", async () => {
@@ -196,7 +218,7 @@ describe("PDF visual rendering in the real child process", () => {
     for (let i = 0; i < 9; i++) declaredImage(pdf, 2000, 2000);
     await expect(
       renderPdfPages(Buffer.from(await pdf.save()))
-    ).rejects.toBeInstanceOf(PdfRenderingError);
+    ).rejects.toMatchObject({ diagnostic: { code: "pdf_image_limit" } });
   });
 
   it("rejects duplicate object definitions that hide the xref-selected image from preflight", async () => {
@@ -211,7 +233,7 @@ describe("PDF visual rendering in the real child process", () => {
     );
     await expect(
       renderPdfPages(Buffer.concat([original, duplicate]))
-    ).rejects.toBeInstanceOf(PdfRenderingError);
+    ).rejects.toMatchObject({ diagnostic: { code: "pdf_invalid" } });
   });
 
   it("renders a valid embedded image and its transparency mask", async () => {
@@ -237,15 +259,80 @@ describe("PDF visual rendering in the real child process", () => {
   });
 
   it("returns only a safe error for malformed source content", async () => {
-    await expect(
+    const error = await renderingFailure(
       renderPdfPages(Buffer.from("%PDF-secret-document-text-not-a-real-pdf"))
-    ).rejects.toThrow(
-      "This PDF could not be rendered within the supported limits."
     );
+    expect(error.diagnostic.code).toBe("pdf_invalid");
+    expect(error.diagnostic).not.toHaveProperty("pageNumber");
+    expect(error.message).not.toMatch(
+      /secret-document|not-a-real-pdf|Error:|node_modules/
+    );
+    expect(error.diagnostic.elapsedMs).toEqual(expect.any(Number));
   }, 15_000);
+
+  it("distinguishes encryption detected by the PDF parser", async () => {
+    const pdf = await PDFDocument.create();
+    pdf.addPage([100, 100]);
+    // The parser rejects the encryption dictionary before decoding page data.
+    pdf.context.trailerInfo.Encrypt = pdf.context.register(
+      pdf.context.obj({
+        Filter: PDFName.of("Standard"),
+        V: 1,
+        R: 2,
+        P: -4,
+      })
+    );
+    const error = await renderingFailure(
+      renderPdfPages(Buffer.from(await pdf.save()))
+    );
+    expect(error.diagnostic.code).toBe("pdf_password");
+    expect(error.diagnostic).not.toHaveProperty("pageNumber");
+  });
+
+  it("reports the declared-object complexity guard without guessing a page", async () => {
+    const pdf = await PDFDocument.create();
+    pdf.addPage([100, 100]);
+    pdf.context.register(pdf.context.obj(Array(100_001).fill(0)));
+    const error = await renderingFailure(
+      renderPdfPages(Buffer.from(await pdf.save()))
+    );
+    expect(error.diagnostic.code).toBe("pdf_complexity_limit");
+    expect(error.diagnostic).not.toHaveProperty("pageNumber");
+  }, 15_000);
+
+  it("reports the physical page when PDF.js warns that page content was omitted", async () => {
+    const pdf = await PDFDocument.create();
+    pdf.addPage([100, 100]);
+    const page = pdf.addPage([100, 100]);
+    page.pushOperators(
+      PDFOperator.of(PDFOperatorNames.DrawObject, [
+        PDFName.of("private-missing-image"),
+      ])
+    );
+    const error = await renderingFailure(
+      renderPdfPages(Buffer.from(await pdf.save()))
+    );
+    expect(error.diagnostic).toMatchObject({
+      code: "pdf_render_warning",
+      pageNumber: 2,
+    });
+    expect(error.message).toContain("PDF page 2");
+    expect(error.message).not.toContain("private-missing-image");
+    expect(JSON.stringify(error.diagnostic)).not.toContain("private");
+  });
 });
 
 describe("renderer process boundaries", () => {
+  it("keeps the no-argument error constructor compatible and supplies safe diagnostics", () => {
+    const error = new PdfRenderingError();
+    expect(error).toBeInstanceOf(Error);
+    expect(error.diagnostic).toEqual({
+      version: 1,
+      stage: "pdf_render",
+      code: "unknown_error",
+    });
+  });
+
   it.each([
     ["missing metadata", undefined],
     [
@@ -314,10 +401,10 @@ describe("renderer process boundaries", () => {
     const spawn = vi.mocked(childProcess.spawn);
     await expect(
       renderPdfPages(Buffer.from("not a PDF"))
-    ).rejects.toBeInstanceOf(PdfRenderingError);
+    ).rejects.toMatchObject({ diagnostic: { code: "pdf_invalid" } });
     await expect(
       renderPdfPages(Buffer.alloc(4 * 1024 * 1024 + 1))
-    ).rejects.toBeInstanceOf(PdfRenderingError);
+    ).rejects.toMatchObject({ diagnostic: { code: "pdf_invalid" } });
     expect(spawn).not.toHaveBeenCalled();
   });
 
@@ -335,9 +422,11 @@ describe("renderer process boundaries", () => {
     ).toBe(true);
     expect(options?.env?.NODE_ENV).toBe("production");
     expect(options?.windowsHide).toBe(true);
-    child.stdout.emit("data", Buffer.from('{"ok":false}'));
+    child.stdout.emit("data", Buffer.from('{"ok":false,"code":"pdf_invalid"}'));
     child.emit("close", 1);
-    await expect(pending).rejects.toBeInstanceOf(PdfRenderingError);
+    await expect(pending).rejects.toMatchObject({
+      diagnostic: { code: "pdf_invalid" },
+    });
   });
 
   it("force-kills on deadline and waits for close before rejecting", async () => {
@@ -351,8 +440,12 @@ describe("renderer process boundaries", () => {
     await vi.advanceTimersByTimeAsync(PDF_RENDERING_LIMITS.timeoutMs);
     expect(child.kill).toHaveBeenCalledWith("SIGKILL");
     expect(settled).toBe(false);
+    // Killing the worker can emit a later pipe error; it must not erase timeout.
+    child.stdin.emit("error", new Error("private pipe failure"));
     child.emit("close", null);
-    expect(await pending).toBeInstanceOf(PdfRenderingError);
+    expect(await pending).toMatchObject({
+      diagnostic: { code: "pdf_timeout", elapsedMs: 30_000 },
+    });
     expect(vi.getTimerCount()).toBe(0);
   });
 
@@ -365,7 +458,9 @@ describe("renderer process boundaries", () => {
     );
     expect(child.kill).toHaveBeenCalledWith("SIGKILL");
     child.emit("close", 1);
-    await expect(pending).rejects.toBeInstanceOf(PdfRenderingError);
+    await expect(pending).rejects.toMatchObject({
+      diagnostic: { code: "pdf_worker_failed" },
+    });
   });
 
   it("caps stdout even when a child emits unlimited data", async () => {
@@ -375,7 +470,9 @@ describe("renderer process boundaries", () => {
     for (let n = 0; n < 40; n++) child.stdout.emit("data", chunk);
     expect(child.kill).toHaveBeenCalledWith("SIGKILL");
     child.emit("close", 1);
-    await expect(pending).rejects.toBeInstanceOf(PdfRenderingError);
+    await expect(pending).rejects.toMatchObject({
+      diagnostic: { code: "pdf_output_limit" },
+    });
   });
 
   it("rejects malformed child output without retaining its text", async () => {
@@ -383,8 +480,95 @@ describe("renderer process boundaries", () => {
     const pending = renderPdfPages(Buffer.from("%PDF-test"));
     child.stdout.emit("data", Buffer.from("private source text; invalid JSON"));
     child.emit("close", 0);
-    await expect(pending).rejects.toThrow(
-      "This PDF could not be rendered within the supported limits."
+    const error = await renderingFailure(pending);
+    expect(error.diagnostic.code).toBe("pdf_protocol_error");
+    expect(error.message).not.toContain("private source text");
+  });
+
+  it.each([0, 1])(
+    "retains a valid bounded page failure with exit status %i",
+    async (exitCode) => {
+      const child = fakeChild();
+      const pending = renderPdfPages(Buffer.from("%PDF-test"));
+      child.stdout.emit(
+        "data",
+        Buffer.from('{"ok":false,"code":"pdf_page_failed","pageNumber":3}')
+      );
+      child.emit("close", exitCode);
+      const error = await renderingFailure(pending);
+      expect(error.diagnostic).toMatchObject({
+        code: "pdf_page_failed",
+        pageNumber: 3,
+      });
+      expect(error.message).toContain("PDF page 3");
+    }
+  );
+
+  it.each([
+    { ok: false },
+    { ok: false, code: "private-source-text" },
+    { ok: false, code: "pdf_page_failed", pageNumber: 0 },
+    { ok: false, code: "pdf_page_failed", pageNumber: 61 },
+    { ok: false, code: "pdf_page_failed", pageNumber: 1.5 },
+    { ok: false, code: "pdf_page_failed", pageNumber: "2" },
+    { ok: false, code: "pdf_page_failed", message: "private-source-text" },
+  ])(
+    "rejects an invalid failure protocol without retaining arbitrary data: %j",
+    async (value) => {
+      const child = fakeChild();
+      const pending = renderPdfPages(Buffer.from("%PDF-test"));
+      child.stdout.emit("data", Buffer.from(JSON.stringify(value)));
+      child.emit("close", 1);
+      const error = await renderingFailure(pending);
+      expect(error.diagnostic.code).toBe("pdf_protocol_error");
+      expect(error.diagnostic).not.toHaveProperty("pageNumber");
+      expect(JSON.stringify(error)).not.toContain("private-source-text");
+    }
+  );
+
+  it("requires a small failure payload even when it contains a valid code", async () => {
+    const child = fakeChild();
+    const pending = renderPdfPages(Buffer.from("%PDF-test"));
+    child.stdout.emit(
+      "data",
+      Buffer.from('{"ok":false,"code":"pdf_invalid"}' + " ".repeat(512))
     );
+    child.emit("close", 1);
+    await expect(pending).rejects.toMatchObject({
+      diagnostic: { code: "pdf_protocol_error" },
+    });
+  });
+
+  it("reports a worker failure for an empty nonzero exit", async () => {
+    const child = fakeChild();
+    const pending = renderPdfPages(Buffer.from("%PDF-test"));
+    child.emit("close", 1);
+    await expect(pending).rejects.toMatchObject({
+      diagnostic: { code: "pdf_worker_failed" },
+    });
+  });
+
+  it("does not accept a claimed success after a worker exits unsuccessfully", async () => {
+    const child = fakeChild();
+    const pending = renderPdfPages(Buffer.from("%PDF-test"));
+    child.stdout.emit(
+      "data",
+      Buffer.from('{"ok":true,"pageCount":1,"pages":[]}')
+    );
+    child.emit("close", 1);
+    await expect(pending).rejects.toMatchObject({
+      diagnostic: { code: "pdf_worker_failed" },
+    });
+  });
+
+  it("does not expose a process launch exception", async () => {
+    vi.mocked(childProcess.spawn).mockImplementationOnce(() => {
+      throw new Error("private source path and credentials");
+    });
+    const error = await renderingFailure(
+      renderPdfPages(Buffer.from("%PDF-test"))
+    );
+    expect(error.diagnostic.code).toBe("pdf_worker_failed");
+    expect(error.message).not.toMatch(/private|credentials/);
   });
 });

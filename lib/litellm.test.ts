@@ -106,11 +106,12 @@ describe("Independent conversion and audit models", () => {
   it("sends the selected stage model in each request", async () => {
     vi.stubEnv("LITELLM_CONVERSION_MODEL", "conversion-model");
     vi.stubEnv("LITELLM_AUDIT_MODEL", "audit-model");
-    const fetchMock = vi
-      .fn()
-      .mockImplementation(async () =>
-        jsonResponse({ choices: [{ message: { content: "ok" } }] })
-      );
+    const fetchMock = vi.fn().mockImplementation(async () =>
+      jsonResponse({
+        choices: [{ message: { content: "ok" } }],
+        model: "test-model",
+      })
+    );
     vi.stubGlobal("fetch", fetchMock);
 
     await callLiteLLM("Convert", "PDF", getLiteLLMConfig("convert"));
@@ -576,7 +577,7 @@ describe("Error handling", () => {
     );
 
     await expect(callLiteLLM("system", "user", CONFIG)).rejects.toThrow(
-      "LiteLLM error 500: The model provider is temporarily unavailable. Please try again later."
+      "LiteLLM error 500: HTML conversion stopped. The AI service is temporarily unavailable. Try again later."
     );
   });
 
@@ -609,7 +610,7 @@ describe("Error handling", () => {
     expect(message).not.toContain("upstream-secret");
     expect(message).not.toContain("data:application/pdf");
     expect(message).not.toContain(encodedPdf);
-    expect(message).not.toContain("request");
+    expect(message).not.toContain('"request":');
     expect(message).not.toContain("private-filename.pdf");
     expect(message).not.toContain("confidential document passage");
   });
