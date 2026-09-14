@@ -1,4 +1,9 @@
 import "server-only";
+import {
+  createJobDiagnostic,
+  type DiagnosticCode,
+  type JobDiagnostic,
+} from "./job-diagnostics";
 
 import {
   DOCX_MIME_TYPE,
@@ -10,19 +15,28 @@ const RENDER_TIMEOUT_MS = 60_000;
 
 /** Only controlled diagnostics from this module may reach an API response. */
 export class WordToPdfError extends Error {
+  readonly diagnostic: JobDiagnostic;
   constructor(
     message: string,
-    public readonly status: number
+    public readonly status: number,
+    code: DiagnosticCode = "word_rejected",
+    httpStatus?: number
   ) {
     super(message);
     this.name = "WordToPdfError";
+    this.diagnostic = createJobDiagnostic({
+      stage: "word_to_pdf",
+      code,
+      httpStatus,
+    });
   }
 }
 
 function configurationError(): WordToPdfError {
   return new WordToPdfError(
     "Word conversion is not configured. Ask the administrator to check the Word conversion service, or export your document as a PDF and upload it.",
-    503
+    503,
+    "word_configuration"
   );
 }
 
@@ -88,38 +102,56 @@ function responseError(status: number): WordToPdfError {
   if (status >= 300 && status < 400) {
     return new WordToPdfError(
       "The Word conversion service redirected the request. Ask the administrator to check its address, or upload a PDF instead.",
-      502
+      502,
+      "word_configuration",
+      status
     );
   }
-  if (status === 401 || status === 403) return configurationError();
+  if (status === 401 || status === 403) {
+    return new WordToPdfError(
+      configurationError().message,
+      503,
+      "word_configuration",
+      status
+    );
+  }
   if (status === 400 || status === 422) {
     return new WordToPdfError(
       "The Word document could not be rendered. Check that it opens in Word and is not password protected, or export it as a PDF and upload it.",
-      422
+      422,
+      "word_rejected",
+      status
     );
   }
   if (status === 413) {
     return new WordToPdfError(
       "The Word conversion service rejected the file size. Reduce the document size, or export it as a PDF under 4 MB and upload it.",
-      413
+      413,
+      "word_size_limit",
+      status
     );
   }
   if (status === 429 || status === 503) {
     return new WordToPdfError(
       "The Word conversion service is busy. Try again shortly, or export your document as a PDF and upload it.",
-      503
+      503,
+      "word_busy",
+      status
     );
   }
   return new WordToPdfError(
     "The Word conversion service could not complete the request. Try again, or export your document as a PDF and upload it.",
-    502
+    502,
+    "word_busy",
+    status
   );
 }
 
 function renderedSizeError(): WordToPdfError {
   return new WordToPdfError(
     "The rendered PDF exceeds 4 MB. Reduce images or split the Word document, then try again.",
-    413
+    413,
+    "word_size_limit"
   );
 }
 
@@ -139,7 +171,8 @@ async function readPdf(
   if (!response.body) {
     throw new WordToPdfError(
       "The Word conversion service returned no PDF. Try again, or export the document as a PDF and upload it.",
-      502
+      502,
+      "word_invalid_output"
     );
   }
 
@@ -172,7 +205,8 @@ async function readPdf(
   if (!isPdfBuffer(pdf)) {
     throw new WordToPdfError(
       "The Word conversion service returned an invalid PDF. Try again, or export the document as a PDF and upload it.",
-      502
+      502,
+      "word_invalid_output"
     );
   }
   return pdf;
@@ -192,7 +226,8 @@ export async function renderWordToPdf(
   if (buffer.byteLength > MAX_FILE_SIZE_BYTES) {
     throw new WordToPdfError(
       "File too large. Maximum upload size is 4 MB.",
-      413
+      413,
+      "word_size_limit"
     );
   }
   const { endpoint, authorization } = rendererConfiguration();
@@ -214,7 +249,8 @@ export async function renderWordToPdf(
       reject(
         new WordToPdfError(
           "Word conversion took too long. Try a smaller document, or export it as a PDF and upload it.",
-          504
+          504,
+          "word_timeout"
         )
       );
       controller.abort();
@@ -244,7 +280,8 @@ export async function renderWordToPdf(
     if (error instanceof WordToPdfError) throw error;
     throw new WordToPdfError(
       "Could not reach the Word conversion service. Try again, or export your document as a PDF and upload it.",
-      502
+      502,
+      "word_connection"
     );
   } finally {
     if (timer) clearTimeout(timer);

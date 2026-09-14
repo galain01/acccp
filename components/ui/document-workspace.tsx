@@ -139,7 +139,12 @@ export default function DocumentWorkspace({
               ? { documentId: data.documentId }
               : {}),
             html: undefined,
-            errorMessage: data.error ?? "Conversion failed.",
+            errorMessage:
+              typeof data.detail === "string" && data.detail.trim()
+                ? data.detail
+                : typeof data.error === "string"
+                  ? data.error
+                  : "Conversion failed.",
           });
           return;
         }

@@ -20,6 +20,9 @@ vi.mock("@/lib/actions/admin-metrics", () => ({
 vi.mock("@/lib/actions/metrics-history", () => ({
   getMetricsHistory: vi.fn(),
 }));
+vi.mock("@/lib/actions/failure-metrics", () => ({
+  getFailureSummary: vi.fn(),
+}));
 
 import AdminMetrics from "@/components/ui/admin-metrics";
 import {
@@ -28,6 +31,7 @@ import {
   listRecentJobs,
 } from "@/lib/actions/admin-metrics";
 import { getMetricsHistory } from "@/lib/actions/metrics-history";
+import { getFailureSummary } from "@/lib/actions/failure-metrics";
 import type {
   DashboardHistory,
   DashboardHistoryDay,
@@ -186,6 +190,7 @@ function jobsFixture(): Awaited<ReturnType<typeof listRecentJobs>> {
     estimatedCallCount: index === 1 ? 1 : 0,
     unpricedCallCount: index === 0 ? 1 : 0,
     createdAt: "2026-09-09T17:42:00.000Z",
+    failure: null,
   }));
   return {
     rows: rows.slice(0, 10),
@@ -237,6 +242,7 @@ beforeEach(() => {
   });
   vi.mocked(listRecentJobs).mockResolvedValue(jobsFixture());
   vi.mocked(getMetricsHistory).mockResolvedValue(historyFixture());
+  vi.mocked(getFailureSummary).mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -256,6 +262,67 @@ async function renderDashboard(range = SELECTED_RANGE) {
 }
 
 describe("real admin metrics server rendering", () => {
+  it("shows accessible error details only for failed jobs and a safe legacy fallback", async () => {
+    const markup = await renderDashboard();
+    const failed = rowContaining(markup, "synthetic-unknown-metrics.pdf");
+    expect(failed).toContain("<details");
+    expect(failed).toContain("<summary");
+    expect(textContent(failed)).toContain(
+      "Error details for synthetic-unknown-metrics.pdf"
+    );
+    expect(textContent(failed)).toContain(
+      "Detailed reason was not recorded for this failure."
+    );
+    expect(rowContaining(markup, LONG_FILENAME)).not.toContain("Error details");
+  });
+
+  it("renders validated current failure details beside its failed status", async () => {
+    const jobs = jobsFixture();
+    jobs.rows[0].failure = {
+      diagnostic: {
+        version: 1,
+        stage: "audit",
+        code: "provider_rate_limit",
+        httpStatus: 429,
+        model: SOL,
+        attemptNumber: 1,
+        retryAfterSeconds: 30,
+      },
+      occurredAt: "2026-09-09T17:43:00.000Z",
+    };
+    vi.mocked(listRecentJobs).mockResolvedValue(jobs);
+    const row = rowContaining(
+      await renderDashboard(),
+      "synthetic-unknown-metrics.pdf"
+    );
+    expect(textContent(row)).toContain("Accessibility check stopped.");
+    expect(textContent(row)).toContain("HTTP status 429");
+    expect(textContent(row)).toContain("Provider wait hint 30 seconds");
+  });
+
+  it("shows anonymous failure-attempt counts for the selected dates with coverage limits", async () => {
+    vi.mocked(getFailureSummary).mockResolvedValue([
+      { stage: "audit", code: "provider_rate_limit", count: 1234 },
+      { stage: "pdf_render", code: "pdf_page_failed", count: 2 },
+    ]);
+    const markup = await renderDashboard();
+    expect(textContent(rowContaining(markup, "too many requests"))).toContain(
+      "1,234"
+    );
+    expect(
+      textContent(rowContaining(markup, "could not prepare this PDF page"))
+    ).toContain("2");
+    expect(textContent(markup)).toContain(
+      "Earlier failures are not backfilled."
+    );
+    expect(textContent(markup)).toContain(
+      "These anonymous counts remain after files expire"
+    );
+    expect(getFailureSummary).toHaveBeenCalledWith({
+      from: "2026-08-12",
+      to: "2026-09-10",
+    });
+  });
   it("renders the 12-job fixture with measured averages and qualified cost totals", async () => {
     const markup = await renderDashboard();
     previewMarkup = markup;

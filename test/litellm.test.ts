@@ -6,10 +6,302 @@ import {
   computeCallCostUsd,
   fetchModelPricing,
   getPublishedModelPricing,
+  getLiteLLMConfig,
+  LiteLLMError,
   PUBLISHED_PRICING_MODELS,
 } from "@/lib/litellm";
 
 const CONFIG = { baseUrl: "https://litellm.test", apiKey: "test-key" };
+
+async function failedCall(response: Response): Promise<LiteLLMError> {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response));
+  const failure = await callLiteLLM("private instructions", "private source", {
+    ...CONFIG,
+    model: "test-model",
+  }).catch((error) => error);
+  expect(failure).toBeInstanceOf(LiteLLMError);
+  return failure as LiteLLMError;
+}
+
+describe("safe provider failure diagnostics", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+    vi.useRealTimers();
+  });
+
+  it.each([
+    ["budget_exceeded", "provider_budget"],
+    ["insufficient_quota", "provider_quota"],
+    ["rate_limit_exceeded", "provider_rate_limit"],
+    ["invalid_api_key", "provider_auth"],
+    ["model_not_found", "provider_model_not_found"],
+    ["key_model_access_denied", "provider_auth"],
+  ])(
+    "classifies explicit %s without preserving surrounding private content",
+    async (code, expected) => {
+      const failure = await failedCall(
+        jsonResponse(
+          {
+            error: {
+              code,
+              type: "invalid_request_error",
+              message: "private-source.pdf private source sk-secret",
+              model: "private document text",
+              request: { api_key: "sk-secret", body: "private source" },
+            },
+          },
+          429
+        )
+      );
+      expect(failure.diagnostic).toMatchObject({
+        version: 1,
+        stage: "conversion",
+        code: expected,
+        model: "test-model",
+        httpStatus: 429,
+        elapsedMs: expect.any(Number),
+      });
+      for (const privateText of [
+        "private-source.pdf",
+        "private source",
+        "sk-secret",
+        "private document text",
+      ])
+        expect(JSON.stringify(failure) + failure.message).not.toContain(
+          privateText
+        );
+    }
+  );
+
+  it("understands an exact gateway type when code is an HTTP number", async () => {
+    const failure = await failedCall(
+      jsonResponse({ error: { type: "budget_exceeded", code: "429" } }, 429)
+    );
+    expect(failure.diagnostic?.code).toBe("provider_budget");
+  });
+
+  it.each([
+    {
+      message: "budget_exceeded: spending limit reached",
+      type: "throttling_error",
+      code: "429",
+    },
+    { code: "BudgetExceededError" },
+    { code: "insufficient_quota private source" },
+    { code: "constructor" },
+    { type: "__proto__" },
+    { code: "x".repeat(100_000) },
+    { code: "insufficient_quota", type: "rate_limit_exceeded" },
+  ])(
+    "keeps ambiguous or unrecognized 429 responses ambiguous (case %#)",
+    async (error) => {
+      const failure = await failedCall(jsonResponse({ error }, 429));
+      expect(failure.diagnostic?.code).toBe("provider_rate_or_quota");
+      expect(failure.message).not.toContain("spending limit was reached");
+    }
+  );
+
+  it.each([
+    [400, "provider_request_rejected"],
+    [401, "provider_auth"],
+    [403, "provider_auth"],
+    [404, "provider_model_not_found"],
+    [413, "provider_payload_limit"],
+    [422, "provider_request_rejected"],
+    [429, "provider_rate_or_quota"],
+    [503, "provider_unavailable"],
+  ])(
+    "uses a safe HTTP %s fallback for non-JSON responses",
+    async (status, code) => {
+      const failure = await failedCall(
+        new Response("<html>private text sk-secret</html>", {
+          status: status as number,
+        })
+      );
+      expect(failure.diagnostic?.code).toBe(code);
+      expect(failure.message).not.toContain("private text");
+      expect(failure.message).not.toContain("sk-secret");
+      if (status === 400)
+        expect(failure.message).not.toMatch(
+          /PDF is readable|supports this input/
+        );
+    }
+  );
+
+  it("keeps only numeric Retry-After and a UUID LiteLLM call ID", async () => {
+    const failure = await failedCall(
+      new Response("{}", {
+        status: 429,
+        headers: {
+          "retry-after": "12",
+          "x-litellm-call-id": "019b2c4d-e5f6-7890-abcd-ef1234567890",
+          "x-request-id": "private-other-id",
+          "x-litellm-model-api-base": "https://provider.test/secret",
+        },
+      })
+    );
+    expect(failure.diagnostic).toMatchObject({
+      retryAfterSeconds: 12,
+      providerRequestId: "019b2c4d-e5f6-7890-abcd-ef1234567890",
+    });
+    expect(JSON.stringify(failure)).not.toContain("private-other-id");
+    expect(JSON.stringify(failure)).not.toContain("provider.test");
+  });
+
+  it.each([
+    "99999999999",
+    "86401",
+    "-1",
+    "1.5",
+    "Wed, 21 Oct 2026 07:28:00 GMT",
+    "12 sk-secret",
+  ])(
+    "discards invalid Retry-After %j and private request IDs",
+    async (retryAfter) => {
+      const failure = await failedCall(
+        new Response("{}", {
+          status: 429,
+          headers: {
+            "retry-after": retryAfter,
+            "x-litellm-call-id": "sk-private-source",
+          },
+        })
+      );
+      expect(failure.diagnostic).not.toHaveProperty("retryAfterSeconds");
+      expect(failure.diagnostic).not.toHaveProperty("providerRequestId");
+      expect(JSON.stringify(failure)).not.toContain("sk-private-source");
+    }
+  );
+
+  it("discards oversized bodies even if the beginning contains a recognized code", async () => {
+    const failure = await failedCall(
+      jsonResponse(
+        {
+          error: {
+            code: "budget_exceeded",
+            message: "private source ".repeat(2000),
+          },
+        },
+        429
+      )
+    );
+    expect(failure.diagnostic?.code).toBe("provider_rate_or_quota");
+    expect(JSON.stringify(failure)).not.toContain("private source");
+  });
+
+  it("bounds streamed body bytes and cancels the stream", async () => {
+    const cancel = vi.fn();
+    let index = 0;
+    const body = new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          index += 1;
+          controller.enqueue(
+            new TextEncoder().encode(
+              index === 1
+                ? '{"error":{"code":"budget_exceeded","message":"'
+                : "x".repeat(9000)
+            )
+          );
+        },
+        cancel,
+      },
+      { highWaterMark: 0 }
+    );
+    const failure = await failedCall(new Response(body, { status: 429 }));
+    expect(failure.diagnostic?.code).toBe("provider_rate_or_quota");
+    expect(index).toBe(3);
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("does not wait indefinitely for a stalled error body", async () => {
+    vi.useFakeTimers();
+    const cancel = vi.fn();
+    const pending = failedCall(
+      new Response(new ReadableStream({ start() {}, cancel }), { status: 429 })
+    );
+    await vi.advanceTimersByTimeAsync(1500);
+    const failure = await pending;
+    expect(failure.diagnostic?.code).toBe("provider_rate_or_quota");
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("rejects an advertised oversized body before reading it", async () => {
+    const pull = vi.fn();
+    const cancel = vi.fn();
+    const failure = await failedCall(
+      new Response(new ReadableStream({ pull, cancel }, { highWaterMark: 0 }), {
+        status: 429,
+        headers: { "content-length": "999999" },
+      })
+    );
+    expect(failure.diagnostic?.code).toBe("provider_rate_or_quota");
+    expect(pull).not.toHaveBeenCalled();
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("falls back safely when the error body stream fails or is already locked", async () => {
+    const broken = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.error(new Error("private source sk-secret"));
+      },
+    });
+    const failure = await failedCall(new Response(broken, { status: 503 }));
+    expect(failure.diagnostic?.code).toBe("provider_unavailable");
+    expect(JSON.stringify(failure) + failure.message).not.toContain(
+      "sk-secret"
+    );
+    const response = new Response("private source", { status: 503 });
+    const lockedReader = response.body!.getReader();
+    const lockedFailure = await failedCall(response);
+    expect(lockedFailure.diagnostic?.code).toBe("provider_unavailable");
+    await lockedReader.cancel();
+  });
+
+  it("classifies configuration and network failures without source exceptions", async () => {
+    vi.stubEnv("LITELLM_BASE_URL", "");
+    expect(() => getLiteLLMConfig()).toThrow(LiteLLMError);
+    try {
+      getLiteLLMConfig();
+    } catch (error) {
+      expect((error as LiteLLMError).diagnostic?.code).toBe(
+        "provider_configuration"
+      );
+    }
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockRejectedValue(new Error("private source sk-secret"))
+    );
+    const failure = await callLiteLLM("system", "source", {
+      ...CONFIG,
+      model: "test-model",
+    }).catch((error) => error);
+    expect(failure.diagnostic.code).toBe("provider_connection");
+    expect(failure.diagnostic).not.toHaveProperty("httpStatus");
+    expect(JSON.stringify(failure) + failure.message).not.toContain(
+      "sk-secret"
+    );
+  });
+
+  it("distinguishes unreadable JSON from unexpected successful response structure", async () => {
+    const unreadable = await failedCall(
+      new Response("private source sk-secret", { status: 200 })
+    );
+    expect(unreadable.diagnostic?.code).toBe("provider_invalid_json");
+    const unexpected = await failedCall(
+      jsonResponse({ error: { message: "private source sk-secret" } })
+    );
+    expect(unexpected.diagnostic?.code).toBe("provider_invalid_response");
+    expect(JSON.stringify([unreadable, unexpected])).not.toContain("sk-secret");
+  });
+
+  it("preserves the existing message-only constructor", () => {
+    const failure = new LiteLLMError("Safe older summary");
+    expect(failure.message).toBe("Safe older summary");
+    expect(failure.diagnostic).toBeUndefined();
+  });
+});
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {

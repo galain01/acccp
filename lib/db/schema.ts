@@ -19,6 +19,7 @@ import {
   primaryKey,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
+import { DIAGNOSTIC_CODES, DIAGNOSTIC_STAGES } from "../job-diagnostics";
 
 export const artifactStatus = pgEnum("artifact_status", [
   "available",
@@ -619,6 +620,33 @@ export const modelCalls = pgTable(
 
 // Daily totals survive document deletion without a link back to any person,
 // document, job, source content, or exact event timestamp.
+// Failure attempts are counted at recording time, not again during purge.
+export const dailyFailureMetrics = pgTable(
+  "daily_failure_metrics",
+  {
+    day: date().notNull(),
+    stage: text().notNull(),
+    code: text().notNull(),
+    failureCount: bigint("failure_count", { mode: "number" }).notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.day, table.stage, table.code] }),
+    check("daily_failure_metrics_count_positive_chk", sql`failure_count > 0`),
+    check(
+      "daily_failure_metrics_stage_chk",
+      sql.raw(
+        `stage in (${DIAGNOSTIC_STAGES.map((value) => `'${value}'`).join(", ")})`
+      )
+    ),
+    check(
+      "daily_failure_metrics_code_chk",
+      sql.raw(
+        `code in (${DIAGNOSTIC_CODES.map((value) => `'${value}'`).join(", ")})`
+      )
+    ),
+  ]
+).enableRLS();
+
 export const retainedJobMetrics = pgTable(
   "retained_job_metrics",
   {

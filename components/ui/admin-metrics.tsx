@@ -1,6 +1,11 @@
 import Link from "next/link";
 import { getUserRoleCounts, listRecentJobs } from "@/lib/actions/admin-metrics";
 import { getMetricsHistory } from "@/lib/actions/metrics-history";
+import { getFailureSummary } from "@/lib/actions/failure-metrics";
+import {
+  createJobDiagnostic,
+  describeJobDiagnostic,
+} from "@/lib/job-diagnostics";
 import {
   costQualifier,
   formatDuration,
@@ -9,6 +14,7 @@ import {
   type MetricsRange,
 } from "@/lib/metrics-display";
 import AdminTablePagination from "./admin-table-pagination";
+import JobFailureDetails from "./job-failure-details";
 import MetricsTrend from "./metrics-trend";
 import { Badge } from "./badge";
 import { Button } from "./button";
@@ -70,10 +76,11 @@ export default async function AdminMetrics({
   jobsPage: number;
   range: MetricsRange;
 }) {
-  const [roleCounts, recentJobs, history] = await Promise.all([
+  const [roleCounts, recentJobs, history, failures] = await Promise.all([
     getUserRoleCounts(),
     listRecentJobs(jobsPage),
     getMetricsHistory({ from: range.from, to: range.to }),
+    getFailureSummary({ from: range.from, to: range.to }),
   ]);
   const summary = history.summary;
   const filters: Record<string, string> = {
@@ -316,6 +323,48 @@ export default async function AdminMetrics({
           </TableBody>
         </Table>
       </section>
+      <section className="min-w-0" aria-labelledby="metrics-failures">
+        <h3 id="metrics-failures" className="mb-3 font-semibold">
+          Failure reasons
+        </h3>
+        <Table>
+          <TableCaption>
+            Failed attempts recorded since this update, including retries and
+            Word files rejected before a job is saved, in the selected date
+            range. Earlier failures are not backfilled. These anonymous counts
+            remain after files expire and are separate from the latest job
+            status.
+          </TableCaption>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Failure reason</TableHead>
+              <TableHead>Failed attempts</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {failures.map((failure) => (
+              <TableRow key={`${failure.stage}:${failure.code}`}>
+                <TableCell className="max-w-3xl whitespace-normal">
+                  {describeJobDiagnostic(
+                    createJobDiagnostic({
+                      stage: failure.stage,
+                      code: failure.code,
+                    })
+                  )}
+                </TableCell>
+                <TableCell>{formatNumber(failure.count)}</TableCell>
+              </TableRow>
+            ))}
+            {!failures.length && (
+              <TableRow>
+                <TableCell colSpan={2}>
+                  No failure reasons recorded in this period.
+                </TableCell>
+              </TableRow>
+            )}
+          </TableBody>
+        </Table>
+      </section>
       <section
         className="flex min-w-0 flex-col gap-4"
         aria-labelledby="metrics-recent"
@@ -375,6 +424,12 @@ export default async function AdminMetrics({
                   >
                     {row.status}
                   </Badge>
+                  {row.status === "failed" && (
+                    <JobFailureDetails
+                      failure={row.failure}
+                      filename={row.filename}
+                    />
+                  )}
                 </TableCell>
                 <TableCell className="max-w-40 break-words whitespace-normal">
                   {row.model ?? "Unknown"}
