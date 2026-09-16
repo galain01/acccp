@@ -39,7 +39,7 @@ export interface RenderedPdf {
 
 // Keep these protocol bounds synchronized with the fixed child renderer.
 export const PDF_RENDERING_LIMITS = Object.freeze({
-  timeoutMs: 30_000,
+  timeoutMs: 90_000,
   maxPages: 60,
   maxPagePixels: 2_000_000,
   maxPageDimension: 4096,

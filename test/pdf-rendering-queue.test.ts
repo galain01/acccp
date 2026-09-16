@@ -119,11 +119,9 @@ describe("bounded PDF renderer queue", () => {
     }
   });
 
-  it("expires waiting work without spawning it and recovers the queue capacity", async () => {
+  it("expires waiting work at 30 seconds while the active renderer continues and recovers queue capacity", async () => {
     vi.useFakeTimers();
-    const first = renderPdfPages(request("first")).catch(
-      (error: unknown) => error
-    );
+    const first = renderPdfPages(request("first"));
     const expired = renderPdfPages(request("expired")).catch(
       (error: unknown) => error
     );
@@ -133,11 +131,10 @@ describe("bounded PDF renderer queue", () => {
     });
     expect(children).toHaveLength(1);
     const replacement = renderPdfPages(request("replacement"));
-    // A kill request alone does not free the slot.
-    expect(children[0].kill).toHaveBeenCalledWith("SIGKILL");
+    expect(children[0].kill).not.toHaveBeenCalled();
     expect(children).toHaveLength(1);
-    children[0].emit("close", null);
-    expect(await first).toMatchObject({ diagnostic: { code: "pdf_timeout" } });
+    closeSuccessfully(children[0]);
+    await expect(first).resolves.toMatchObject({ pageCount: 1 });
     expect(children).toHaveLength(2);
     expect(inputOf(children[1])).toBe("%PDF-replacement");
     closeSuccessfully(children[1]);
@@ -145,28 +142,31 @@ describe("bounded PDF renderer queue", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("gives an admitted child its own full deadline and waits for its actual close", async () => {
+  it("gives an admitted child its own full 90 seconds and holds the slot until actual close", async () => {
     vi.useFakeTimers();
     const first = renderPdfPages(request("first")).catch(
       (error: unknown) => error
     );
-    await vi.advanceTimersByTimeAsync(10_000);
+    await vi.advanceTimersByTimeAsync(70_000);
+    expect(children[0].kill).not.toHaveBeenCalled();
     const second = renderPdfPages(request("second")).catch(
       (error: unknown) => error
     );
-    await vi.advanceTimersByTimeAsync(25_000);
+    await vi.advanceTimersByTimeAsync(20_000);
     expect(children[0].kill).toHaveBeenCalledWith("SIGKILL");
     expect(children).toHaveLength(1);
     children[0].emit("close", null);
     await first;
     expect(children).toHaveLength(2);
-    await vi.advanceTimersByTimeAsync(PDF_RENDERING_LIMITS.timeoutMs - 1);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(children[1].kill).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(PDF_RENDERING_LIMITS.timeoutMs - 30_000 - 1);
     expect(children[1].kill).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
     expect(children[1].kill).toHaveBeenCalledWith("SIGKILL");
     children[1].emit("close", null);
     expect(await second).toMatchObject({
-      diagnostic: { code: "pdf_timeout", elapsedMs: 55_000 },
+      diagnostic: { code: "pdf_timeout", elapsedMs: 110_000 },
     });
     expect(vi.getTimerCount()).toBe(0);
   });

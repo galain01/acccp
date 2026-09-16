@@ -161,7 +161,7 @@ try {
       failed = true;
       child.kill("SIGKILL");
     };
-    const timer = setTimeout(stop, 30_000);
+    const timer = setTimeout(stop, 90_000);
     child.stdout.on("data", (chunk) => {
       output += chunk;
       if (output.length > 8 * 1024 * 1024) stop();

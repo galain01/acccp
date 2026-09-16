@@ -37,7 +37,7 @@ not an operating-system sandbox or a hard native-memory limit.
 
 ## Bounds and deployment
 
-Uploads remain limited to 4 MiB. The renderer permits up to 60 pages, 30 seconds,
+Uploads remain limited to 4 MiB. The renderer permits up to 60 pages, 90 seconds,
 2 million pixels per page (120 million total), 4096 pixels per page dimension,
 8 MiB PNG per page and 24 MiB total PNG data. Before image decoding, a preflight
 inspects up to 100,000 PDF objects, including unreferenced image streams and nested
@@ -61,12 +61,15 @@ evidence. Rendering warnings fail the operation to avoid silently omitted images
 
 Each Node process runs at most one renderer child at a time, with a FIFO queue
 of at most four waiting requests. A request waits at most 30 seconds for a slot,
-then has the existing 30-second child deadline. Full or expired queues return a
+then has a separate 90-second child deadline. Full or expired queues return a
 plain-language busy message. The slot is held until the child closes, including
 after timeout or protocol failure. This bounds simultaneous renderer children in
 one process; separate server instances and model requests remain independent.
 The 192 MiB V8 heap setting is not a native-memory ceiling. Original PDFs and
-the normal output rendering resolution are unchanged.
+the normal output rendering resolution are unchanged. A rendering timeout discards
+partial page output and stops conversion before model calls. The user receives a
+safe timeout message and can retry a smaller PDF or divide it into shorter files.
+The 90 seconds covers page preparation only; model conversion and audit follow.
 
 Node 24 is required. `next.config.ts` explicitly traces the child script, PDF.js
 worker, CMaps, fonts, WASM assets, and the platform's native canvas library into

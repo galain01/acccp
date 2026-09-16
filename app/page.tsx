@@ -20,6 +20,7 @@ import {
   InputOTPSlot,
 } from "@/components/ui/input-otp";
 import { Button } from "@/components/ui/button";
+import DocumentProcessingNotice from "@/components/ui/document-processing-notice";
 import { authClient } from "@/lib/auth-client";
 
 const RESEND_COOLDOWN_SECONDS = 30;
@@ -228,6 +229,7 @@ export default function HomePage(): React.JSX.Element {
           </CardFooter>
         </Card>
       )}
+      <DocumentProcessingNotice className="w-full max-w-lg" />
     </main>
   );
 }

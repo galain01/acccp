@@ -3,6 +3,7 @@
 import { useRef, useState, type DragEvent } from "react";
 import { Upload } from "lucide-react";
 import { cn } from "@/lib/utils";
+import DocumentProcessingNotice from "./document-processing-notice";
 import {
   isSupportedDocumentFilename,
   MAX_FILE_SIZE_BYTES,
@@ -104,6 +105,7 @@ export default function FileUpload({
           }}
         />
       </div>
+      <DocumentProcessingNotice compact />
       {rejectHint && (
         <p role="status" className="text-sm text-destructive">
           {rejectHint}

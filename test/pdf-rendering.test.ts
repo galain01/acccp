@@ -676,7 +676,7 @@ describe("renderer process boundaries", () => {
     });
   });
 
-  it("force-kills on deadline and waits for close before rejecting", async () => {
+  it("permits rendering beyond 30 seconds, force-kills at 90 seconds and waits for close", async () => {
     vi.useFakeTimers();
     const child = fakeChild();
     let settled = false;
@@ -684,14 +684,19 @@ describe("renderer process boundaries", () => {
       settled = true;
       return error;
     });
-    await vi.advanceTimersByTimeAsync(PDF_RENDERING_LIMITS.timeoutMs);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(child.kill).not.toHaveBeenCalled();
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(child.kill).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
     expect(child.kill).toHaveBeenCalledWith("SIGKILL");
     expect(settled).toBe(false);
     // Killing the worker can emit a later pipe error; it must not erase timeout.
     child.stdin.emit("error", new Error("private pipe failure"));
     child.emit("close", null);
     expect(await pending).toMatchObject({
-      diagnostic: { code: "pdf_timeout", elapsedMs: 30_000 },
+      diagnostic: { code: "pdf_timeout", elapsedMs: 90_000 },
     });
     expect(vi.getTimerCount()).toBe(0);
   });
