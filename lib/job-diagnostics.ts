@@ -36,6 +36,7 @@ export const DIAGNOSTIC_CODES = [
   "pdf_page_failed",
   "pdf_output_limit",
   "pdf_timeout",
+  "pdf_renderer_busy",
   "pdf_worker_failed",
   "pdf_protocol_error",
   "word_configuration",
@@ -206,7 +207,7 @@ const EXPLANATIONS: Record<DiagnosticCode, string> = {
   pdf_page_limit:
     "The PDF has more pages than the app can process in one job. Split it into shorter documents and try again.",
   pdf_image_limit:
-    "An image in the PDF exceeds the app's processing limits. Reduce large images or export a smaller PDF and try again.",
+    "An image, or a group of images, in the PDF exceeds the app's processing limits. Try splitting the document into shorter files or exporting with lower-resolution images.",
   pdf_complexity_limit:
     "The PDF exceeds the app's processing limits. Export a fresh or simpler PDF, or split it into shorter documents.",
   pdf_render_warning:
@@ -217,6 +218,8 @@ const EXPLANATIONS: Record<DiagnosticCode, string> = {
     "The prepared page images exceed the app's size limits. Try a shorter document or reduce large images.",
   pdf_timeout:
     "Preparing the PDF pages took longer than the app allows. Try a shorter or simpler document.",
+  pdf_renderer_busy:
+    "Several documents are being prepared right now. Please try this document again shortly.",
   pdf_worker_failed:
     "The PDF preparation service stopped unexpectedly. Try again; if it continues, contact the app administrator.",
   pdf_protocol_error:

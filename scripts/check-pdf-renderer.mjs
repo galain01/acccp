@@ -88,6 +88,42 @@ try {
   );
   pdf.catalog.set(PDFName.of("StructTreeRoot"), structureRef);
   pdf.catalog.set(PDFName.of("MarkInfo"), pdf.context.obj({ Marked: true }));
+  // A small compressed file may contain a high-resolution source scan. Exercise
+  // the new source-image allowance using actual decoded pixels, not a declaration
+  // that PDF.js never draws. Every page has a distinct 20.16 MP bilevel image.
+  for (let index = 0; index < 18; index++) {
+    const width = 3600,
+      height = 5600;
+    const pixels = new Uint8Array((width / 8) * height).fill(255);
+    for (let row = 1400; row < 4200; row++) {
+      pixels.fill(0, row * (width / 8) + 112, row * (width / 8) + 338);
+    }
+    const ref = pdf.context.register(
+      pdf.context.flateStream(pixels, {
+        Type: PDFName.of("XObject"),
+        Subtype: PDFName.of("Image"),
+        Width: width,
+        Height: height,
+        BitsPerComponent: 1,
+        ColorSpace: PDFName.of("DeviceGray"),
+      })
+    );
+    const page = pdf.addPage([432, 672]);
+    page.node.set(
+      PDFName.of("Resources"),
+      pdf.context.obj({ XObject: { Scan: ref } })
+    );
+    page.pushOperators(
+      PDFOperator.of("q"),
+      PDFOperator.of(
+        "cm",
+        [432, 0, 0, 672, 0, 0].map((n) => pdf.context.obj(n))
+      ),
+      PDFOperator.of("Do", [PDFName.of("Scan")]),
+      PDFOperator.of("Q")
+    );
+    page.drawText(`Scan page ${index + 1}`, { x: 10, y: 640, size: 10 });
+  }
   const request = JSON.stringify({
     pdf: Buffer.from(await pdf.save()).toString("base64"),
   });
@@ -125,7 +161,7 @@ try {
       failed = true;
       child.kill("SIGKILL");
     };
-    const timer = setTimeout(stop, 30_000);
+    const timer = setTimeout(stop, 90_000);
     child.stdout.on("data", (chunk) => {
       output += chunk;
       if (output.length > 8 * 1024 * 1024) stop();
@@ -148,9 +184,32 @@ try {
     });
     child.stdin.end(request);
   });
-  if (!result.ok || result.pageCount !== 3 || result.pages?.length !== 3)
+  if (!result.ok || result.pageCount !== 21 || result.pages?.length !== 21)
     throw new Error("Traced PDF renderer omitted pages");
   for (const [index, page] of result.pages.entries()) {
+    if (index >= 3) {
+      if (
+        page.pageNumber !== index + 1 ||
+        !page.text?.includes(`Scan page ${index - 2}`) ||
+        page.width !== 864 ||
+        page.height !== 1344
+      ) {
+        throw new Error(
+          "Traced PDF renderer lost scanned page order or dimensions"
+        );
+      }
+      const image = await loadImage(Buffer.from(page.png, "base64"));
+      const canvas = createCanvas(image.width, image.height);
+      const context = canvas.getContext("2d");
+      context.drawImage(image, 0, 0);
+      const center = context.getImageData(432, 672, 1, 1).data;
+      const corner = context.getImageData(20, 1200, 1, 1).data;
+      if (center[0] !== 0 || center[3] !== 255 || corner[0] !== 255) {
+        throw new Error("Traced PDF renderer lost scan pixels");
+      }
+      canvas.width = canvas.height = 1;
+      continue;
+    }
     if (
       page.pageNumber !== index + 1 ||
       !page.text?.includes(`Runtime page ${index + 1}`)
@@ -190,7 +249,7 @@ try {
       throw new Error("Traced PDF renderer lost page graphics");
   }
   console.log(
-    `[pdf-renderer] Traced runtime passed: ${process.platform}/${process.arch}, ${process.version}, 3 pages, text, vector pixels and located image alternatives, ${copied} runtime assets.`
+    `[pdf-renderer] Traced runtime passed: ${process.platform}/${process.arch}, ${process.version}, 21 pages including 18 high-resolution scans, text, vector pixels and located image alternatives, ${copied} runtime assets.`
   );
 } finally {
   // Only remove the exact temporary build directory allocated above.

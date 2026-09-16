@@ -7,6 +7,7 @@ import {
   PDFName,
   PDFOperator,
   PDFOperatorNames,
+  PDFStream,
   StandardFonts,
   rgb,
 } from "pdf-lib";
@@ -62,6 +63,31 @@ function declaredImage(
       Height: height,
       BitsPerComponent: 8,
       ColorSpace: PDFName.of("DeviceGray"),
+    })
+  );
+}
+
+function imageResources(
+  pdf: PDFDocument,
+  images: ReturnType<typeof declaredImage>[]
+) {
+  return pdf.context.obj({
+    XObject: pdf.context.obj(
+      Object.fromEntries(images.map((image, index) => [`Image${index}`, image]))
+    ),
+  });
+}
+
+function resourceForm(
+  pdf: PDFDocument,
+  resources: ReturnType<typeof imageResources>
+) {
+  return pdf.context.register(
+    pdf.context.flateStream(new Uint8Array(), {
+      Type: PDFName.of("XObject"),
+      Subtype: PDFName.of("Form"),
+      BBox: [0, 0, 100, 100],
+      Resources: resources,
     })
   );
 }
@@ -151,12 +177,10 @@ describe("PDF visual rendering in the real child process", () => {
   it("rejects oversized embedded images instead of returning a page with the image omitted", async () => {
     const pdf = await PDFDocument.create();
     const page = pdf.addPage([300, 300]);
-    const canvas = createCanvas(3000, 3000);
-    const context = canvas.getContext("2d");
-    context.fillStyle = "#ff0000";
-    context.fillRect(0, 0, 3000, 3000);
-    const image = await pdf.embedPng(await canvas.encode("png"));
-    page.drawImage(image, { x: 0, y: 0, width: 200, height: 200 });
+    page.node.set(
+      PDFName.of("Resources"),
+      imageResources(pdf, [declaredImage(pdf, 5000, 5000)])
+    );
     const error = await renderingFailure(
       renderPdfPages(Buffer.from(await pdf.save()))
     );
@@ -180,7 +204,7 @@ describe("PDF visual rendering in the real child process", () => {
     async (key) => {
       const pdf = await PDFDocument.create();
       pdf.addPage([100, 100]);
-      const mask = declaredImage(pdf, 3000, 3000, false);
+      const mask = declaredImage(pdf, 5000, 5000, false);
       const image = declaredImage(pdf, 1, 1);
       const nested = pdf.context.obj({ [key]: mask });
       pdf.context.register(pdf.context.obj({ Nested: nested, Image: image }));
@@ -195,12 +219,12 @@ describe("PDF visual rendering in the real child process", () => {
   it("rejects base/mask axis expansion even when their individual areas fit", async () => {
     const pdf = await PDFDocument.create();
     pdf.addPage([100, 100]);
-    const mask = declaredImage(pdf, 1000, 4000);
+    const mask = declaredImage(pdf, 1000, 5000);
     pdf.context.register(
       pdf.context.flateStream(new Uint8Array([0]), {
         Type: PDFName.of("XObject"),
         Subtype: PDFName.of("Image"),
-        Width: 4000,
+        Width: 5000,
         Height: 1000,
         BitsPerComponent: 8,
         ColorSpace: PDFName.of("DeviceGray"),
@@ -215,18 +239,241 @@ describe("PDF visual rendering in the real child process", () => {
   it("rejects aggregate declared image pixels before decoding unused streams", async () => {
     const pdf = await PDFDocument.create();
     pdf.addPage([100, 100]);
-    for (let i = 0; i < 9; i++) declaredImage(pdf, 2000, 2000);
+    for (let i = 0; i < 21; i++) declaredImage(pdf, 4000, 6000);
     await expect(
       renderPdfPages(Buffer.from(await pdf.save()))
     ).rejects.toMatchObject({ diagnostic: { code: "pdf_image_limit" } });
   });
 
+  it("renders all 18 high-resolution 1-bit scan images without changing page resolution", async () => {
+    const pdf = await PDFDocument.create();
+    const font = await pdf.embedFont(StandardFonts.Helvetica);
+    const width = 3600;
+    const height = 5600;
+    const rowBytes = width / 8;
+    const pixels = new Uint8Array(rowBytes * height).fill(255);
+    // A black stripe beside white paper proves the scan was rendered rather than
+    // omitted. Separate streams exercise the 362.88 MP document resource total.
+    for (let row = 0; row < height; row++)
+      pixels.fill(0, row * rowBytes, row * rowBytes + 90);
+    for (let n = 1; n <= 18; n++) {
+      const image = pdf.context.register(
+        pdf.context.flateStream(pixels, {
+          Type: PDFName.of("XObject"),
+          Subtype: PDFName.of("Image"),
+          Width: width,
+          Height: height,
+          BitsPerComponent: 1,
+          ColorSpace: PDFName.of("DeviceGray"),
+        })
+      );
+      const form = pdf.context.register(
+        pdf.context.flateStream(
+          Buffer.from("q 432 0 0 672 0 0 cm /Scan Do Q"),
+          {
+            Type: PDFName.of("XObject"),
+            Subtype: PDFName.of("Form"),
+            BBox: [0, 0, 432, 672],
+            Resources: pdf.context.obj({ XObject: { Scan: image } }),
+          }
+        )
+      );
+      const page = pdf.addPage([432, 672]);
+      page.node.setXObject(PDFName.of("ScannedPage"), form);
+      page.pushOperators(
+        PDFOperator.of(PDFOperatorNames.DrawObject, [PDFName.of("ScannedPage")])
+      );
+      page.drawText(`Physical page ${n}`, { x: 110, y: 650, size: 12, font });
+    }
+    const result = await renderPdfPages(Buffer.from(await pdf.save()));
+    expect(result.pageCount).toBe(18);
+    for (const [index, page] of result.pages.entries()) {
+      expect(page.pageNumber).toBe(index + 1);
+      expect([page.width, page.height]).toEqual([864, 1344]);
+      expect(page.text).toContain(`Physical page ${index + 1}`);
+      const canvas = createCanvas(page.width, page.height);
+      const context = canvas.getContext("2d");
+      context.drawImage(await loadImage(page.png), 0, 0);
+      expect([...context.getImageData(60, 600, 1, 1).data]).toEqual([
+        0, 0, 0, 255,
+      ]);
+      expect([...context.getImageData(600, 600, 1, 1).data]).toEqual([
+        255, 255, 255, 255,
+      ]);
+    }
+  }, 30_000);
+
+  it("accepts the exact image and document limits for unused declared streams", async () => {
+    const pdf = await PDFDocument.create();
+    pdf.addPage([100, 100]);
+    for (let i = 0; i < 20; i++) declaredImage(pdf, 4000, 6000);
+    expect(
+      (await renderPdfPages(Buffer.from(await pdf.save()))).pageCount
+    ).toBe(1);
+  });
+
+  it("keeps the source image axis limit even for a small image area", async () => {
+    const pdf = await PDFDocument.create();
+    pdf.addPage([100, 100]);
+    declaredImage(pdf, 8193, 1);
+    await expect(
+      renderPdfPages(Buffer.from(await pdf.save()))
+    ).rejects.toMatchObject({
+      diagnostic: { code: "pdf_image_limit" },
+    });
+  });
+
+  it("accepts exactly 32 MP on one page and deduplicates repeated resource names", async () => {
+    const pdf = await PDFDocument.create();
+    const images = [
+      declaredImage(pdf, 4000, 4000),
+      declaredImage(pdf, 4000, 4000),
+    ];
+    pdf
+      .addPage([100, 100])
+      .node.set(
+        PDFName.of("Resources"),
+        imageResources(pdf, [...images, ...images, ...images])
+      );
+    expect(
+      (await renderPdfPages(Buffer.from(await pdf.save()))).pageCount
+    ).toBe(1);
+  });
+
+  it("counts a base image and its mask in the page resource budget", async () => {
+    const pdf = await PDFDocument.create();
+    pdf.addPage([100, 100]);
+    const page = pdf.addPage([100, 100]);
+    const mask = declaredImage(pdf, 4000, 5000);
+    const base = declaredImage(pdf, 4000, 5000);
+    pdf.context.lookup(base, PDFStream).dict.set(PDFName.of("SMask"), mask);
+    page.node.set(PDFName.of("Resources"), imageResources(pdf, [base]));
+    await expect(
+      renderPdfPages(Buffer.from(await pdf.save()))
+    ).rejects.toMatchObject({
+      diagnostic: { code: "pdf_image_limit", pageNumber: 2 },
+    });
+  });
+
+  it.each([
+    "direct",
+    "inherited",
+    "nested form",
+    "pattern",
+    "Type3 font",
+    "graphics-state font",
+    "soft-mask group",
+    "annotation appearance",
+    "annotation state",
+  ])(
+    "rejects more than 32 MP in a page's %s resources before rendering",
+    async (kind) => {
+      const pdf = await PDFDocument.create();
+      pdf.addPage([100, 100]);
+      const page = pdf.addPage([100, 100]);
+      const resources = imageResources(pdf, [
+        declaredImage(pdf, 4000, 5000),
+        declaredImage(pdf, 4000, 5000),
+      ]);
+      const form = resourceForm(pdf, resources);
+      let pageResources = resources;
+      if (kind === "inherited") {
+        page.node.Parent()!.set(PDFName.of("Resources"), resources);
+        page.node.delete(PDFName.of("Resources"));
+      } else if (kind === "nested form") {
+        pageResources = imageResources(pdf, [
+          resourceForm(pdf, imageResources(pdf, [form])),
+        ]);
+      } else if (kind === "pattern") {
+        pageResources = pdf.context.obj({ Pattern: { Pattern1: form } });
+      } else if (kind === "Type3 font") {
+        pageResources = pdf.context.obj({
+          Font: {
+            Font1: {
+              Type: PDFName.of("Font"),
+              Subtype: PDFName.of("Type3"),
+              Resources: resources,
+              CharProcs: { A: form },
+            },
+          },
+        });
+      } else if (kind === "soft-mask group") {
+        pageResources = pdf.context.obj({
+          ExtGState: {
+            State1: { SMask: { S: PDFName.of("Luminosity"), G: form } },
+          },
+        });
+      } else if (kind === "graphics-state font") {
+        const font = pdf.context.register(
+          pdf.context.obj({
+            Type: PDFName.of("Font"),
+            Subtype: PDFName.of("Type3"),
+            Resources: resources,
+            CharProcs: { A: form },
+          })
+        );
+        pageResources = pdf.context.obj({
+          ExtGState: { State1: { Font: [font, 12] } },
+        });
+      } else if (kind.startsWith("annotation")) {
+        page.node.set(
+          PDFName.of("Annots"),
+          pdf.context.obj([
+            {
+              Type: PDFName.of("Annot"),
+              Subtype: PDFName.of("Stamp"),
+              Rect: [0, 0, 100, 100],
+              P: page.ref,
+              AP: {
+                N: kind === "annotation state" ? { Selected: form } : form,
+              },
+            },
+          ])
+        );
+        pageResources = pdf.context.obj({});
+      }
+      if (kind !== "inherited")
+        page.node.set(PDFName.of("Resources"), pageResources);
+      await expect(
+        renderPdfPages(Buffer.from(await pdf.save()))
+      ).rejects.toMatchObject({
+        diagnostic: { code: "pdf_image_limit", pageNumber: 2 },
+      });
+    }
+  );
+
+  it("keeps each page separate when forms contain page backlinks and share image streams", async () => {
+    const pdf = await PDFDocument.create();
+    const first = pdf.addPage([100, 100]);
+    const second = pdf.addPage([100, 100]);
+    const images = [
+      declaredImage(pdf, 4000, 5000),
+      declaredImage(pdf, 4000, 5000),
+    ];
+    const firstForm = resourceForm(
+      pdf,
+      imageResources(pdf, [images[0], images[0]])
+    );
+    const secondForm = resourceForm(pdf, imageResources(pdf, [images[1]]));
+    pdf.context
+      .lookup(firstForm, PDFStream)
+      .dict.set(PDFName.of("P"), second.ref);
+    pdf.context
+      .lookup(secondForm, PDFStream)
+      .dict.set(PDFName.of("Parent"), first.ref);
+    first.node.set(PDFName.of("Resources"), imageResources(pdf, [firstForm]));
+    second.node.set(PDFName.of("Resources"), imageResources(pdf, [secondForm]));
+    expect(
+      (await renderPdfPages(Buffer.from(await pdf.save()))).pageCount
+    ).toBe(2);
+  });
+
   it("rejects duplicate object definitions that hide the xref-selected image from preflight", async () => {
     const pdf = await PDFDocument.create();
     pdf.addPage([100, 100]);
-    const ref = declaredImage(pdf, 3000, 3000);
+    const ref = declaredImage(pdf, 5000, 5000);
     const original = Buffer.from(await pdf.save({ useObjectStreams: false }));
-    // The original xref still selects the 9MP definition. A sequential parser
+    // The original xref still selects the 25MP definition. A sequential parser
     // instead sees this appended 1px replacement last and overwrites the object.
     const duplicate = Buffer.from(
       `\n${ref.objectNumber} ${ref.generationNumber} obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceGray /Length 1 >>\nstream\nX\nendstream\nendobj\n`
@@ -429,7 +676,7 @@ describe("renderer process boundaries", () => {
     });
   });
 
-  it("force-kills on deadline and waits for close before rejecting", async () => {
+  it("permits rendering beyond 30 seconds, force-kills at 90 seconds and waits for close", async () => {
     vi.useFakeTimers();
     const child = fakeChild();
     let settled = false;
@@ -437,14 +684,19 @@ describe("renderer process boundaries", () => {
       settled = true;
       return error;
     });
-    await vi.advanceTimersByTimeAsync(PDF_RENDERING_LIMITS.timeoutMs);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(child.kill).not.toHaveBeenCalled();
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(child.kill).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
     expect(child.kill).toHaveBeenCalledWith("SIGKILL");
     expect(settled).toBe(false);
     // Killing the worker can emit a later pipe error; it must not erase timeout.
     child.stdin.emit("error", new Error("private pipe failure"));
     child.emit("close", null);
     expect(await pending).toMatchObject({
-      diagnostic: { code: "pdf_timeout", elapsedMs: 30_000 },
+      diagnostic: { code: "pdf_timeout", elapsedMs: 90_000 },
     });
     expect(vi.getTimerCount()).toBe(0);
   });

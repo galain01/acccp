@@ -37,13 +37,18 @@ not an operating-system sandbox or a hard native-memory limit.
 
 ## Bounds and deployment
 
-Uploads remain limited to 4 MiB. The renderer permits up to 60 pages, 30 seconds,
+Uploads remain limited to 4 MiB. The renderer permits up to 60 pages, 90 seconds,
 2 million pixels per page (120 million total), 4096 pixels per page dimension,
 8 MiB PNG per page and 24 MiB total PNG data. Before image decoding, a preflight
 inspects up to 100,000 PDF objects, including unreferenced image streams and nested
-soft/explicit masks. Declared images and masks are limited to 8 million pixels and
+soft/explicit masks. Declared images and masks are limited to 24 million pixels and
 8192 pixels per dimension; combined base/mask dimensions must also fit. The sum
-of those declared image areas is limited to 32 million pixels across the document.
+of those declared image areas is limited to 32 million pixels in each page's
+resource graph and 480 million pixels across the document. A page's resource
+graph includes inherited resources, nested forms, patterns, Type3 fonts,
+transparency groups and annotation appearances; shared images count once per
+page. The document budget also includes unused images. These separate bounds
+allow long scans without admitting the same large pixel total on a single page.
 Inline images retain PDF.js's per-image check; these guards are not a total native
 memory cap. Repeated indirect-object definitions are rejected to prevent the
 preflight and renderer from choosing different versions of an image or mask.
@@ -54,11 +59,25 @@ faculty-facing message. Optional page text is capped at 100,000 characters per
 page and 500,000 total; unavailable text remains unknown rather than truncated
 evidence. Rendering warnings fail the operation to avoid silently omitted images.
 
+Each Node process runs at most one renderer child at a time, with a FIFO queue
+of at most four waiting requests. A request waits at most 30 seconds for a slot,
+then has a separate 90-second child deadline. Full or expired queues return a
+plain-language busy message. The slot is held until the child closes, including
+after timeout or protocol failure. This bounds simultaneous renderer children in
+one process; separate server instances and model requests remain independent.
+The 192 MiB V8 heap setting is not a native-memory ceiling. Original PDFs and
+the normal output rendering resolution are unchanged. A rendering timeout discards
+partial page output and stops conversion before model calls. The user receives a
+safe timeout message and can retry a smaller PDF or divide it into shorter files.
+The 90 seconds covers page preparation only; model conversion and audit follow.
+
 Node 24 is required. `next.config.ts` explicitly traces the child script, PDF.js
 worker, CMaps, fonts, WASM assets, and the platform's native canvas library into
 `/api/convert`. Every production build runs `scripts/check-pdf-renderer.mjs`, which
 copies only traced rendering assets into a fresh temporary directory, renders
-three synthetic PDF pages there, and verifies text, order and vector pixels. This
+three tagged synthetic vector pages and eighteen 20.16-million-pixel scanned
+pages there, and verifies text, order, vector pixels, image descriptions and
+actual scan pixels. This
 exercises the build platform's native library and permission configuration. A
 Windows pass does not establish Linux compatibility: require the Vercel Linux
 build check, then verify an authenticated conversion in the deployed function.
