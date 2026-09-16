@@ -6,7 +6,13 @@ scan has 20.16 million source pixels, above the former 8-million-image limit.
 An 18-page example also exceeded the former 32-million-document limit even
 though its pages render sequentially.
 
-## Change
+The initial measurements below used a 30-second rendering deadline. The release
+extends that deadline to 90 seconds; the queue wait remains 30 seconds. The
+landing page and uploader explain processing limits, additional AI processing
+time, what happens on failure and how to retry with smaller files. They do not
+claim a particular number of full-color pages is a proven failure threshold.
+
+## Initial image-limit evaluation (30-second rendering deadline)
 
 The candidate permits 24 million pixels per source image, 32 million declared
 image pixels per page's resource graph, and 480 million declared image pixels
@@ -85,11 +91,31 @@ separate HTTP-request check above. They do not estimate whole-site capacity or
 end-to-end conversion/audit latency. No model
 calls, database records or stored documents were created by the hosted tests.
 
+## 90-second release validation
+
+The release candidate at `ebaaced` raises the renderer and build-smoke deadline
+to 90 seconds. The queue admission deadline stays at 30 seconds. Tests verify
+that an admitted worker can run beyond 30 seconds, receives its own full
+90-second deadline after waiting, and retains its slot until the child closes.
+All 931 tests and the production build pass with this configuration. Changed
+code passes lint, and the landing-page notice was checked in the browser.
+
+A new isolated Vercel preview using this exact renderer completed all 18 pages
+of the high-resolution JPEG color fixture in **69.2 seconds**, compared with
+the 30-second timeout above. Peak sampled parent-plus-renderer RSS was 382 MiB,
+with one observed renderer. The Linux build also passed the 21-page traced-assets
+check. This measures page preparation only, before AI conversion and audit.
+The temporary preview and its remote benchmark branch were removed after the
+test; its endpoint and credentials are absent from the application branch.
+
+This demonstrates that the longer deadline helps this particular color scan.
+It does not establish a fixed full-color page-count threshold: image encoding,
+resolution, page contents and runtime conditions affect processing time.
+
 ## Release scope
 
 This fixes image-admission failures for the tested high-resolution scans without
 changing their model input or rendering resolution. Computationally demanding
-documents can still reach the existing time/output limits. No migration or new
-production environment variable is required. The feature remains on its branch;
-production has not been updated. Raw PDFs, page images, credentials and numeric
+documents can still reach time/output limits. No migration or new production
+environment variable is required. Raw PDFs, page images, credentials and numeric
 benchmark records remain outside Git.
