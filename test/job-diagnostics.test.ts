@@ -10,6 +10,19 @@ import {
 } from "@/lib/job-diagnostics";
 
 describe("safe saved job diagnostics", () => {
+  it("explains a full or expired PDF queue without document or infrastructure details", () => {
+    const diagnostic = createJobDiagnostic({
+      stage: "pdf_render",
+      code: "pdf_renderer_busy",
+      elapsedMs: 30_000,
+      message: "private document",
+    });
+    expect(readJobDiagnostic(diagnostic)).toEqual(diagnostic);
+    expect(describeJobDiagnostic(diagnostic)).toBe(
+      "PDF page preparation stopped. Several documents are being prepared right now. Please try this document again shortly."
+    );
+  });
+
   it("retains only bounded fields and supplies the supported version", () => {
     const safe = {
       version: 1,

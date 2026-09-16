@@ -44,9 +44,10 @@ export const PDF_RENDERING_LIMITS = Object.freeze({
   maxPagePixels: 2_000_000,
   maxPageDimension: 4096,
   maxTotalPagePixels: 120_000_000,
-  maxImagePixels: 8_000_000,
+  maxImagePixels: 24_000_000,
   maxImageDimension: 8192,
-  maxDeclaredImagePixels: 32_000_000,
+  maxPageImagePixels: 32_000_000,
+  maxDeclaredImagePixels: 480_000_000,
   maxPngBytes: 8 * 1024 * 1024,
   maxTotalPngBytes: 24 * 1024 * 1024,
   maxPageTextChars: 100_000,
@@ -57,6 +58,11 @@ export const PDF_RENDERING_LIMITS = Object.freeze({
   maxPageAltChars: 32_000,
   maxTotalAltChars: 128_000,
   maxStderrBytes: 16 * 1024,
+});
+
+export const PDF_RENDERING_QUEUE_LIMITS = Object.freeze({
+  maxWaiting: 4,
+  timeoutMs: 30_000,
 });
 
 export class PdfRenderingError extends Error {
@@ -97,6 +103,86 @@ function renderingError(
   return new PdfRenderingError(
     createJobDiagnostic({ stage: "pdf_render", code, pageNumber, elapsedMs })
   );
+}
+
+type ReleaseRenderer = () => void;
+interface RendererWaiter {
+  resolve: (release: ReleaseRenderer) => void;
+  reject: (error: PdfRenderingError) => void;
+  timer: ReturnType<typeof setTimeout>;
+  deadline: number;
+  elapsed: () => number;
+}
+interface RendererQueue {
+  active: boolean;
+  waiting: RendererWaiter[];
+}
+
+// Bundled routes can evaluate this module independently within one Node process.
+// Sharing the gate prevents their native-memory-heavy children from overlapping.
+// Separate server processes still have separate gates.
+const rendererQueueKey = Symbol.for("acccp.pdf-renderer-queue.v1");
+const rendererGlobals = globalThis as typeof globalThis & {
+  [rendererQueueKey]?: RendererQueue;
+};
+const rendererQueue = (rendererGlobals[rendererQueueKey] ??= {
+  active: false,
+  waiting: [],
+});
+
+function rendererBusy(elapsed: () => number): PdfRenderingError {
+  return new PdfRenderingError({
+    version: 1,
+    stage: "pdf_render",
+    code: "pdf_renderer_busy",
+    elapsedMs: elapsed(),
+  });
+}
+
+function rendererRelease(): ReleaseRenderer {
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    let waiter: RendererWaiter | undefined;
+    while ((waiter = rendererQueue.waiting.shift())) {
+      clearTimeout(waiter.timer);
+      // Honor the deadline even if a blocked event loop delayed its timer.
+      if (performance.now() >= waiter.deadline) {
+        waiter.reject(rendererBusy(waiter.elapsed));
+        continue;
+      }
+      waiter.resolve(rendererRelease());
+      return;
+    }
+    rendererQueue.active = false;
+  };
+}
+
+function acquireRenderer(
+  elapsed: () => number
+): ReleaseRenderer | Promise<ReleaseRenderer> {
+  if (!rendererQueue.active) {
+    rendererQueue.active = true;
+    return rendererRelease();
+  }
+  if (rendererQueue.waiting.length >= PDF_RENDERING_QUEUE_LIMITS.maxWaiting)
+    throw rendererBusy(elapsed);
+  return new Promise((resolve, reject) => {
+    const waiter: RendererWaiter = {
+      resolve,
+      reject,
+      elapsed,
+      deadline: performance.now() + PDF_RENDERING_QUEUE_LIMITS.timeoutMs,
+      timer: setTimeout(() => {
+        const index = rendererQueue.waiting.indexOf(waiter);
+        if (index === -1) return;
+        rendererQueue.waiting.splice(index, 1);
+        reject(rendererBusy(elapsed));
+      }, PDF_RENDERING_QUEUE_LIMITS.timeoutMs),
+    };
+    rendererQueue.waiting.push(waiter);
+  });
 }
 
 const MAX_STDIN_BYTES = Math.ceil(MAX_FILE_SIZE_BYTES / 3) * 4 + 64;
@@ -277,109 +363,120 @@ export async function renderPdfPages(buffer: Buffer): Promise<RenderedPdf> {
   ) {
     throw renderingError("pdf_invalid", undefined, elapsed());
   }
-  const request = JSON.stringify({ pdf: buffer.toString("base64") });
-  if (Buffer.byteLength(request) > MAX_STDIN_BYTES)
-    throw renderingError("pdf_invalid", undefined, elapsed());
-  const root = process.cwd();
-  const childPath = join(root, "lib", "pdf-rendering-child.mjs");
-  const env: NodeJS.ProcessEnv = { NODE_ENV: "production" };
-  // Windows may need this public OS path to load system DLLs. No user/app vars.
-  if (process.platform === "win32" && process.env.SystemRoot) {
-    env.SystemRoot = process.env.SystemRoot;
-  }
-
-  return new Promise((resolve, reject) => {
-    let child: ReturnType<typeof spawn>;
-    try {
-      child = spawn(
-        process.execPath,
-        [
-          "--max-old-space-size=192",
-          "--permission",
-          "--allow-addons",
-          `--allow-fs-read=${childPath}`,
-          `--allow-fs-read=${join(root, "lib", "pdf-image-alternatives.mjs")}`,
-          `--allow-fs-read=${join(root, "node_modules", "pdf-lib", "dist", "pdf-lib.min.js")}`,
-          `--allow-fs-read=${join(root, "node_modules", "pdfjs-dist")}`,
-          `--allow-fs-read=${join(root, "node_modules", "@napi-rs")}`,
-          childPath,
-        ],
-        { env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] }
-      );
-    } catch {
-      reject(renderingError("pdf_worker_failed", undefined, elapsed()));
-      return;
+  const slot = acquireRenderer(elapsed);
+  const release = typeof slot === "function" ? slot : await slot;
+  try {
+    // Queued requests retain only their original bytes, not another base64 copy.
+    const request = JSON.stringify({ pdf: buffer.toString("base64") });
+    if (Buffer.byteLength(request) > MAX_STDIN_BYTES)
+      throw renderingError("pdf_invalid", undefined, elapsed());
+    const root = process.cwd();
+    const childPath = join(root, "lib", "pdf-rendering-child.mjs");
+    const env: NodeJS.ProcessEnv = { NODE_ENV: "production" };
+    // Windows may need this public OS path to load system DLLs. No user/app vars.
+    if (process.platform === "win32" && process.env.SystemRoot) {
+      env.SystemRoot = process.env.SystemRoot;
     }
-    let closed = false;
-    let failureCode: PdfFailureCode | undefined;
-    let stdoutBytes = 0;
-    let stderrBytes = 0;
-    const chunks: Buffer[] = [];
-    const stop = (code: PdfFailureCode) => {
-      if (closed) return;
-      // Preserve the first observed failure instead of replacing a timeout with
-      // a subsequent pipe error caused by terminating the same worker.
-      failureCode ??= code;
-      child.stdin?.destroy();
-      // SIGKILL maps to forceful process termination on Windows as well.
-      child.kill("SIGKILL");
-    };
-    const timer = setTimeout(
-      () => stop("pdf_timeout"),
-      PDF_RENDERING_LIMITS.timeoutMs
-    );
-    child.stdout?.on("data", (chunk: Buffer) => {
-      stdoutBytes += chunk.length;
-      if (stdoutBytes > MAX_STDOUT_BYTES) stop("pdf_output_limit");
-      else if (!failureCode) chunks.push(chunk);
-    });
-    child.stderr?.on("data", (chunk: Buffer) => {
-      // Discard native/library output privately; never retain document errors.
-      stderrBytes += chunk.length;
-      if (stderrBytes > PDF_RENDERING_LIMITS.maxStderrBytes)
-        stop("pdf_worker_failed");
-    });
-    child.on("error", () => stop("pdf_worker_failed"));
-    child.stdin?.on("error", () => stop("pdf_worker_failed"));
-    child.once("close", (code) => {
-      closed = true;
-      clearTimeout(timer);
-      if (failureCode) {
-        reject(renderingError(failureCode, undefined, elapsed()));
-        return;
-      }
-      if (stdoutBytes === 0 && code !== 0) {
+
+    return await new Promise<RenderedPdf>((resolve, reject) => {
+      let child: ReturnType<typeof spawn>;
+      try {
+        child = spawn(
+          process.execPath,
+          [
+            "--max-old-space-size=192",
+            "--permission",
+            "--allow-addons",
+            `--allow-fs-read=${childPath}`,
+            `--allow-fs-read=${join(root, "lib", "pdf-image-alternatives.mjs")}`,
+            `--allow-fs-read=${join(root, "node_modules", "pdf-lib", "dist", "pdf-lib.min.js")}`,
+            `--allow-fs-read=${join(root, "node_modules", "pdfjs-dist")}`,
+            `--allow-fs-read=${join(root, "node_modules", "@napi-rs")}`,
+            childPath,
+          ],
+          { env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] }
+        );
+      } catch {
         reject(renderingError("pdf_worker_failed", undefined, elapsed()));
         return;
       }
-      try {
-        const value: unknown = JSON.parse(
-          Buffer.concat(chunks).toString("utf8")
-        );
-        if (isRecord(value) && value.ok === false) {
-          if (stdoutBytes > 512) throw renderingError("pdf_protocol_error");
-          throw new PdfRenderingError(
-            createJobDiagnostic({
-              ...parseFailure(value),
-              elapsedMs: elapsed(),
-            })
+      let closed = false;
+      let failureCode: PdfFailureCode | undefined;
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+      const chunks: Buffer[] = [];
+      const stop = (code: PdfFailureCode) => {
+        if (closed) return;
+        // Preserve the first observed failure instead of replacing a timeout with
+        // a subsequent pipe error caused by terminating the same worker.
+        failureCode ??= code;
+        child.stdin?.destroy();
+        // SIGKILL maps to forceful process termination on Windows as well.
+        child.kill("SIGKILL");
+      };
+      const timer = setTimeout(
+        () => stop("pdf_timeout"),
+        PDF_RENDERING_LIMITS.timeoutMs
+      );
+      child.stdout?.on("data", (chunk: Buffer) => {
+        stdoutBytes += chunk.length;
+        if (stdoutBytes > MAX_STDOUT_BYTES) stop("pdf_output_limit");
+        else if (!failureCode) chunks.push(chunk);
+      });
+      child.stderr?.on("data", (chunk: Buffer) => {
+        // Discard native/library output privately; never retain document errors.
+        stderrBytes += chunk.length;
+        if (stderrBytes > PDF_RENDERING_LIMITS.maxStderrBytes)
+          stop("pdf_worker_failed");
+      });
+      child.on("error", () => stop("pdf_worker_failed"));
+      child.stdin?.on("error", () => stop("pdf_worker_failed"));
+      child.once("close", (code) => {
+        closed = true;
+        clearTimeout(timer);
+        if (failureCode) {
+          reject(renderingError(failureCode, undefined, elapsed()));
+          return;
+        }
+        if (stdoutBytes === 0 && code !== 0) {
+          reject(renderingError("pdf_worker_failed", undefined, elapsed()));
+          return;
+        }
+        try {
+          const value: unknown = JSON.parse(
+            Buffer.concat(chunks).toString("utf8")
+          );
+          if (isRecord(value) && value.ok === false) {
+            if (stdoutBytes > 512) throw renderingError("pdf_protocol_error");
+            throw new PdfRenderingError(
+              createJobDiagnostic({
+                ...parseFailure(value),
+                elapsedMs: elapsed(),
+              })
+            );
+          }
+          if (code !== 0) throw renderingError("pdf_worker_failed");
+          resolve(parseResult(value));
+        } catch (error) {
+          const diagnostic =
+            error instanceof PdfRenderingError
+              ? error.diagnostic
+              : { stage: "pdf_render", code: "pdf_protocol_error" };
+          reject(
+            new PdfRenderingError(
+              createJobDiagnostic({ ...diagnostic, elapsedMs: elapsed() })
+            )
           );
         }
-        if (code !== 0) throw renderingError("pdf_worker_failed");
-        resolve(parseResult(value));
-      } catch (error) {
-        const diagnostic =
-          error instanceof PdfRenderingError
-            ? error.diagnostic
-            : { stage: "pdf_render", code: "pdf_protocol_error" };
-        reject(
-          new PdfRenderingError(
-            createJobDiagnostic({ ...diagnostic, elapsedMs: elapsed() })
-          )
-        );
+      });
+      // Await close even on failure: rejection never leaves a renderer running.
+      try {
+        child.stdin?.end(request);
+      } catch {
+        stop("pdf_worker_failed");
       }
     });
-    // Await close even on failure: rejection never leaves a renderer running.
-    child.stdin?.end(request);
-  });
+  } finally {
+    release();
+  }
 }
