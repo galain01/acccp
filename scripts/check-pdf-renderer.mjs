@@ -30,7 +30,7 @@ try {
     )
       continue;
     if (
-      !/^(?:lib[/\\]pdf-(?:rendering-child|image-alternatives)\.mjs|node_modules[/\\](?:pdfjs-dist|@napi-rs)[/\\]|node_modules[/\\]pdf-lib[/\\]dist[/\\]pdf-lib\.min\.js$)/.test(
+      !/^(?:lib[/\\]pdf-(?:rendering-child|image-alternatives|revisions)\.mjs|node_modules[/\\](?:pdfjs-dist|@napi-rs)[/\\]|node_modules[/\\]pdf-lib[/\\]dist[/\\]pdf-lib\.min\.js$)/.test(
         sub
       )
     )
@@ -124,8 +124,22 @@ try {
     );
     page.drawText(`Scan page ${index + 1}`, { x: 10, y: 640, size: 10 });
   }
+  // Exercise an ordinary appended save in the traced runtime too: the current
+  // catalog is an update of an earlier compressed definition in this same PDF.
+  const original = Buffer.from(await pdf.save());
+  const previousXref = [
+    ...original.toString("latin1").matchAll(/startxref\s+(\d+)/g),
+  ].at(-1)?.[1];
+  if (!previousXref)
+    throw new Error("Synthetic PDF has no cross-reference index");
+  pdf.catalog.set(PDFName.of("Lang"), PDFHexString.fromText("en"));
+  const rootRef = pdf.context.trailerInfo.Root;
+  const updatedCatalog = `\n${rootRef.objectNumber} ${rootRef.generationNumber} obj\n${pdf.catalog.toString()}\nendobj\n`;
+  const updatedOffset = original.length + 1;
+  const xrefOffset = original.length + Buffer.byteLength(updatedCatalog);
+  const update = `${updatedCatalog}xref\n${rootRef.objectNumber} 1\n${String(updatedOffset).padStart(10, "0")} ${String(rootRef.generationNumber).padStart(5, "0")} n \ntrailer\n<< /Size ${pdf.context.largestObjectNumber + 1} /Root ${rootRef.toString()} /Prev ${previousXref} >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
   const request = JSON.stringify({
-    pdf: Buffer.from(await pdf.save()).toString("base64"),
+    pdf: Buffer.concat([original, Buffer.from(update)]).toString("base64"),
   });
   const childPath = join(target, "lib/pdf-rendering-child.mjs");
   const result = await new Promise((done, reject) => {
@@ -137,6 +151,7 @@ try {
         "--allow-addons",
         `--allow-fs-read=${childPath}`,
         `--allow-fs-read=${join(target, "lib/pdf-image-alternatives.mjs")}`,
+        `--allow-fs-read=${join(target, "lib/pdf-revisions.mjs")}`,
         `--allow-fs-read=${join(target, "node_modules/pdf-lib/dist/pdf-lib.min.js")}`,
         `--allow-fs-read=${join(target, "node_modules/pdfjs-dist")}`,
         `--allow-fs-read=${join(target, "node_modules/@napi-rs")}`,
@@ -249,7 +264,7 @@ try {
       throw new Error("Traced PDF renderer lost page graphics");
   }
   console.log(
-    `[pdf-renderer] Traced runtime passed: ${process.platform}/${process.arch}, ${process.version}, 21 pages including 18 high-resolution scans, text, vector pixels and located image alternatives, ${copied} runtime assets.`
+    `[pdf-renderer] Traced runtime passed: ${process.platform}/${process.arch}, ${process.version}, saved-revision PDF with 21 pages including 18 high-resolution scans, text, vector pixels and located image alternatives, ${copied} runtime assets.`
   );
 } finally {
   // Only remove the exact temporary build directory allocated above.

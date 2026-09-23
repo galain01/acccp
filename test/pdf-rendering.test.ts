@@ -468,7 +468,7 @@ describe("PDF visual rendering in the real child process", () => {
     ).toBe(2);
   });
 
-  it("rejects duplicate object definitions that hide the xref-selected image from preflight", async () => {
+  it("rejects an unindexed appended object that hides an oversized image", async () => {
     const pdf = await PDFDocument.create();
     pdf.addPage([100, 100]);
     const ref = declaredImage(pdf, 5000, 5000);
@@ -482,6 +482,32 @@ describe("PDF visual rendering in the real child process", () => {
       renderPdfPages(Buffer.concat([original, duplicate]))
     ).rejects.toMatchObject({ diagnostic: { code: "pdf_invalid" } });
   });
+
+  it.each(["image", "mask"])(
+    "does not exempt an %s stream with a misleading XRef type from image checks",
+    async (kind) => {
+      const pdf = await PDFDocument.create();
+      pdf.addPage([100, 100]);
+      const misleading = pdf.context.register(
+        pdf.context.flateStream(new Uint8Array([0]), {
+          Type: PDFName.of("XRef"),
+          W: [1, 4, 2],
+          ...(kind === "image" ? { Subtype: PDFName.of("Image") } : {}),
+          Width: 5000,
+          Height: 5000,
+          BitsPerComponent: 8,
+          ColorSpace: PDFName.of("DeviceGray"),
+        })
+      );
+      if (kind === "mask")
+        pdf.context.register(pdf.context.obj({ SMask: misleading }));
+      // The XRef /W array conflicts with this stream's image dimensions. Its
+      // label cannot hide the malformed/oversized image from preflight.
+      await expect(
+        renderPdfPages(Buffer.from(await pdf.save()))
+      ).rejects.toMatchObject({ diagnostic: { code: "pdf_invalid" } });
+    }
+  );
 
   it("renders a valid embedded image and its transparency mask", async () => {
     const pdf = await PDFDocument.create();

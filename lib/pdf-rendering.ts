@@ -389,6 +389,7 @@ export async function renderPdfPages(buffer: Buffer): Promise<RenderedPdf> {
             "--allow-addons",
             `--allow-fs-read=${childPath}`,
             `--allow-fs-read=${join(root, "lib", "pdf-image-alternatives.mjs")}`,
+            `--allow-fs-read=${join(root, "lib", "pdf-revisions.mjs")}`,
             `--allow-fs-read=${join(root, "node_modules", "pdf-lib", "dist", "pdf-lib.min.js")}`,
             `--allow-fs-read=${join(root, "node_modules", "pdfjs-dist")}`,
             `--allow-fs-read=${join(root, "node_modules", "@napi-rs")}`,

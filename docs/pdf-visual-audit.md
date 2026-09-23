@@ -50,12 +50,16 @@ transparency groups and annotation appearances; shared images count once per
 page. The document budget also includes unused images. These separate bounds
 allow long scans without admitting the same large pixel total on a single page.
 Inline images retain PDF.js's per-image check; these guards are not a total native
-memory cap. Repeated indirect-object definitions are rejected to prevent the
-preflight and renderer from choosing different versions of an image or mask.
-This excludes some valid incrementally saved PDFs; the error asks for a freshly
-exported PDF. Output is bounded and stderr is capped at 16 KiB; failures discard
-partial output and use a safe
-faculty-facing message. Optional page text is capped at 100,000 characters per
+memory cap. The preflight follows the PDF's cross-reference index and saved
+revision chain to select current object definitions, including compressed objects.
+Ordinary appended saves can contain older definitions with the same object number;
+those alone no longer cause rejection. A later physical definition that the index
+does not select cannot hide a large image or mask from the checks. Invalid or
+ambiguous index data still fails safely. Original PDF bytes are preserved for
+storage, PDF.js rendering and both model calls; no PDF rewrite or outside repair
+service is introduced. Output is bounded and stderr is capped at 16 KiB; failures
+discard partial output and use a safe faculty-facing message. Optional page text
+is capped at 100,000 characters per
 page and 500,000 total; unavailable text remains unknown rather than truncated
 evidence. Rendering warnings fail the operation to avoid silently omitted images.
 
@@ -72,16 +76,25 @@ safe timeout message and can retry a smaller PDF or divide it into shorter files
 The 90 seconds covers page preparation only; model conversion and audit follow.
 
 Node 24 is required. `next.config.ts` explicitly traces the child script, PDF.js
-worker, CMaps, fonts, WASM assets, and the platform's native canvas library into
-`/api/convert`. Every production build runs `scripts/check-pdf-renderer.mjs`, which
+worker, revision reader, CMaps, fonts, WASM assets, and the platform's native canvas
+library into `/api/convert`. Every production build runs `scripts/check-pdf-renderer.mjs`, which
 copies only traced rendering assets into a fresh temporary directory, renders
 three tagged synthetic vector pages and eighteen 20.16-million-pixel scanned
-pages there, and verifies text, order, vector pixels, image descriptions and
-actual scan pixels. This
+pages in a PDF with an appended saved revision, and verifies text, order, vector
+pixels, image descriptions and actual scan pixels. This
 exercises the build platform's native library and permission configuration. A
 Windows pass does not establish Linux compatibility: require the Vercel Linux
 build check, then verify an authenticated conversion in the deployed function.
 No new environment variables or database migration are required.
+
+Saved-revision compatibility was checked locally with the original eight-page
+research article, six-page blank W-9 and one-page statistical chart supplied for
+the model tournament. All pages prepared successfully. For the two previously
+rejected originals, page PNGs, extracted text and authored image-description
+evidence matched the separately verified comparison copies exactly. Source hashes
+were unchanged, and this check made no model calls. Synthetic regression tests
+also exercise current text/image/description updates, compressed and linearized
+indexes, deleted objects and misleading definitions that could hide image limits.
 
 ## What the audit can establish
 

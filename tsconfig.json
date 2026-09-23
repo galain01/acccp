@@ -32,5 +32,5 @@
     ".next/dev/types/**/*.ts",
     "lti-server.js"
   ],
-  "exclude": ["node_modules"]
+  "exclude": ["node_modules", ".benchmark"]
 }
