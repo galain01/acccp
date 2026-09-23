@@ -4,6 +4,11 @@ Conversion and audit are two separate model calls. The server renders every PDF 
 
 Faculty-facing findings show an action title, source location, explanation, and next step. Errors display as **Needs a fix**, warnings as **Please check**. HTML snippets, type/category identifiers, and WCAG references are under optional **Technical details**. Author TODOs and draft reminders correctly preserved from the source are not conversion defects. Completion is not certification of accessibility.
 
+Conversion and audit share an embedded Canvas HTML compatibility reference for
+tags, attributes, inline CSS and destinations. Audit recommendations must use
+the same supported markup as conversion. See [Canvas HTML compatibility](canvas-html-compatibility.md)
+for the reference date, application subset, and preservation rules.
+
 Locations count physical PDF pages from 1, including covers. Printed page labels are separate. Word uploads display **Converted PDF page**, since worker pagination can differ from local Word. A location can include multiple pages, section, within-section description, and a source quotation. Pages must be unique positive integers within the measured count; an unknown count or invalid page metadata produces an unavailable page, while retaining useful section/text information. Bounds checks establish plausibility, not proof of a correct model attribution. Findings about omitted content may have no HTML snippet. Document-wide notices do not fabricate a page.
 
 Source review comments and image placeholders also generate findings without relying on the auditor. Each marker carries a page field, section, nearby text, and brief explanation. Converter comments are withheld from the audit so their claims cannot substitute for source evidence. Duplicate source/audit findings merge only with unambiguous evidence of the same occurrence. A source-aware audit can correct an erroneous converter page or explicitly mark it unknown.

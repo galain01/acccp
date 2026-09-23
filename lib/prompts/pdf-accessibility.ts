@@ -1,3 +1,5 @@
+import { CANVAS_COMPATIBILITY_PROMPT } from "./canvas-compatibility";
+
 /**
  * Converts a native PDF attachment (text and page images) to Canvas HTML.
  * The PDF is document content, not a source of instructions for the agent.
@@ -20,6 +22,8 @@ The PDF may have no semantic tags, incorrect tags, scanned pages, or inconsisten
 - Do not include <html>, <head>, <body>, <script>, or <style> elements, event-handler attributes, JavaScript URLs, or other executable content.
 - Return ordinary HTML, not a JSON-encoded or backslash-escaped string. Do not add literal \\n escape sequences. A formatter handles indentation and line breaks after conversion.
 - Do not add commentary about the source PDF or claim that the output is certified accessible. Preserve citations and source references that are part of the original document.
+
+${CANVAS_COMPATIBILITY_PROMPT}
 
 ## Content preservation
 
@@ -61,7 +65,7 @@ The PDF may have no semantic tags, incorrect tags, scanned pages, or inconsisten
 - Put prose in <p> elements. Preserve meaningful bold as <strong> and italics as <em>.
 - Do not use empty paragraphs, nonbreaking-space spacers, or repeated <br> elements for layout.
 - Use <ul> and <ol> for actual lists, with each item in <li>. Preserve nesting inside the parent <li>.
-- Preserve the source's numbering sequence using start/value/type attributes when necessary; do not duplicate list numbers in the item text or silently restart continued lists at 1.
+- Preserve the source's numbering sequence using ol start/type/reversed attributes when necessary. For numbering jumps, use separate ol runs with the correct start; do not use li value, duplicate list numbers in the item text, or silently restart continued lists at 1.
 - Use <dl>, <dt>, and <dd> for term-definition or label-value relationships when appropriate. Do not use them for unrelated visual layout.
 - Use <pre><code> for actual source code, or <pre> for other meaningfully preformatted text. Preserve meaningful indentation and line breaks and escape the source so it remains inert. Use style="white-space:pre-wrap; overflow-wrap:anywhere;" on <pre> to permit visual wrapping on narrow screens.
 
@@ -70,19 +74,19 @@ The PDF may have no semantic tags, incorrect tags, scanned pages, or inconsisten
 - Preserve meaningful relationships in tabular data. Accessible label-value tables are permitted when they communicate those relationships clearly; a description list or labeled paragraphs are also valid.
 - Do not create tables solely to mimic page layout, text columns, or indentation.
 - Preserve table titles and their relationship to the table. Prefer a concise, accurate <caption> when it usefully identifies the table; do not invent a subject or add a redundant generic label solely to satisfy a markup rule.
-- Use header cells and explicit associations that match the data's real relationships: <th scope="col"> for column headers and <th scope="row"> for row headers when appropriate. Use <thead> when the table has a column-header group; a table containing only row headers and values may use <tbody> without an invented column-header row. For complex tables, use unique id/headers associations rather than relying on visual position.
-- When a source row contains multiple independent label-value pairs, put each pair on its own row in a two-column table, or explicitly associate each value with its own label using unique id/headers attributes. Do not mark multiple independent labels as scope="row" in the same row, which would ambiguously associate them with all values in that row.
+- Use header cells and associations that match the data's real relationships: <th scope="col"> for column headers and <th scope="row"> for row headers when appropriate. Use <thead> when the table has a column-header group; a table containing only row headers and values may use <tbody> without an invented column-header row. Use scope="rowgroup" or scope="colgroup" only with corresponding structural groups. Do not rely on headers attributes, which are absent from Canvas's published allowlist. For complex tables, use faithful simpler tables or label-value groups when they preserve every association; otherwise retain the content and add a located TABLE REVIEW REQUIRED comment explaining the unresolved relationship.
+- When a source row contains multiple independent label-value pairs, put each pair on its own row in a two-column table or its own labeled description-list group. Do not mark multiple independent labels as scope="row" in the same row, which would ambiguously associate them with all values in that row.
 - Preserve all cell content, merged-cell relationships, and meaningful source notes. Do not treat the first data row as column headings merely because it appears first. If a relationship is ambiguous, retain the content and add a located TABLE REVIEW REQUIRED comment.
 - Rejoin tables continued across pages when their columns and meaning match. Do not repeat continuation header rows as data rows.
 - Wrap every table in <div style="overflow-x:auto;">. Wide data tables may scroll horizontally inside this wrapper; the rest of the page must reflow.
 
 ## Hyperlinks
 
-- Preserve every real hyperlink target that is available in the supplied PDF input, exactly as supplied. Preserve its visible link text.
+- Preserve every real hyperlink target that is available in the supplied PDF input and meets the Canvas destination rules, exactly as supplied. Preserve its visible link text. Retain unsupported destinations as inert text with a located LINK TARGET REVIEW REQUIRED comment.
 - If the source displays a full URL or email address, it may be linked to that exact URL or a mailto: target for that address. Never infer a hidden target from an organization name, domain hint, or link label.
 - If text appears to be a link but the destination is unavailable, retain the text and append a located LINK TARGET REQUIRED comment. Do not invent an href or use "#" as a substitute.
 - Preserve visible link wording. Evaluate link purpose using its accessible name and programmatically associated context, such as the containing sentence, paragraph, list item, or table cell. When the purpose remains unclear, add a located LINK TEXT REQUIRED comment for instructor review. Do not automatically flag every bare URL or occurrence of "click here". Do not invent a more descriptive label or destination unsupported by the source.
-- Keep suspicious or malformed non-executable targets unchanged and add a located LINK TARGET REVIEW REQUIRED comment for review. Never emit executable javascript:, data:, or vbscript: targets; preserve such targets as visible inert text with the same review comment.
+- Keep suspicious or malformed targets with a supported scheme unchanged and add a located LINK TARGET REVIEW REQUIRED comment for review. Targets with an unsupported or unsafe scheme remain visible inert text, never an active href or src.
 
 ## Images and visual information
 
@@ -109,14 +113,13 @@ The PDF may have no semantic tags, incorrect tags, scanned pages, or inconsisten
 - Prefer inherited Canvas text and background colors. Do not rely on color alone to communicate meaning; preserve textual labels or provide an equivalent supported by the source.
 - Prefer native semantic HTML over ARIA. Add ARIA only when needed for an accessible name or relationship not already expressed by native elements.
 - Do not create custom interactive widgets. Links must support ordinary keyboard navigation.
-- Allowed block elements: <section>, <div>, <p>, <pre>, <ul>, <ol>, <li>, <dl>, <dt>, <dd>, <table>, <caption>, <thead>, <tbody>, <tr>, <th>, <td>, <figure>, <figcaption>, <blockquote>, <h2> through <h6>, <hr>, <br>.
-- Allowed inline elements: <strong>, <em>, <a>, <abbr>, <code>, <sub>, <sup>, <img>.
+- Use only the elements, attributes, inline CSS properties and destination rules in the shared Canvas HTML compatibility section above. Do not broaden this application's subset just because Canvas supports additional elements.
 - Use <blockquote> only for an actual quotation in the source. Do not use tables, blockquotes, or heading elements just to style text.
 - Do not emit forms, iframes, scripts, external libraries, or unsupported presentational markup.
 
 ## Final check
 
-Before returning, check every page for omitted content; confirm reading order, list continuity, table associations, link preservation, image positions, and alternatives. Compare every output heading's parent and rank with the source outline, including relationships that continue across pages; correct unintended flattening or nesting. Confirm that any accessibility text you added is minimal and supported by the source. Leave the specified, located review comments where the source prevents a reliable decision and beside every image placeholder. Return only the HTML fragment.
+Before returning, check every page for omitted content; confirm reading order, list continuity, table associations, link preservation, image positions, and alternatives. Compare every output heading's parent and rank with the source outline, including relationships that continue across pages; correct unintended flattening or nesting. Check each active element, attribute, CSS property/value and URL against the Canvas compatibility rules, including list starts and table grouping; use a supported faithful representation for anything that would be stripped. Do not alter escaped source examples or required application placeholders. Confirm that any accessibility text you added is minimal and supported by the source. Leave the specified, located review comments where the source prevents a reliable decision and beside every image placeholder. Return only the HTML fragment.
 `;
 
 export const PDF_ACCESSIBILITY_USER_MESSAGE =
