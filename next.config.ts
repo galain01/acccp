@@ -7,6 +7,7 @@ const nextConfig: NextConfig = {
       "./node_modules/pdf-lib/dist/pdf-lib.min.js",
       "./lib/pdf-rendering-child.mjs",
       "./lib/pdf-image-alternatives.mjs",
+      "./lib/pdf-revisions.mjs",
       "./node_modules/pdfjs-dist/package.json",
       "./node_modules/pdfjs-dist/legacy/build/*.mjs",
       "./node_modules/pdfjs-dist/cmaps/**",
