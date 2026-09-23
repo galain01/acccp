@@ -42,6 +42,26 @@ deployment.
 
 Validation for this change: 162 existing conversion, heading-review,
 image-review, source-finding and closing-tag tests passed; TypeScript and ESLint
-passed. These checks verify integration and existing behavior with mocked model
-responses. A live-model conversion and Canvas save have not been tested with
-these revised prompts.
+passed. The production build and its traced native PDF-renderer smoke test passed
+locally on Windows/Node 24. These automated tests use mocked model responses.
+
+A live end-to-end conversion of the five-page synthetic Field Methods PDF on
+September 23 used gpt-5.6-sol-2026-07-09 for both stages. It completed in 77 seconds
+using 29,184 tokens and $0.216304 in gateway-reported cost. The generated tables
+used three column scopes and two row scopes, with no headers attributes or
+malformed closing tags. The inspected elements, attributes and inline styles
+were within the Canvas profile. Schedule dates, the sampling instruction, chart
+counts and equipment values were retained. The audit returned six warnings:
+image insertion, two unavailable link destinations, one unclear link label,
+and two heading-grouping reviews. The converter combined two Field notes
+headings; this run is not a zero-defect conversion result. This fixture has no
+numbering jump, so it does not test the separate ol/start generation rule. The
+generated output has not been saved in Canvas as part of this live-model check.
+
+A separate manual Canvas Page save test on September 23, 2026 preserved the
+header element and table IDs/scope, but removed td headers attributes and li
+value="7". The saved list displayed 3, 4, 5 instead of 3, 7, 8. This confirms
+those two compatibility concerns in the tested Page workflow; it does not
+replace a live-model evaluation of the revised prompts. See the
+[selectable output plan](output-formats-plan.md) for keeping Canvas rules
+specific to Canvas as other output formats are added.
