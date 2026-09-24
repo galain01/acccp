@@ -22,7 +22,7 @@ if (!serviceRoleKey)
 
 export const DOCUMENTS_BUCKET = "documents";
 
-export { DOCX_MIME_TYPE } from "./document-input";
+export { DOCX_MIME_TYPE, PPTX_MIME_TYPE } from "./document-input";
 
 const storage = createClient(supabaseUrl, serviceRoleKey, {
   auth: { persistSession: false, autoRefreshToken: false },
@@ -40,6 +40,26 @@ export function sourceDocxKey(sessionId: string, documentId: string): string {
 
 export function htmlOutputKey(sessionId: string, documentId: string): string {
   return `${sessionId}/${documentId}/output.html`;
+}
+
+export function sourcePptxKey(sessionId: string, documentId: string): string {
+  return `${sessionId}/${documentId}/source.pptx`;
+}
+
+export function pptxOutputKey(
+  sessionId: string,
+  documentId: string,
+  jobId: string
+): string {
+  return `${sessionId}/${documentId}/${jobId}/output.pptx`;
+}
+
+export function outputReviewKey(
+  sessionId: string,
+  documentId: string,
+  jobId: string
+): string {
+  return `${sessionId}/${documentId}/${jobId}/review.json`;
 }
 
 export async function uploadObject(
@@ -65,9 +85,14 @@ export async function downloadObject(key: string): Promise<Buffer> {
 /** The bucket is private, so downloads need a short-lived signed url. */
 export async function createSignedUrl(
   key: string,
-  expiresInSeconds = 60 * 5
+  expiresInSeconds = 60 * 5,
+  downloadFilename?: string
 ): Promise<string> {
-  const { data, error } = await storage.createSignedUrl(key, expiresInSeconds);
+  const { data, error } = await storage.createSignedUrl(
+    key,
+    expiresInSeconds,
+    downloadFilename ? { download: downloadFilename } : undefined
+  );
   if (error) throw new Error(`Signing failed for ${key}: ${error.message}`);
   return data.signedUrl;
 }

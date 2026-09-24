@@ -2,7 +2,10 @@
 
 import { Lock, LockOpen, X } from "lucide-react";
 import { useState } from "react";
-import { isSupportedDocumentFilename } from "@/lib/document-input";
+import {
+  DEFAULT_OUTPUT_TARGET,
+  isSupportedOutputForFilename,
+} from "@/lib/output-formats";
 import { formatBytes, formatUploadTime } from "@/lib/format";
 import type { ConversionStatus, UploadedDocument } from "@/lib/types/document";
 import { Badge } from "./badge";
@@ -33,7 +36,10 @@ interface DocumentTableProps {
   isProcessing: boolean;
 }
 
-function statusBadge(status: ConversionStatus): React.JSX.Element {
+function statusBadge(
+  status: ConversionStatus,
+  isPowerPoint = false
+): React.JSX.Element {
   switch (status) {
     case "idle":
       return <Badge variant="outline">Ready</Badge>;
@@ -44,7 +50,7 @@ function statusBadge(status: ConversionStatus): React.JSX.Element {
     case "success":
       return (
         <Badge className="bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">
-          Success
+          {isPowerPoint ? "Ready to review" : "Success"}
         </Badge>
       );
     case "error":
@@ -105,8 +111,8 @@ export default function DocumentTable({
         </CardHeader>
         <CardContent>
           <p className="text-sm text-muted-foreground">
-            Drag Word or PDF files onto the upload area above or click to
-            browse, then click{" "}
+            Choose an output format, then drag the matching files onto the
+            upload area above or click to browse, then click{" "}
             <strong className="font-medium text-foreground">Convert</strong> to
             start the conversion process.
           </p>
@@ -138,6 +144,7 @@ export default function DocumentTable({
                   <span className="sr-only">Conversion lock</span>
                 </TableHead>
                 <TableHead>Document name</TableHead>
+                <TableHead>Output format</TableHead>
                 <TableHead>Conversion status</TableHead>
                 <TableHead>File size</TableHead>
                 <TableHead>Upload time</TableHead>
@@ -150,7 +157,10 @@ export default function DocumentTable({
                   doc.status === "success" || doc.status === "error";
                 const canReconvert =
                   doc.status === "success" &&
-                  isSupportedDocumentFilename(doc.name);
+                  isSupportedOutputForFilename(
+                    doc.name,
+                    doc.outputTarget ?? DEFAULT_OUTPUT_TARGET
+                  );
 
                 return (
                   <TableRow key={doc.id}>
@@ -198,7 +208,15 @@ export default function DocumentTable({
                       )}
                     </TableCell>
                     <TableCell>
-                      {statusBadge(doc.status)}
+                      {doc.outputTarget === "accessible_pptx"
+                        ? "PowerPoint (.pptx)"
+                        : "Canvas HTML"}
+                    </TableCell>
+                    <TableCell>
+                      {statusBadge(
+                        doc.status,
+                        doc.outputTarget === "accessible_pptx"
+                      )}
                       {issueBadges(doc)}
                     </TableCell>
                     <TableCell>{formatBytes(doc.size)}</TableCell>

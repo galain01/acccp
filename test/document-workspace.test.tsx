@@ -9,6 +9,10 @@ import type { UploadedDocument } from "@/lib/types/document";
 vi.mock("@/lib/actions/documents", () => ({
   deleteDocument: vi.fn().mockResolvedValue(undefined),
   getDocumentHtml: vi.fn().mockResolvedValue("<h2>Saved result</h2>"),
+  getDocumentOutputDownload: vi.fn().mockResolvedValue({
+    url: "https://storage.example.test/result.pptx",
+    filename: "updated.pptx",
+  }),
 }));
 
 // Only replace the browser file picker. Selection, status changes, buttons,
@@ -35,6 +39,10 @@ vi.mock("@/components/ui/file-upload", () => ({
 
 import DocumentWorkspace from "@/components/ui/document-workspace";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import {
+  getDocumentHtml,
+  getDocumentOutputDownload,
+} from "@/lib/actions/documents";
 
 const SESSION_ID = "synthetic-session";
 let host: HTMLDivElement;
@@ -146,6 +154,17 @@ async function click(target: HTMLButtonElement) {
   await act(async () => target.click());
 }
 
+async function selectOutput(value: "canvas_html" | "accessible_pptx") {
+  const select = host.querySelector("select")!;
+  expect(host.querySelector(`label[for="${select.id}"]`)?.textContent).toBe(
+    "Output format"
+  );
+  await act(async () => {
+    select.value = value;
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+}
+
 function requests(): FormData[] {
   return fetchMock.mock.calls.map(([url, init]) => {
     expect(url).toBe("/api/convert");
@@ -158,6 +177,11 @@ function requests(): FormData[] {
 }
 
 beforeEach(() => {
+  vi.mocked(getDocumentHtml).mockResolvedValue("<h2>Saved result</h2>");
+  vi.mocked(getDocumentOutputDownload).mockResolvedValue({
+    url: "https://storage.example.test/result.pptx",
+    filename: "updated.pptx",
+  });
   vi.stubGlobal("React", React);
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal("fetch", fetchMock);
@@ -177,9 +201,174 @@ afterEach(async () => {
   host.remove();
   vi.unstubAllGlobals();
   vi.clearAllMocks();
+  vi.restoreAllMocks();
 });
 
 describe("DocumentWorkspace conversion selection", () => {
+  it("keeps each upload's output format when the selector changes and skips completed PowerPoints", async () => {
+    await mount([
+      savedDocument("done", "success", {
+        name: "done.pptx",
+        outputTarget: "accessible_pptx",
+      }),
+    ]);
+    await upload("article.pdf");
+    await selectOutput("accessible_pptx");
+    await upload("slides.pptx");
+    await selectOutput("canvas_html");
+    expect(row("article.pdf").textContent).toContain("Canvas HTML");
+    expect(row("slides.pptx").textContent).toContain("PowerPoint (.pptx)");
+    expect(row("done.pptx").textContent).toContain("Ready to review");
+    await click(button("Convert"));
+    expect(
+      requests().map((form) => [
+        (form.get("file") as File).name,
+        form.get("outputTarget"),
+      ])
+    ).toEqual([
+      ["article.pdf", "canvas_html"],
+      ["slides.pptx", "accessible_pptx"],
+    ]);
+    expect(button("Convert").disabled).toBe(true);
+    await click(button("Re-convert", row("done.pptx")));
+    expect(requests()[2].get("outputTarget")).toBe("accessible_pptx");
+    expect(requests()[2].get("documentId")).toBe("done");
+  });
+
+  it("does not accept a file belonging to the other selected output format", async () => {
+    await mount();
+    await upload("slides.pptx");
+    expect(host.querySelectorAll("tbody tr")).toHaveLength(0);
+    await selectOutput("accessible_pptx");
+    await upload("article.pdf");
+    expect(host.querySelectorAll("tbody tr")).toHaveLength(0);
+    expect(button("Convert").disabled).toBe(true);
+  });
+
+  it("shows PowerPoint changes and slide locations, downloads a fresh signed result, and never fetches HTML", async () => {
+    const downloadClick = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => {});
+    await mount([
+      savedDocument("slides", "success", {
+        name: "lecture.pptx",
+        outputTarget: "accessible_pptx",
+        changes: ["Slide 2: identified the existing title."],
+        errors: [
+          {
+            type: "other",
+            severity: "warning",
+            title: "Check the reading order",
+            message: "Check that the objects are read in a useful order.",
+            suggestion: "Open the Reading Order pane in PowerPoint.",
+            location: {
+              scope: "element",
+              sourcePages: [2],
+              printedPageLabel: null,
+              section: null,
+              locator: "Diagram",
+              quote: null,
+            },
+          },
+        ],
+      }),
+    ]);
+    await click(button("lecture.pptx"));
+    const dialog = document.body.querySelector('[role="dialog"]')!;
+    expect(dialog.textContent).toContain("Slide 2");
+    expect(dialog.textContent).toContain("identified the existing title");
+    expect(dialog.textContent).toContain("Accessibility Checker");
+    expect(dialog.textContent).not.toContain("PDF page");
+    expect(dialog.textContent).not.toContain("Copy HTML");
+    expect(dialog.textContent).not.toContain("View HTML output");
+    expect(dialog.textContent).not.toContain("online HTML copy is unavailable");
+    expect(getDocumentHtml).not.toHaveBeenCalled();
+    await click(button("Download PowerPoint", dialog));
+    await click(button("Download PowerPoint", dialog));
+    expect(getDocumentOutputDownload).toHaveBeenCalledTimes(2);
+    expect(getDocumentOutputDownload).toHaveBeenLastCalledWith(
+      "slides",
+      "accessible_pptx"
+    );
+    expect(downloadClick).toHaveBeenCalledTimes(2);
+  });
+
+  it("explains an expired PowerPoint download without offering HTML actions", async () => {
+    vi.mocked(getDocumentOutputDownload).mockResolvedValueOnce(null);
+    await mount([
+      savedDocument("expired", "success", {
+        name: "expired.pptx",
+        outputTarget: "accessible_pptx",
+      }),
+    ]);
+    await click(button("expired.pptx"));
+    const dialog = document.body.querySelector('[role="dialog"]')!;
+    await click(button("Download PowerPoint", dialog));
+    expect(dialog.querySelector('[role="alert"]')?.textContent).toContain(
+      "expire after 14 days"
+    );
+    expect(dialog.textContent).not.toContain("Copy HTML");
+    expect(getDocumentHtml).not.toHaveBeenCalled();
+  });
+
+  it("opens a newly completed PowerPoint response without an HTML field", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        documentId: "saved-slides",
+        jobId: "pptx-job",
+        outputTarget: "accessible_pptx",
+        changes: ["Slide 1: added a title for navigation."],
+        errors: [],
+        model: "deterministic",
+        tokensUsed: 0,
+      }),
+    } as Response);
+    await mount();
+    await selectOutput("accessible_pptx");
+    await upload("new-slides.pptx");
+    await click(button("Convert"));
+    expect(row("new-slides.pptx").textContent).toContain("Ready to review");
+    await click(button("new-slides.pptx"));
+    const dialog = document.body.querySelector('[role="dialog"]')!;
+    expect(dialog.textContent).toContain(
+      "Slide 1: added a title for navigation."
+    );
+    expect(button("Download PowerPoint", dialog).disabled).toBe(false);
+    expect(dialog.textContent).not.toContain("HTML");
+    expect(getDocumentHtml).not.toHaveBeenCalled();
+  });
+
+  it("uses the document output format for location labels even if finding metadata claims slides", async () => {
+    await mount([
+      savedDocument("article", "success", {
+        errors: [
+          {
+            type: "other",
+            severity: "warning",
+            title: "Check this section",
+            message: "Check this section.",
+            suggestion: "Compare it to the original.",
+            location: {
+              scope: "element",
+              sourceKind: "slide",
+              sourcePages: [3],
+              printedPageLabel: null,
+              section: null,
+              locator: null,
+              quote: null,
+            },
+          },
+        ],
+      }),
+    ]);
+    await click(button("article.pdf"));
+    const dialog = document.body.querySelector('[role="dialog"]')!;
+    expect(dialog.textContent).toContain("PDF page 3");
+    expect(dialog.textContent).not.toContain("Slide 3");
+    expect(getDocumentHtml).toHaveBeenCalledWith("article");
+  });
+
   it("distinguishes completed conversions needing review from failed conversions", async () => {
     await mount([
       savedDocument("needs-review", "success", {

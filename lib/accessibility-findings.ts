@@ -21,6 +21,8 @@ export type FindingCategory =
   | "content-fidelity";
 export interface FindingLocation {
   scope: "element" | "document";
+  /** Omitted for PDF sources. Presentation locations use measured slide indexes. */
+  sourceKind?: "slide";
   sourcePages: number[] | null;
   printedPageLabel: string | null;
   section: string | null;
@@ -86,6 +88,7 @@ export function readFindingLocation(
     new Set(pages).size === pages.length;
   return {
     scope,
+    ...(input.sourceKind === "slide" ? { sourceKind: "slide" as const } : {}),
     sourcePages: validPages ? [...pages].sort((a, b) => a - b) : null,
     printedPageLabel: validPages
       ? (boundedText(input.printedPageLabel, 40) ?? null)

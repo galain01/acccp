@@ -17,15 +17,17 @@ export default function ApplicationUsage(): React.JSX.Element {
         <DialogHeader>
           <DialogTitle>Usage</DialogTitle>
           <DialogDescription>
-            Convert Word documents and PDFs into accessible Canvas content.
+            Create Canvas HTML or improve the accessibility of a PowerPoint
+            file.
           </DialogDescription>
         </DialogHeader>
         <p className="font-medium">Follow the steps below to get started.</p>
         <ol className="list-inside list-decimal space-y-2 text-sm text-muted-foreground">
           <li>
-            Drop your Word (.docx) document or PDF onto the upload area or click
-            to browse. Each file can be up to 4 MB. Word documents are converted
-            to PDF automatically.
+            Choose your output format. Canvas HTML accepts Word (.docx)
+            documents and PDFs; PowerPoint output accepts PowerPoint (.pptx)
+            files. Drop files onto the upload area or click to browse. Each file
+            can be up to 4 MB.
           </li>
           <li>
             Click{" "}
@@ -33,12 +35,14 @@ export default function ApplicationUsage(): React.JSX.Element {
             start the conversion process.
           </li>
           <li>
-            Once conversion completes, click a document name to view, copy, and
-            download the converted HTML output.
+            Once processing completes, click a document name to download the
+            result and read the review items. Canvas HTML also offers a copy
+            option.
           </li>
           <li>
-            Review the accessibility findings and re-add any image placeholders
-            in Canvas before publishing.
+            For Canvas, review the findings and re-add any image placeholders
+            before publishing. For PowerPoint, review the changes and remaining
+            items, then run PowerPoint’s Accessibility Checker before sharing.
           </li>
         </ol>
       </DialogContent>

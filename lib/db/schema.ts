@@ -33,6 +33,8 @@ export const artifactType = pgEnum("artifact_type", [
   "html_output",
   "validation_report",
   "review_metadata",
+  "source_pptx",
+  "pptx_output",
 ]);
 export const findingSeverity = pgEnum("finding_severity", [
   "info",
@@ -477,6 +479,11 @@ export const conversionJobs = pgTable(
   {
     id: uuid().defaultRandom().primaryKey().notNull(),
     documentId: uuid("document_id").notNull(),
+    outputTarget: text("output_target")
+      .$type<"canvas_html" | "accessible_pptx">()
+      .default("canvas_html")
+      .notNull(),
+    profileVersion: text("profile_version").default("canvas-html-v1").notNull(),
     requestedByUserId: uuid("requested_by_user_id").notNull(),
     status: jobStatus().default("queued").notNull(),
     reviewStatus: reviewStatus("review_status").default("pending").notNull(),
@@ -549,7 +556,18 @@ export const conversionJobs = pgTable(
       foreignColumns: [users.id],
       name: "conversion_jobs_reviewed_by_user_id_fkey",
     }).onDelete("set null"),
+    // Keep the legacy arbiter during rollout: old servers still use
+    // ON CONFLICT(document_id), and this release has one target per input.
+    // Remove it only when a later release supports two outputs of one source.
     unique("conversion_jobs_one_job_per_document").on(table.documentId),
+    unique("conversion_jobs_one_job_per_document_target").on(
+      table.documentId,
+      table.outputTarget
+    ),
+    check(
+      "conversion_jobs_output_target_chk",
+      sql`output_target in ('canvas_html', 'accessible_pptx')`
+    ),
     check(
       "conversion_jobs_attempt_count_nonnegative_chk",
       sql`attempt_count >= 0`

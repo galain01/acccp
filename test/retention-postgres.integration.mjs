@@ -39,6 +39,11 @@ vi.mock("@/lib/storage", () => ({
   sourceDocxKey: (session, document) => `${session}/${document}/source.docx`,
   sourcePdfKey: (session, document) => `${session}/${document}/source.pdf`,
   htmlOutputKey: (session, document) => `${session}/${document}/output.html`,
+  sourcePptxKey: (session, document) => `${session}/${document}/source.pptx`,
+  pptxOutputKey: (session, document, job) =>
+    `${session}/${document}/${job}/output.pptx`,
+  outputReviewKey: (session, document, job) =>
+    `${session}/${document}/${job}/review.json`,
 }));
 
 import {
@@ -258,6 +263,12 @@ beforeAll(async () => {
       "utf8"
     )
   );
+  await pg.exec(
+    await readFile(
+      new URL("../drizzle/0013_powerpoint_outputs.sql", import.meta.url),
+      "utf8"
+    )
+  );
 });
 
 afterAll(async () => {
@@ -289,6 +300,78 @@ beforeEach(async () => {
 });
 
 describe("retention against in-memory PostgreSQL", () => {
+  it("defaults historical jobs to Canvas and supports both old and target-aware upserts during rollout", async () => {
+    const document = await seedDocument(1);
+    const legacy = await pg.query(
+      "SELECT output_target,profile_version FROM conversion_jobs WHERE id=$1",
+      [document.jobId]
+    );
+    expect(legacy.rows[0]).toEqual({
+      output_target: "canvas_html",
+      profile_version: "canvas-html-v1",
+    });
+    await pg.query(
+      "INSERT INTO conversion_jobs (document_id,requested_by_user_id) VALUES ($1,$2) ON CONFLICT(document_id) DO UPDATE SET attempt_count=1",
+      [document.id, ownerId]
+    );
+    await pg.query(
+      "INSERT INTO conversion_jobs (document_id,requested_by_user_id,output_target) VALUES ($1,$2,'canvas_html') ON CONFLICT(document_id,output_target) DO UPDATE SET attempt_count=2",
+      [document.id, ownerId]
+    );
+    await expect(
+      pg.query(
+        "INSERT INTO conversion_jobs (document_id,requested_by_user_id,output_target) VALUES ($1,$2,'accessible_pptx')",
+        [document.id, ownerId]
+      )
+    ).rejects.toThrow();
+    await expect(
+      pg.query(
+        "INSERT INTO conversion_jobs (document_id,requested_by_user_id,output_target) VALUES ($1,$2,'accessible_pdf')",
+        [document.id, ownerId]
+      )
+    ).rejects.toThrow();
+    const jobs = await pg.query(
+      "SELECT count(*)::int as total,max(attempt_count)::int as attempts FROM conversion_jobs WHERE document_id=$1",
+      [document.id]
+    );
+    expect(jobs.rows[0]).toEqual({ total: 1, attempts: 2 });
+  });
+
+  it("purges PowerPoint originals and orphaned job outputs while retaining every target's usage", async () => {
+    const document = await seedDocument(360);
+    const canvasDocument = await seedDocument(360);
+    const pptxJob = document.jobId;
+    await pg.query(
+      "UPDATE conversion_jobs SET output_target='accessible_pptx',profile_version='powerpoint-v1' WHERE id=$1",
+      [pptxJob]
+    );
+    await pg.query(
+      "INSERT INTO model_calls (job_id,stage,model,prompt_tokens,completion_tokens,cost_usd) VALUES ($1,'convert','synthetic-pptx',25,10,0.002)",
+      [pptxJob]
+    );
+    const base = `${sessionId}/${document.id}`;
+    for (const key of [
+      `${base}/source.pptx`,
+      `${base}/${pptxJob}/output.pptx`,
+      `${base}/${pptxJob}/review.json`,
+    ])
+      blobs.set(key, "synthetic private deck");
+    const before = await combinedMetrics();
+    expect(await purgeDocumentIfEligible(document.id)).toBe("purged");
+    expect(await purgeDocumentIfEligible(canvasDocument.id)).toBe("purged");
+    expect(blobs.size).toBe(0);
+    expect(await combinedMetrics()).toEqual(before);
+    const jobs = await pg.query(
+      "SELECT sum(job_count)::int as total FROM retained_job_metrics"
+    );
+    expect(jobs.rows[0].total).toBe(2);
+    const orphaned = await pg.query(
+      "SELECT count(*)::int as total FROM conversion_jobs WHERE document_id=$1",
+      [document.id]
+    );
+    expect(orphaned.rows[0].total).toBe(0);
+  });
+
   it("preserves latest-attempt pages, all-attempt tokens and exact duration frequencies by original job cohort", async () => {
     const measured = await seedDocument(360);
     const sameDuration = await seedDocument(360);
@@ -970,14 +1053,12 @@ describe("anonymous failure history", () => {
     const failedAt = new Date().toISOString();
     const day = failedAt.slice(0, 10);
     await withRetainedDocument(document.id, async (tx) => {
-      await tx
-        .insert(schema.jobEvents)
-        .values({
-          jobId: document.jobId,
-          eventType: "conversion_failed",
-          message: "Controlled explanation",
-          metadata: { diagnostic },
-        });
+      await tx.insert(schema.jobEvents).values({
+        jobId: document.jobId,
+        eventType: "conversion_failed",
+        message: "Controlled explanation",
+        metadata: { diagnostic },
+      });
       await recordFailureCount(tx, diagnostic, failedAt);
       await recordFailureCount(
         tx,
@@ -1015,14 +1096,12 @@ describe("anonymous failure history", () => {
     const document = await seedDocument(1);
     await expect(
       withRetainedDocument(document.id, async (tx) => {
-        await tx
-          .insert(schema.jobEvents)
-          .values({
-            jobId: document.jobId,
-            eventType: "conversion_failed",
-            message: "Controlled explanation",
-            metadata: { diagnostic },
-          });
+        await tx.insert(schema.jobEvents).values({
+          jobId: document.jobId,
+          eventType: "conversion_failed",
+          message: "Controlled explanation",
+          metadata: { diagnostic },
+        });
         await recordFailureCount(tx, diagnostic, new Date().toISOString());
         throw new Error("Synthetic failure before commit");
       })

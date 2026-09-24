@@ -113,7 +113,8 @@ export default function HomePage(): React.JSX.Element {
         </h1>
         <p className="text-sm text-muted-foreground">
           Convert your Word and PDF course content into accessible Canvas-ready
-          HTML.
+          HTML, or improve a PowerPoint presentation and download an updated
+          .pptx file.
         </p>
       </header>
       {step === "email" ? (

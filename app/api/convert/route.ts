@@ -1,7 +1,7 @@
 /**
  * POST /api/convert
  *
- * Converts a .pdf or .docx into accessible Canvas HTML and persists the document, the
+ * Converts PDF/DOCX to Canvas HTML or remediates PPTX in its native format, preserving the
  * conversion job, its artifacts, and its accessibility findings.
  *
  * Request:  multipart/form-data
@@ -33,6 +33,15 @@ import { NextRequest, NextResponse } from "next/server";
 import { and, eq, isNull, sql } from "drizzle-orm";
 
 import { verifyRoleOrUnauthorized } from "@/lib/auth";
+import { convertPowerPoint } from "@/lib/powerpoint-convert";
+import {
+  DEFAULT_OUTPUT_TARGET,
+  isOutputTarget,
+  isSupportedOutputForFilename,
+  OUTPUT_PROFILES,
+  outputFilename,
+  readOutputChanges,
+} from "@/lib/output-formats";
 import {
   convertPdf,
   type AccessibilityError,
@@ -41,9 +50,11 @@ import {
 import {
   DOCX_MIME_TYPE,
   isDocxFilename,
+  isPptxFilename,
   isSupportedDocumentFilename,
   MAX_FILE_SIZE_BYTES,
   PDF_MIME_TYPE,
+  PPTX_MIME_TYPE,
   validateDocumentInput,
 } from "@/lib/document-input";
 import { renderWordToPdf, WordToPdfError } from "@/lib/word-to-pdf";
@@ -75,8 +86,11 @@ import {
 import {
   downloadObject,
   htmlOutputKey,
+  pptxOutputKey,
+  outputReviewKey,
   sourceDocxKey,
   sourcePdfKey,
+  sourcePptxKey,
   uploadObject,
 } from "@/lib/storage";
 
@@ -176,6 +190,11 @@ async function convertRequest(req: NextRequest) {
   if (typeof sessionId !== "string" || !sessionId) {
     return json({ error: "No sessionId provided." }, 400);
   }
+  const outputTarget = formData.get("outputTarget") ?? DEFAULT_OUTPUT_TARGET;
+  if (!isOutputTarget(outputTarget)) {
+    return json({ error: "Choose a supported output format." }, 400);
+  }
+  const profileVersion = OUTPUT_PROFILES[outputTarget].version;
 
   // Establishes ownership for every write below.
   const [session] = await db
@@ -221,7 +240,16 @@ async function convertRequest(req: NextRequest) {
       return json(
         {
           error:
-            "This document format cannot be converted. Upload a PDF or Word (.docx) file.",
+            "This document format cannot be converted. Upload a PDF, Word (.docx), or PowerPoint (.pptx) file.",
+        },
+        415
+      );
+    }
+    if (!isSupportedOutputForFilename(filename, outputTarget)) {
+      return json(
+        {
+          error:
+            "Choose Accessible PowerPoint for a .pptx file, or Canvas HTML for a PDF or Word file.",
         },
         415
       );
@@ -229,9 +257,11 @@ async function convertRequest(req: NextRequest) {
     try {
       sourceBuffer = await withRetainedDocument(documentId, async () =>
         downloadObject(
-          isDocxFilename(filename)
-            ? sourceDocxKey(sessionId, documentId)
-            : sourcePdfKey(sessionId, documentId)
+          isPptxFilename(filename)
+            ? sourcePptxKey(sessionId, documentId)
+            : isDocxFilename(filename)
+              ? sourceDocxKey(sessionId, documentId)
+              : sourcePdfKey(sessionId, documentId)
         )
       );
     } catch (error) {
@@ -251,7 +281,8 @@ async function convertRequest(req: NextRequest) {
     if (!file || !(file instanceof File)) {
       return json(
         {
-          error: "No file provided. Include a PDF or Word (.docx) file.",
+          error:
+            "No file provided. Include a PDF, Word (.docx), or PowerPoint (.pptx) file.",
         },
         400
       );
@@ -260,7 +291,16 @@ async function convertRequest(req: NextRequest) {
       return json(
         {
           error:
-            "Upload a PDF or Word (.docx) file. Older .doc files must be saved as .docx first.",
+            "Upload a PDF, Word (.docx), or PowerPoint (.pptx) file. Older .doc or .ppt files must be saved in their current format first.",
+        },
+        415
+      );
+    }
+    if (!isSupportedOutputForFilename(file.name, outputTarget)) {
+      return json(
+        {
+          error:
+            "Choose Accessible PowerPoint for a .pptx file, or Canvas HTML for a PDF or Word file.",
         },
         415
       );
@@ -289,6 +329,7 @@ async function convertRequest(req: NextRequest) {
   const processingStartedAt = performance.now();
   const startedAt = new Date().toISOString();
   const isWord = isDocxFilename(filename);
+  const isPowerPoint = isPptxFilename(filename);
   const pdfFilename = isWord ? filename.replace(/\.docx$/i, ".pdf") : filename;
   let buffer: Buffer;
   try {
@@ -315,8 +356,12 @@ async function convertRequest(req: NextRequest) {
     }
     return json({ error: describeJobDiagnostic(diagnostic) }, error.status);
   }
-  const sourceMimeType = isWord ? DOCX_MIME_TYPE : PDF_MIME_TYPE;
-  const pageCount = await countPdfPages(buffer);
+  const sourceMimeType = isPowerPoint
+    ? PPTX_MIME_TYPE
+    : isWord
+      ? DOCX_MIME_TYPE
+      : PDF_MIME_TYPE;
+  const pageCount = isPowerPoint ? null : await countPdfPages(buffer);
 
   if (!isReconversion) {
     const [created] = await db
@@ -332,9 +377,11 @@ async function convertRequest(req: NextRequest) {
       .returning({ id: documents.id });
     documentId = created.id;
 
-    const sourceKey = isWord
-      ? sourceDocxKey(sessionId, documentId)
-      : sourcePdfKey(sessionId, documentId);
+    const sourceKey = isPowerPoint
+      ? sourcePptxKey(sessionId, documentId)
+      : isWord
+        ? sourceDocxKey(sessionId, documentId)
+        : sourcePdfKey(sessionId, documentId);
     // Every blob write takes the same document lock as the purge. A failed
     // upload keeps a tombstone until storage cleanup actually succeeds.
     try {
@@ -360,13 +407,15 @@ async function convertRequest(req: NextRequest) {
     }
   }
 
-  // conversion_jobs is unique per document, so a re-convert updates in place.
+  // Each destination has its own job; retries update only that destination.
   const job = await withRetainedDocument(documentId, async (tx, document) => {
     const expiresAt = retentionExpiresAt(document.createdAt);
     const [savedJob] = await tx
       .insert(conversionJobs)
       .values({
         documentId,
+        outputTarget,
+        profileVersion,
         requestedByUserId: userId,
         status: "processing",
         startedAt,
@@ -377,9 +426,10 @@ async function convertRequest(req: NextRequest) {
         processingDurationMs: null,
       })
       .onConflictDoUpdate({
-        target: conversionJobs.documentId,
+        target: [conversionJobs.documentId, conversionJobs.outputTarget],
         set: {
           status: "processing",
+          profileVersion,
           startedAt,
           completedAt: null,
           errorCode: null,
@@ -403,7 +453,9 @@ async function convertRequest(req: NextRequest) {
 
   // Deliberately outside a transaction: this is a multi-second model call and
   // would pin a pooled connection for its whole duration.
-  let result = await convertPdf(buffer, pdfFilename);
+  let result = isPowerPoint
+    ? await convertPowerPoint(sourceBuffer, filename)
+    : await convertPdf(buffer, pdfFilename);
 
   if ("error" in result) {
     const diagnostic = createJobDiagnostic({
@@ -420,12 +472,29 @@ async function convertRequest(req: NextRequest) {
     );
 
     console.error(`[api/convert] job=${jobId} failed: ${diagnostic.code}`);
-    return json({ error: "Conversion failed", detail, jobId, documentId }, 500);
+    return json(
+      { error: "Conversion failed", detail, jobId, documentId, outputTarget },
+      500
+    );
   }
 
-  if (isWord) result = withWordRenderingReview(result);
+  if (isWord && "html" in result) result = withWordRenderingReview(result);
 
-  const htmlKey = htmlOutputKey(sessionId, documentId);
+  const outputKey = isPowerPoint
+    ? pptxOutputKey(sessionId, documentId, jobId)
+    : htmlOutputKey(sessionId, documentId);
+  const outputBody = "pptx" in result ? result.pptx : result.html;
+  const outputMimeType = isPowerPoint
+    ? PPTX_MIME_TYPE
+    : "text/html; charset=utf-8";
+  const changes = "changes" in result ? readOutputChanges(result.changes) : [];
+  const reviewKey = outputReviewKey(sessionId, documentId, jobId);
+  const reviewBody = JSON.stringify({
+    outputTarget,
+    profileVersion,
+    changes,
+    findings: result.errors,
+  });
   const savingStartedAt = performance.now();
   try {
     await withRetainedDocument(documentId, async (tx, document) => {
@@ -439,7 +508,9 @@ async function convertRequest(req: NextRequest) {
           PDF_MIME_TYPE
         );
       }
-      await uploadObject(htmlKey, result.html, "text/html; charset=utf-8");
+      await uploadObject(outputKey, outputBody, outputMimeType);
+      if (isPowerPoint)
+        await uploadObject(reviewKey, reviewBody, "application/json");
 
       const artifactsUpdatedAt = new Date().toISOString();
 
@@ -458,22 +529,49 @@ async function convertRequest(req: NextRequest) {
               },
             ]
           : []),
+        ...(isPowerPoint
+          ? [
+              {
+                artifactType: "source_pptx" as const,
+                filename,
+                mimeType: PPTX_MIME_TYPE,
+                storageKey: sourcePptxKey(sessionId, documentId),
+                fileSizeBytes: sourceBuffer.byteLength,
+                previewSnippet: null,
+              },
+            ]
+          : [
+              {
+                artifactType: "source_pdf" as const,
+                filename: pdfFilename,
+                mimeType: PDF_MIME_TYPE,
+                storageKey: sourcePdfKey(sessionId, documentId),
+                fileSizeBytes: buffer.byteLength,
+                previewSnippet: null,
+              },
+            ]),
         {
-          artifactType: "source_pdf" as const,
-          filename: pdfFilename,
-          mimeType: PDF_MIME_TYPE,
-          storageKey: sourcePdfKey(sessionId, documentId),
-          fileSizeBytes: buffer.byteLength,
-          previewSnippet: null,
+          artifactType: isPowerPoint
+            ? ("pptx_output" as const)
+            : ("html_output" as const),
+          filename: outputFilename(filename, outputTarget),
+          mimeType: isPowerPoint ? PPTX_MIME_TYPE : "text/html",
+          storageKey: outputKey,
+          fileSizeBytes: Buffer.byteLength(outputBody),
+          previewSnippet: "html" in result ? result.html.slice(0, 500) : null,
         },
-        {
-          artifactType: "html_output" as const,
-          filename: filename.replace(/\.(?:pdf|docx)$/i, ".html"),
-          mimeType: "text/html",
-          storageKey: htmlKey,
-          fileSizeBytes: Buffer.byteLength(result.html),
-          previewSnippet: result.html.slice(0, 500),
-        },
+        ...(isPowerPoint
+          ? [
+              {
+                artifactType: "review_metadata" as const,
+                filename: "review.json",
+                mimeType: "application/json",
+                storageKey: reviewKey,
+                fileSizeBytes: Buffer.byteLength(reviewBody),
+                previewSnippet: null,
+              },
+            ]
+          : []),
       ]) {
         await tx
           .insert(artifacts)
@@ -534,22 +632,26 @@ async function convertRequest(req: NextRequest) {
           tokensUsed: result.tokensUsed,
           findingCount: result.errors.length,
           extractionWarnings: result.extractionWarnings,
+          outputTarget,
+          profileVersion,
+          changes,
         },
       });
 
-      await tx.insert(modelCalls).values(
-        result.calls.map((call) => ({
-          jobId,
-          stage: call.stage,
-          model: call.model,
-          promptTokens: call.promptTokens,
-          completionTokens: call.completionTokens,
-          cachedPromptTokens: call.cachedPromptTokens ?? null,
-          cacheCreationPromptTokens: call.cacheCreationPromptTokens ?? null,
-          costSource: call.costSource ?? null,
-          costUsd: call.costUsd !== null ? String(call.costUsd) : null,
-        }))
-      );
+      if (result.calls.length > 0)
+        await tx.insert(modelCalls).values(
+          result.calls.map((call) => ({
+            jobId,
+            stage: call.stage,
+            model: call.model,
+            promptTokens: call.promptTokens,
+            completionTokens: call.completionTokens,
+            cachedPromptTokens: call.cachedPromptTokens ?? null,
+            cacheCreationPromptTokens: call.cacheCreationPromptTokens ?? null,
+            costSource: call.costSource ?? null,
+            costUsd: call.costUsd !== null ? String(call.costUsd) : null,
+          }))
+        );
 
       // Complete last so duration includes every successful artifact, finding,
       // event and model-call write. A rollback leaves no successful duration.
@@ -587,7 +689,7 @@ async function convertRequest(req: NextRequest) {
       result.calls
     );
     console.error(`[api/convert] job=${jobId} output persistence failed`);
-    return json({ error: message, jobId, documentId }, 500);
+    return json({ error: message, jobId, documentId, outputTarget }, 500);
   }
 
   console.log(
@@ -597,7 +699,10 @@ async function convertRequest(req: NextRequest) {
   return NextResponse.json({
     jobId,
     documentId,
-    html: result.html,
+    outputTarget,
+    profileVersion,
+    changes,
+    ...("html" in result ? { html: result.html } : {}),
     errors: result.errors,
     model: result.model,
     tokensUsed: result.tokensUsed,

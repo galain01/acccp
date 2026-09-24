@@ -112,6 +112,7 @@ interface RendererWaiter {
   timer: ReturnType<typeof setTimeout>;
   deadline: number;
   elapsed: () => number;
+  expirationError: () => PdfRenderingError;
 }
 interface RendererQueue {
   active: boolean;
@@ -149,7 +150,7 @@ function rendererRelease(): ReleaseRenderer {
       clearTimeout(waiter.timer);
       // Honor the deadline even if a blocked event loop delayed its timer.
       if (performance.now() >= waiter.deadline) {
-        waiter.reject(rendererBusy(waiter.elapsed));
+        waiter.reject(waiter.expirationError());
         continue;
       }
       waiter.resolve(rendererRelease());
@@ -160,7 +161,8 @@ function rendererRelease(): ReleaseRenderer {
 }
 
 function acquireRenderer(
-  elapsed: () => number
+  elapsed: () => number,
+  requestDeadline?: number
 ): ReleaseRenderer | Promise<ReleaseRenderer> {
   if (!rendererQueue.active) {
     rendererQueue.active = true;
@@ -168,18 +170,29 @@ function acquireRenderer(
   }
   if (rendererQueue.waiting.length >= PDF_RENDERING_QUEUE_LIMITS.maxWaiting)
     throw rendererBusy(elapsed);
+  const queueTimeout = Math.min(
+    PDF_RENDERING_QUEUE_LIMITS.timeoutMs,
+    requestDeadline === undefined
+      ? Infinity
+      : Math.max(0, requestDeadline - performance.now())
+  );
+  const expirationError = () =>
+    requestDeadline !== undefined && performance.now() >= requestDeadline
+      ? renderingError("pdf_timeout", undefined, elapsed())
+      : rendererBusy(elapsed);
   return new Promise((resolve, reject) => {
     const waiter: RendererWaiter = {
       resolve,
       reject,
       elapsed,
-      deadline: performance.now() + PDF_RENDERING_QUEUE_LIMITS.timeoutMs,
+      expirationError,
+      deadline: performance.now() + queueTimeout,
       timer: setTimeout(() => {
         const index = rendererQueue.waiting.indexOf(waiter);
         if (index === -1) return;
         rendererQueue.waiting.splice(index, 1);
-        reject(rendererBusy(elapsed));
-      }, PDF_RENDERING_QUEUE_LIMITS.timeoutMs),
+        reject(expirationError());
+      }, queueTimeout),
     };
     rendererQueue.waiting.push(waiter);
   });
@@ -353,9 +366,27 @@ function parseResult(value: unknown): RenderedPdf {
  * The child has no inherited app environment, bounded pipes and an OS process
  * deadline. Native memory is isolated from the parent JS heap, not OS-sandboxed.
  */
-export async function renderPdfPages(buffer: Buffer): Promise<RenderedPdf> {
+export async function renderPdfPages(
+  buffer: Buffer,
+  options: { timeoutMs?: number } = {}
+): Promise<RenderedPdf> {
   const started = performance.now();
   const elapsed = () => Math.max(0, Math.round(performance.now() - started));
+  const timeout = options.timeoutMs;
+  if (
+    timeout !== undefined &&
+    (!Number.isFinite(timeout) ||
+      timeout < 1 ||
+      timeout >
+        PDF_RENDERING_QUEUE_LIMITS.timeoutMs + PDF_RENDERING_LIMITS.timeoutMs)
+  ) {
+    throw new RangeError(
+      "PDF rendering timeout must be between 1 and 120000 milliseconds."
+    );
+  }
+  // An explicit caller budget covers queue time and rendering together. Omitted
+  // budgets preserve the existing 30-second queue and 90-second active limits.
+  const requestDeadline = timeout === undefined ? undefined : started + timeout;
   if (
     !Buffer.isBuffer(buffer) ||
     buffer.length > MAX_FILE_SIZE_BYTES ||
@@ -363,9 +394,11 @@ export async function renderPdfPages(buffer: Buffer): Promise<RenderedPdf> {
   ) {
     throw renderingError("pdf_invalid", undefined, elapsed());
   }
-  const slot = acquireRenderer(elapsed);
+  const slot = acquireRenderer(elapsed, requestDeadline);
   const release = typeof slot === "function" ? slot : await slot;
   try {
+    if (requestDeadline !== undefined && performance.now() >= requestDeadline)
+      throw renderingError("pdf_timeout", undefined, elapsed());
     // Queued requests retain only their original bytes, not another base64 copy.
     const request = JSON.stringify({ pdf: buffer.toString("base64") });
     if (Buffer.byteLength(request) > MAX_STDIN_BYTES)
@@ -377,6 +410,8 @@ export async function renderPdfPages(buffer: Buffer): Promise<RenderedPdf> {
     if (process.platform === "win32" && process.env.SystemRoot) {
       env.SystemRoot = process.env.SystemRoot;
     }
+    if (requestDeadline !== undefined && performance.now() >= requestDeadline)
+      throw renderingError("pdf_timeout", undefined, elapsed());
 
     return await new Promise<RenderedPdf>((resolve, reject) => {
       let child: ReturnType<typeof spawn>;
@@ -417,7 +452,12 @@ export async function renderPdfPages(buffer: Buffer): Promise<RenderedPdf> {
       };
       const timer = setTimeout(
         () => stop("pdf_timeout"),
-        PDF_RENDERING_LIMITS.timeoutMs
+        Math.min(
+          PDF_RENDERING_LIMITS.timeoutMs,
+          requestDeadline === undefined
+            ? Infinity
+            : Math.max(0, requestDeadline - performance.now())
+        )
       );
       child.stdout?.on("data", (chunk: Buffer) => {
         stdoutBytes += chunk.length;
@@ -444,6 +484,11 @@ export async function renderPdfPages(buffer: Buffer): Promise<RenderedPdf> {
           return;
         }
         try {
+          if (
+            requestDeadline !== undefined &&
+            performance.now() >= requestDeadline
+          )
+            throw renderingError("pdf_timeout");
           const value: unknown = JSON.parse(
             Buffer.concat(chunks).toString("utf8")
           );
@@ -457,7 +502,13 @@ export async function renderPdfPages(buffer: Buffer): Promise<RenderedPdf> {
             );
           }
           if (code !== 0) throw renderingError("pdf_worker_failed");
-          resolve(parseResult(value));
+          const result = parseResult(value);
+          if (
+            requestDeadline !== undefined &&
+            performance.now() >= requestDeadline
+          )
+            throw renderingError("pdf_timeout");
+          resolve(result);
         } catch (error) {
           const diagnostic =
             error instanceof PdfRenderingError

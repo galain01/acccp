@@ -1,8 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { deleteDocument } from "@/lib/actions/documents";
-import { isSupportedDocumentFilename } from "@/lib/document-input";
+import {
+  DEFAULT_OUTPUT_TARGET,
+  isSupportedOutputForFilename,
+  type OutputTarget,
+} from "@/lib/output-formats";
 import type { UploadedDocument } from "@/lib/types/document";
 import { Button } from "./button";
 import DocumentTable from "./document-table";
@@ -17,7 +21,10 @@ function isBatchTarget(doc: UploadedDocument): boolean {
   return (
     !doc.locked &&
     (doc.status === "idle" || doc.status === "error") &&
-    isSupportedDocumentFilename(doc.name)
+    isSupportedOutputForFilename(
+      doc.name,
+      doc.outputTarget ?? DEFAULT_OUTPUT_TARGET
+    )
   );
 }
 
@@ -27,6 +34,10 @@ export default function DocumentWorkspace({
 }: DocumentWorkspaceProps): React.JSX.Element {
   const [documents, setDocuments] =
     useState<UploadedDocument[]>(initialDocuments);
+  const [outputTarget, setOutputTarget] = useState<OutputTarget>(
+    DEFAULT_OUTPUT_TARGET
+  );
+  const outputFormatId = useId();
   const abortControllersRef = useRef<Map<string, AbortController>>(new Map());
 
   const isProcessing = documents.some(
@@ -35,7 +46,11 @@ export default function DocumentWorkspace({
   const hasDocuments = documents.length > 0;
   const canConvert = documents.some(isBatchTarget) && !isProcessing;
   const hasUnsupportedDocuments = documents.some(
-    (doc) => !isSupportedDocumentFilename(doc.name)
+    (doc) =>
+      !isSupportedOutputForFilename(
+        doc.name,
+        doc.outputTarget ?? DEFAULT_OUTPUT_TARGET
+      )
   );
 
   useEffect(() => {
@@ -55,21 +70,28 @@ export default function DocumentWorkspace({
     []
   );
 
-  const addDocuments = useCallback((files: File[]) => {
-    if (files.length === 0) return;
-    setDocuments((prev) => [
-      ...prev,
-      ...files.map((file) => ({
-        id: crypto.randomUUID(),
-        name: file.name,
-        size: file.size,
-        uploadedAt: new Date(),
-        status: "idle" as const,
-        locked: false,
-        file,
-      })),
-    ]);
-  }, []);
+  const addDocuments = useCallback(
+    (files: File[]) => {
+      const compatibleFiles = files.filter((file) =>
+        isSupportedOutputForFilename(file.name, outputTarget)
+      );
+      if (compatibleFiles.length === 0) return;
+      setDocuments((prev) => [
+        ...prev,
+        ...compatibleFiles.map((file) => ({
+          id: crypto.randomUUID(),
+          name: file.name,
+          size: file.size,
+          uploadedAt: new Date(),
+          status: "idle" as const,
+          locked: false,
+          outputTarget,
+          file,
+        })),
+      ]);
+    },
+    [outputTarget]
+  );
 
   const toggleDocumentLock = useCallback((docId: string) => {
     setDocuments((prev) =>
@@ -95,12 +117,16 @@ export default function DocumentWorkspace({
   const convertDocument = useCallback(
     async (doc: UploadedDocument) => {
       if (
-        !isSupportedDocumentFilename(doc.name) ||
+        !isSupportedOutputForFilename(
+          doc.name,
+          doc.outputTarget ?? DEFAULT_OUTPUT_TARGET
+        ) ||
         abortControllersRef.current.has(doc.id)
       )
         return;
       const form = new FormData();
       form.append("sessionId", sessionId);
+      form.append("outputTarget", doc.outputTarget ?? DEFAULT_OUTPUT_TARGET);
 
       // A stored document is re-read from storage; a freshly picked one is sent.
       if (doc.documentId) form.append("documentId", doc.documentId);
@@ -120,6 +146,7 @@ export default function DocumentWorkspace({
         html: undefined,
         errorMessage: undefined,
         errors: undefined,
+        changes: undefined,
       });
 
       try {
@@ -152,7 +179,9 @@ export default function DocumentWorkspace({
         updateDocument(doc.id, {
           status: "success",
           documentId: data.documentId,
-          html: data.html,
+          jobId: data.jobId,
+          html: doc.outputTarget === "accessible_pptx" ? undefined : data.html,
+          changes: data.changes,
           errorMessage: undefined,
           errors: data.errors,
         });
@@ -196,16 +225,50 @@ export default function DocumentWorkspace({
   return (
     <div className="mt-8 flex flex-col gap-6">
       <section className="flex flex-col gap-2">
+        <label
+          htmlFor={outputFormatId}
+          className="text-sm font-medium text-foreground"
+        >
+          Output format
+        </label>
+        <select
+          id={outputFormatId}
+          value={outputTarget}
+          disabled={isProcessing}
+          aria-describedby={`${outputFormatId}-description`}
+          onChange={(event) =>
+            setOutputTarget(event.target.value as OutputTarget)
+          }
+          className="h-10 w-full rounded-lg border border-input bg-background px-3 text-sm focus-visible:outline-2 focus-visible:outline-ring disabled:opacity-50 sm:max-w-sm"
+        >
+          <option value="canvas_html">Canvas HTML</option>
+          <option value="accessible_pptx">PowerPoint (.pptx)</option>
+        </select>
+        <p
+          id={`${outputFormatId}-description`}
+          className="text-sm text-muted-foreground"
+        >
+          {outputTarget === "accessible_pptx"
+            ? "Upload a PowerPoint (.pptx) to improve its accessibility and download an updated PowerPoint file."
+            : "Upload a Word (.docx) document or PDF to create HTML for Canvas."}
+          {hasDocuments &&
+            " This choice applies to new uploads. Documents already listed keep their output format."}
+        </p>
         <h2 className="text-sm font-medium text-foreground">
           Upload documents
         </h2>
-        <FileUpload onFilesSelected={addDocuments} disabled={isProcessing} />
+        <FileUpload
+          key={outputTarget}
+          outputTarget={outputTarget}
+          onFilesSelected={addDocuments}
+          disabled={isProcessing}
+        />
         <p className="text-sm text-muted-foreground">
-          Download the HTML you want to keep. Online copies of originals,
-          generated PDFs, and HTML expire 14 days after the document is first
-          saved for conversion. Re-converting does not extend this period.
-          Expired online copies become unavailable and are queued for daily
-          cleanup. Files on your computer are unaffected.
+          Download the results you want to keep. Online copies of originals and
+          converted files expire 14 days after the document is first saved for
+          conversion. Re-converting does not extend this period. Expired online
+          copies become unavailable and are queued for daily cleanup. Files on
+          your computer are unaffected.
         </p>
       </section>
 
@@ -215,7 +278,8 @@ export default function DocumentWorkspace({
         </Button>
         {!hasDocuments && (
           <p className="mt-2 text-sm text-muted-foreground">
-            Upload at least one Word document or PDF to enable conversion.
+            Upload at least one file for your selected output format to enable
+            conversion.
           </p>
         )}
         {hasDocuments && !isProcessing && (
@@ -227,15 +291,15 @@ export default function DocumentWorkspace({
         )}
         {hasUnsupportedDocuments && (
           <p className="mt-2 text-sm text-muted-foreground">
-            Previous conversions remain available until they expire. Only PDF
-            and .docx documents can be converted. Save older .doc files as .docx
-            before uploading.
+            Previous conversions remain available until they expire. Canvas HTML
+            accepts PDF and .docx files; PowerPoint output accepts .pptx files.
+            Save older .doc or .ppt files in the newer format before uploading.
           </p>
         )}
         {hasDocuments && isProcessing && (
           <p className="mt-2 text-sm text-muted-foreground">
-            Conversion in progress… Word files are prepared as PDFs
-            automatically.
+            Conversion in progress… Each document uses the output format shown
+            in its row. This may take several minutes.
           </p>
         )}
       </section>

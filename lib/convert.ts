@@ -104,7 +104,7 @@ export interface ConversionError {
   calls?: ModelCallUsage[];
 }
 
-async function toModelCallUsage(
+export async function toModelCallUsage(
   stage: ModelCallUsage["stage"],
   call: LiteLLMCallResult,
   config: Pick<LiteLLMConfig, "baseUrl" | "apiKey">

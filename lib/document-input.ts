@@ -3,13 +3,23 @@ export const MAX_FILE_SIZE_BYTES = 4 * 1024 * 1024;
 export const PDF_MIME_TYPE = "application/pdf";
 export const DOCX_MIME_TYPE =
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+export const PPTX_MIME_TYPE =
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+
+export function isPptxFilename(filename: string): boolean {
+  return filename.toLowerCase().endsWith(".pptx");
+}
 
 export function isDocxFilename(filename: string): boolean {
   return filename.toLowerCase().endsWith(".docx");
 }
 
 export function isSupportedDocumentFilename(filename: string): boolean {
-  return isPdfFilename(filename) || isDocxFilename(filename);
+  return (
+    isPdfFilename(filename) ||
+    isDocxFilename(filename) ||
+    isPptxFilename(filename)
+  );
 }
 
 export function isPdfFilename(filename: string): boolean {
@@ -51,12 +61,14 @@ export function validateDocumentInput(
   filename: string
 ): string | null {
   if (isPdfFilename(filename)) return validatePdfInput(buffer, filename);
-  if (!isDocxFilename(filename)) {
-    return "Upload a PDF or Word (.docx) file. Older .doc files must be saved as .docx first.";
+  const isPowerPoint = isPptxFilename(filename);
+  if (!isDocxFilename(filename) && !isPowerPoint) {
+    return "Upload a PDF, Word (.docx), or PowerPoint (.pptx) file. Older .doc or .ppt files must be saved in their current format first.";
   }
-  if (buffer.byteLength === 0) return "The Word file is empty.";
+  const format = isPowerPoint ? "PowerPoint" : "Word";
+  if (buffer.byteLength === 0) return `The ${format} file is empty.`;
   if (buffer.byteLength > MAX_FILE_SIZE_BYTES) {
-    return "File too large. Maximum Word file size is 4 MB.";
+    return `File too large. Maximum ${format} file size is 4 MB.`;
   }
   if (
     buffer.length < 4 ||
@@ -65,7 +77,7 @@ export function validateDocumentInput(
     buffer[2] !== 0x03 ||
     buffer[3] !== 0x04
   ) {
-    return "This file does not look like a Word document. Save it as .docx and upload it again.";
+    return `This file does not look like a ${format} document. Save it as ${isPowerPoint ? ".pptx" : ".docx"} and upload it again.`;
   }
   return null;
 }

@@ -14,6 +14,7 @@ vi.mock("server-only", () => ({}));
 const mocks = vi.hoisted(() => ({
   auth: vi.fn(),
   convert: vi.fn(),
+  convertPowerPoint: vi.fn(),
   renderWord: vi.fn(),
   countPages: vi.fn(),
   upload: vi.fn(),
@@ -32,6 +33,9 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("@/lib/auth", () => ({ verifyRoleOrUnauthorized: mocks.auth }));
 vi.mock("@/lib/convert", () => ({ convertPdf: mocks.convert }));
+vi.mock("@/lib/powerpoint-convert", () => ({
+  convertPowerPoint: mocks.convertPowerPoint,
+}));
 vi.mock("@/lib/pdf-page-count", () => ({ countPdfPages: mocks.countPages }));
 vi.mock("@/lib/word-to-pdf", async () => ({
   ...(await vi.importActual<typeof import("@/lib/word-to-pdf")>(
@@ -60,6 +64,12 @@ vi.mock("@/lib/storage", () => ({
     `${sessionId}/${documentId}/source.pdf`,
   htmlOutputKey: (sessionId: string, documentId: string) =>
     `${sessionId}/${documentId}/output.html`,
+  sourcePptxKey: (sessionId: string, documentId: string) =>
+    `${sessionId}/${documentId}/source.pptx`,
+  pptxOutputKey: (sessionId: string, documentId: string, jobId: string) =>
+    `${sessionId}/${documentId}/${jobId}/output.pptx`,
+  outputReviewKey: (sessionId: string, documentId: string, jobId: string) =>
+    `${sessionId}/${documentId}/${jobId}/review.json`,
 }));
 
 import { POST } from "@/app/api/convert/route";
@@ -75,7 +85,11 @@ import {
   modelCalls,
   validationFindings,
 } from "@/lib/db/schema";
-import { DOCX_MIME_TYPE, MAX_FILE_SIZE_BYTES } from "@/lib/document-input";
+import {
+  DOCX_MIME_TYPE,
+  PPTX_MIME_TYPE,
+  MAX_FILE_SIZE_BYTES,
+} from "@/lib/document-input";
 
 const PDF = "%PDF-1.7\nsynthetic test content\n%%EOF";
 // Route validation checks the ZIP envelope; the mocked worker owns parsing.
@@ -118,10 +132,13 @@ function request(
     name?: string;
     contents?: string;
     documentId?: string;
+    outputTarget?: string;
   } = {}
 ) {
   const form = new FormData();
   form.set("sessionId", "session-1");
+  if (options.outputTarget !== undefined)
+    form.set("outputTarget", options.outputTarget);
   if (options.documentId) {
     form.set("documentId", options.documentId);
   } else {
@@ -209,8 +226,163 @@ describe("document conversion route", () => {
       extractionWarnings: [],
       calls: [usage],
     });
+    mocks.convertPowerPoint.mockResolvedValue({
+      pptx: Buffer.from("PK\x03\x04remediated presentation"),
+      errors: [],
+      changes: ["Slide 2: added a title for navigation."],
+      model: usage.model,
+      tokensUsed: 150,
+      extractionWarnings: [],
+      calls: [usage],
+      pageCount: 6,
+    });
     vi.spyOn(console, "log").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  it("stores native PowerPoint output, its review and all usage on a separate target", async () => {
+    const response = await POST(
+      request({
+        name: "slides.PPTX",
+        contents: DOCX,
+        outputTarget: "accessible_pptx",
+      })
+    );
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toMatchObject({
+      documentId: "doc-1",
+      jobId: "job-1",
+      outputTarget: "accessible_pptx",
+      changes: ["Slide 2: added a title for navigation."],
+    });
+    expect(body).not.toHaveProperty("html");
+    expect(body).not.toHaveProperty("pptx");
+    expect(mocks.convertPowerPoint).toHaveBeenCalledWith(
+      Buffer.from(DOCX),
+      "slides.PPTX"
+    );
+    expect(mocks.convert).not.toHaveBeenCalled();
+    expect(mocks.renderWord).not.toHaveBeenCalled();
+    expect(mocks.countPages).not.toHaveBeenCalled();
+    expect(mocks.upload.mock.calls.map(([key]) => key)).toEqual([
+      "session-1/doc-1/source.pptx",
+      "session-1/doc-1/job-1/output.pptx",
+      "session-1/doc-1/job-1/review.json",
+    ]);
+    expect(mocks.upload.mock.calls[0][2]).toBe(PPTX_MIME_TYPE);
+    expect(mocks.upload.mock.calls[1][2]).toBe(PPTX_MIME_TYPE);
+    expect(artifactValues().map((value) => value.artifactType)).toEqual([
+      "source_pptx",
+      "pptx_output",
+      "review_metadata",
+    ]);
+    expect(inserted.get(conversionJobs)?.values).toHaveBeenCalledWith(
+      expect.objectContaining({
+        outputTarget: "accessible_pptx",
+        profileVersion: "powerpoint-v1",
+        expiresAt: "2026-09-15T00:00:00.000Z",
+      })
+    );
+    expect(
+      inserted.get(conversionJobs)?.onConflictDoUpdate.mock.calls[0][0].target
+    ).toEqual([conversionJobs.documentId, conversionJobs.outputTarget]);
+    expect(updated.set).toHaveBeenLastCalledWith(
+      expect.objectContaining({ pageCount: 6, status: "completed" })
+    );
+    expect(inserted.get(modelCalls)?.values).toHaveBeenCalledWith([
+      expect.objectContaining({ ...usage, jobId: "job-1", costUsd: "0.001" }),
+    ]);
+    expect(
+      inserted.get(jobEvents)?.values.mock.calls[0][0].metadata.changes
+    ).toEqual(body.changes);
+  });
+
+  it.each([
+    ["course.pdf", PDF, "accessible_pptx"],
+    ["course.docx", DOCX, "accessible_pptx"],
+    ["course.pptx", DOCX, "canvas_html"],
+  ])(
+    "rejects mismatched source %s and target %s before storing content",
+    async (name, contents, outputTarget) => {
+      expect(
+        (await POST(request({ name, contents, outputTarget }))).status
+      ).toBe(415);
+      expect(mocks.db.insert).not.toHaveBeenCalled();
+      expect(mocks.convertPowerPoint).not.toHaveBeenCalled();
+      expect(mocks.convert).not.toHaveBeenCalled();
+    }
+  );
+
+  it("rejects unsupported targets and does not silently infer a new destination", async () => {
+    expect(
+      (await POST(request({ outputTarget: "accessible_pdf" }))).status
+    ).toBe(400);
+    expect(
+      (await POST(request({ name: "slides.pptx", contents: DOCX }))).status
+    ).toBe(415);
+    expect(mocks.convertPowerPoint).not.toHaveBeenCalled();
+  });
+
+  it("reconverts the owned original PowerPoint without overwriting it", async () => {
+    ownedDocument("slides.pptx");
+    mocks.download.mockResolvedValueOnce(Buffer.from(DOCX));
+    const response = await POST(
+      request({ documentId: "doc-1", outputTarget: "accessible_pptx" })
+    );
+    expect(response.status).toBe(200);
+    expect(mocks.download).toHaveBeenCalledWith("session-1/doc-1/source.pptx");
+    expect(inserted.has(documents)).toBe(false);
+    expect(mocks.upload.mock.calls.map(([key]) => key)).toEqual([
+      "session-1/doc-1/job-1/output.pptx",
+      "session-1/doc-1/job-1/review.json",
+    ]);
+  });
+
+  it("rejects mismatched stored sources before downloading them", async () => {
+    ownedDocument("slides.pptx");
+    expect(
+      (
+        await POST(
+          request({ documentId: "doc-1", outputTarget: "canvas_html" })
+        )
+      ).status
+    ).toBe(415);
+    expect(mocks.download).not.toHaveBeenCalled();
+    expect(mocks.db.insert).not.toHaveBeenCalled();
+  });
+
+  it("retains usage and controlled diagnostics when a PowerPoint job fails", async () => {
+    mocks.convertPowerPoint.mockResolvedValueOnce({
+      error: "Failed",
+      stage: "conversion",
+      diagnostic: createJobDiagnostic({
+        stage: "pptx_prepare",
+        code: "pptx_visual_change",
+      }),
+      calls: [usage],
+    });
+    const response = await POST(
+      request({
+        name: "slides.pptx",
+        contents: DOCX,
+        outputTarget: "accessible_pptx",
+      })
+    );
+    expect(response.status).toBe(500);
+    expect(await response.json()).toMatchObject({
+      documentId: "doc-1",
+      jobId: "job-1",
+      outputTarget: "accessible_pptx",
+    });
+    expect(artifactValues()).toEqual([]);
+    expect(mocks.upload.mock.calls.map(([key]) => key)).toEqual([
+      "session-1/doc-1/source.pptx",
+    ]);
+    expect(inserted.get(modelCalls)?.values).toHaveBeenCalledWith([
+      expect.objectContaining({ jobId: "job-1", costUsd: "0.001" }),
+    ]);
+    expect(inserted.get(dailyFailureMetrics)).toBeDefined();
   });
 
   it("stores the PDF, accessible HTML, findings, and billed model usage", async () => {

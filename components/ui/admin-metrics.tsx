@@ -208,7 +208,7 @@ export default async function AdminMetrics({
           {formatNumber(summary.timedJobCount)} measured jobs.
         </MetricCard>
         <MetricCard
-          title="Pages in selected jobs"
+          title="Pages / slides in selected jobs"
           value={
             summary.pageMeasuredJobCount
               ? formatNumber(summary.pageCountSum)
@@ -216,8 +216,8 @@ export default async function AdminMetrics({
           }
         >
           {formatNumber(summary.pageMeasuredJobCount)} of{" "}
-          {formatNumber(summary.jobCount)} jobs have page counts. Latest PDF per
-          job.
+          {formatNumber(summary.jobCount)} jobs have page or slide counts. PDF
+          pages or PowerPoint slides from the latest attempt.
         </MetricCard>
         <MetricCard
           title="Average cost per job"
@@ -234,7 +234,7 @@ export default async function AdminMetrics({
           Excludes hosting and storage.
         </MetricCard>
         <MetricCard
-          title="Average pages per measured job"
+          title="Average pages / slides per measured job"
           value={
             summary.pageMeasuredJobCount
               ? formatNumber(
@@ -243,8 +243,8 @@ export default async function AdminMetrics({
               : "Unknown"
           }
         >
-          Older jobs without page or duration measurements are excluded from
-          those averages.
+          Older jobs without page, slide or duration measurements are excluded
+          from those averages.
         </MetricCard>
       </div>
       <p className="text-sm text-muted-foreground">
@@ -263,8 +263,9 @@ export default async function AdminMetrics({
         <Table>
           <TableCaption>
             Spending follows each call’s model, including conversion, audit and
-            retries. Job counts, averages, pages and timing use the last saved
-            conversion model; older totals may lack model attribution.
+            retries. Job counts, averages, pages / slides and timing use the
+            last saved conversion model; older totals may lack model
+            attribution.
           </TableCaption>
           <TableHeader>
             <TableRow>
@@ -274,7 +275,7 @@ export default async function AdminMetrics({
                 "Model cost",
                 "Jobs with history",
                 "Avg tokens / job",
-                "Pages",
+                "Pages / slides",
                 "Median time",
                 "Min / max time",
               ].map((label) => (
@@ -375,8 +376,8 @@ export default async function AdminMetrics({
         <p className="text-sm text-muted-foreground">
           Unexpired documents from the last 14 days, independent of the history
           filter. Job tokens and cost include conversion, audit and all attempts
-          across models; pages and successful processing time describe the
-          latest attempt.
+          across models; pages / slides and successful processing time describe
+          the latest attempt.
         </p>
         <Table>
           <TableCaption>
@@ -395,7 +396,7 @@ export default async function AdminMetrics({
                 "Status",
                 "Model",
                 "Attempts",
-                "Pages",
+                "Pages / slides",
                 "Job time",
                 "Tokens",
                 "Job cost",

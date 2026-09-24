@@ -1,0 +1,10 @@
+ALTER TYPE "public"."artifact_type" ADD VALUE 'source_pptx';--> statement-breakpoint
+ALTER TYPE "public"."artifact_type" ADD VALUE 'pptx_output';--> statement-breakpoint
+ALTER TABLE "daily_failure_metrics" DROP CONSTRAINT "daily_failure_metrics_stage_chk";--> statement-breakpoint
+ALTER TABLE "daily_failure_metrics" DROP CONSTRAINT "daily_failure_metrics_code_chk";--> statement-breakpoint
+ALTER TABLE "conversion_jobs" ADD COLUMN "output_target" text DEFAULT 'canvas_html' NOT NULL;--> statement-breakpoint
+ALTER TABLE "conversion_jobs" ADD COLUMN "profile_version" text DEFAULT 'canvas-html-v1' NOT NULL;--> statement-breakpoint
+ALTER TABLE "conversion_jobs" ADD CONSTRAINT "conversion_jobs_one_job_per_document_target" UNIQUE("document_id","output_target");--> statement-breakpoint
+ALTER TABLE "conversion_jobs" ADD CONSTRAINT "conversion_jobs_output_target_chk" CHECK (output_target in ('canvas_html', 'accessible_pptx'));--> statement-breakpoint
+ALTER TABLE "daily_failure_metrics" ADD CONSTRAINT "daily_failure_metrics_stage_chk" CHECK (stage in ('pptx_prepare', 'word_to_pdf', 'pdf_render', 'conversion', 'audit', 'save_output', 'unknown'));--> statement-breakpoint
+ALTER TABLE "daily_failure_metrics" ADD CONSTRAINT "daily_failure_metrics_code_chk" CHECK (code in ('pptx_invalid', 'pptx_render_failed', 'pptx_visual_change', 'pptx_invalid_plan', 'unknown_error', 'provider_configuration', 'provider_auth', 'provider_model_not_found', 'provider_request_rejected', 'provider_payload_limit', 'provider_rate_or_quota', 'provider_rate_limit', 'provider_quota', 'provider_budget', 'provider_unavailable', 'provider_connection', 'provider_invalid_json', 'provider_invalid_response', 'model_output_limit', 'model_content_filter', 'model_invalid_output', 'pdf_invalid', 'pdf_password', 'pdf_page_limit', 'pdf_image_limit', 'pdf_complexity_limit', 'pdf_render_warning', 'pdf_page_failed', 'pdf_output_limit', 'pdf_timeout', 'pdf_renderer_busy', 'pdf_worker_failed', 'pdf_protocol_error', 'word_configuration', 'word_rejected', 'word_size_limit', 'word_busy', 'word_timeout', 'word_connection', 'word_invalid_output', 'output_storage_failed'));
