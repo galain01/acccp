@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { PptxInspection } from "../lib/pptx-types";
+import type { PptxChange, PptxInspection } from "../lib/pptx-types";
 
 vi.mock("server-only", () => ({}));
 const mocks = vi.hoisted(() => ({
@@ -100,7 +100,7 @@ const pages = (png: Buffer = Buffer.from("identical-png")) => ({
 });
 
 beforeEach(() => {
-  vi.clearAllMocks();
+  vi.resetAllMocks();
   mocks.inspect.mockResolvedValue(inspection);
   mocks.repair.mockResolvedValue({
     buffer: output,
@@ -223,7 +223,7 @@ describe("PowerPoint repair orchestration", () => {
     ]);
     expect(
       result.errors.some((f) =>
-        f.message.includes("changed this slide's appearance")
+        f.message.includes("outside the supported repair area")
       )
     ).toBe(true);
   });
@@ -258,7 +258,14 @@ describe("PowerPoint evidence boundaries", () => {
     context.putImageData(pixels, 0, 0);
     return {
       ...pages(),
-      pages: [{ ...pages().pages[0], width: 400, height: 400, png: canvas.toBuffer("image/png") }],
+      pages: [
+        {
+          ...pages().pages[0],
+          width: 400,
+          height: 400,
+          png: canvas.toBuffer("image/png"),
+        },
+      ],
     };
   };
 
@@ -272,19 +279,164 @@ describe("PowerPoint evidence boundaries", () => {
     expect(await changedPowerPointSlides(raster(), noisy)).toEqual([]);
   });
 
+  const tableSource: PptxInspection = {
+    ...inspection,
+    slides: [
+      {
+        ...inspection.slides[0],
+        objects: [
+          ...inspection.slides[0].objects,
+          {
+            ...inspection.slides[0].objects[0],
+            id: "3",
+            kind: "table",
+            isTitle: false,
+            rect: { x: 5, y: 5, width: 60, height: 40 },
+          },
+        ],
+      },
+    ],
+  };
+  const tableChange: PptxChange = {
+    type: "table-caption",
+    slideNumber: 1,
+    objectId: "3",
+    message: "Separated caption and added column headers.",
+    visualRegion: { x: 5, y: 5, width: 60, height: 10 },
+  };
+
+  it("permits an intentional caption repair but still detects changes to table data and other slide objects", async () => {
+    const repairs = { source: tableSource, changes: [tableChange] };
+    const captionOnly = raster((data) =>
+      data.set([255, 255, 255, 255], (20 * 400 + 20) * 4)
+    );
+    expect(
+      await changedPowerPointSlides(raster(), captionOnly, repairs)
+    ).toEqual([]);
+    for (const [x, y] of [
+      [100, 90],
+      [350, 350],
+    ]) {
+      const damaged = raster((data) =>
+        data.set([0, 0, 0, 255], (y * 400 + x) * 4)
+      );
+      expect(await changedPowerPointSlides(raster(), damaged, repairs)).toEqual(
+        [1]
+      );
+    }
+    // Merely claiming a nonstructural edit never exempts its rectangle.
+    expect(
+      await changedPowerPointSlides(raster(), captionOnly, {
+        source: tableSource,
+        changes: [{ ...tableChange, type: "table-header" }],
+      })
+    ).toEqual([1]);
+  });
+
+  it("rejects a repair region that extends beyond the original table", async () => {
+    const altered = raster((data) => data.set([0, 0, 0, 255], 0));
+    await expect(
+      changedPowerPointSlides(raster(), altered, {
+        source: tableSource,
+        changes: [
+          {
+            ...tableChange,
+            visualRegion: { x: 0, y: 0, width: 100, height: 100 },
+          },
+        ],
+      })
+    ).rejects.toThrow("pptx_visual_change");
+  });
+
+  it("sends the actual structurally repaired slide image to the audit", async () => {
+    const source = raster();
+    const candidate = raster((data) =>
+      data.set([255, 255, 255, 255], (20 * 400 + 20) * 4)
+    );
+    mocks.inspect.mockResolvedValue(tableSource);
+    mocks.repair.mockResolvedValue({
+      buffer: output,
+      inspection: tableSource,
+      findings: [],
+      changes: [tableChange],
+    });
+    mocks.pages
+      .mockReset()
+      .mockResolvedValueOnce(source)
+      .mockResolvedValueOnce(candidate);
+    const result = await convertPowerPoint(input, "table.pptx");
+    expect(result).not.toHaveProperty("error");
+    const evidence = mocks.call.mock.calls[1][1];
+    expect(evidence).toContainEqual(
+      expect.objectContaining({
+        type: "text",
+        text: expect.stringContaining("ACTUAL REPAIRED slide 1"),
+      })
+    );
+    expect(evidence).toContainEqual({
+      type: "image_url",
+      image_url: {
+        detail: "high",
+        url: `data:image/png;base64,${candidate.pages[0].png.toString("base64")}`,
+      },
+    });
+  });
+
+  it("retains a deterministic missing-header error when the model audit reports no issues", async () => {
+    mocks.repair.mockResolvedValue({
+      buffer: output,
+      inspection: tableSource,
+      changes: [],
+      findings: [
+        {
+          code: "missing-table-header",
+          severity: "error",
+          slideNumber: 1,
+          objectId: "3",
+          message: "This table has no header row identified.",
+          suggestion: "Add meaningful column headings and select Header Row.",
+        },
+      ],
+    });
+    const result = await convertPowerPoint(input, "table.pptx");
+    if ("error" in result) throw new Error(result.error);
+    expect(result.errors).toContainEqual(
+      expect.objectContaining({
+        severity: "error",
+        message: "This table has no header row identified.",
+        location: expect.objectContaining({
+          sourcePages: [1],
+          sourceKind: "slide",
+        }),
+      })
+    );
+  });
+
   it.each([
-    ["removed diagram edge", (data: Uint8ClampedArray) => {
-      data.set([255, 255, 255, 255], (20 * 400 + 20) * 4);
-    }],
-    ["widespread color shift", (data: Uint8ClampedArray) => {
-      for (let x = 20; x < 120; x++) data[(20 * 400 + x) * 4]++;
-    }],
-    ["concentrated visible edge changes", (data: Uint8ClampedArray) => {
-      for (let x = 20; x < 40; x++) data[(20 * 400 + x) * 4] += 10;
-    }],
-    ["changed opacity", (data: Uint8ClampedArray) => {
-      data[(20 * 400 + 20) * 4 + 3] = 250;
-    }],
+    [
+      "removed diagram edge",
+      (data: Uint8ClampedArray) => {
+        data.set([255, 255, 255, 255], (20 * 400 + 20) * 4);
+      },
+    ],
+    [
+      "widespread color shift",
+      (data: Uint8ClampedArray) => {
+        for (let x = 20; x < 120; x++) data[(20 * 400 + x) * 4]++;
+      },
+    ],
+    [
+      "concentrated visible edge changes",
+      (data: Uint8ClampedArray) => {
+        for (let x = 20; x < 40; x++) data[(20 * 400 + x) * 4] += 10;
+      },
+    ],
+    [
+      "changed opacity",
+      (data: Uint8ClampedArray) => {
+        data[(20 * 400 + 20) * 4 + 3] = 250;
+      },
+    ],
   ])("rejects %s", async (_label, edit) => {
     expect(await changedPowerPointSlides(raster(), raster(edit))).toEqual([1]);
   });

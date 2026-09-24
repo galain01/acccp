@@ -38,7 +38,8 @@ interface DocumentTableProps {
 
 function statusBadge(
   status: ConversionStatus,
-  isPowerPoint = false
+  isPowerPoint = false,
+  hasAccessibilityErrors = false
 ): React.JSX.Element {
   switch (status) {
     case "idle":
@@ -48,9 +49,16 @@ function statusBadge(
     case "processing":
       return <Badge variant="processing">Processing</Badge>;
     case "success":
+      if (isPowerPoint) {
+        return (
+          <Badge variant={hasAccessibilityErrors ? "destructive" : "secondary"}>
+            {hasAccessibilityErrors ? "Needs a fix" : "Ready to review"}
+          </Badge>
+        );
+      }
       return (
         <Badge className="bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">
-          {isPowerPoint ? "Ready to review" : "Success"}
+          Success
         </Badge>
       );
     case "error":
@@ -215,7 +223,8 @@ export default function DocumentTable({
                     <TableCell>
                       {statusBadge(
                         doc.status,
-                        doc.outputTarget === "accessible_pptx"
+                        doc.outputTarget === "accessible_pptx",
+                        doc.errors?.some((issue) => issue.severity === "error")
                       )}
                       {issueBadges(doc)}
                     </TableCell>

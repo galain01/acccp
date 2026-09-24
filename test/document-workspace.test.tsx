@@ -369,6 +369,47 @@ describe("DocumentWorkspace conversion selection", () => {
     expect(getDocumentHtml).toHaveBeenCalledWith("article");
   });
 
+  it("marks completed PowerPoints with accessibility errors as needing a fix while keeping downloads and batch skipping", async () => {
+    const issue = {
+      type: "no-table-headers" as const,
+      severity: "error" as const,
+      title: "Identify the table labels",
+      message:
+        "The table is missing column labels for software that reads aloud.",
+      suggestion: "Select the table in PowerPoint and identify its header row.",
+    };
+    await mount([
+      savedDocument("needs-fix", "success", {
+        name: "needs-fix.pptx",
+        outputTarget: "accessible_pptx",
+        errors: [issue],
+      }),
+      savedDocument("review-only", "success", {
+        name: "review-only.pptx",
+        outputTarget: "accessible_pptx",
+        errors: [{ ...issue, severity: "warning" }],
+      }),
+    ]);
+    expect(
+      row("needs-fix.pptx").cells[3].querySelector('[data-slot="badge"]')
+        ?.textContent
+    ).toBe("Needs a fix");
+    expect(row("needs-fix.pptx").textContent).not.toContain("Ready to review");
+    expect(row("review-only.pptx").textContent).toContain("Ready to review");
+    expect(button("Convert").disabled).toBe(true);
+    await click(button("needs-fix.pptx"));
+    const dialog = document.body.querySelector('[role="dialog"]')!;
+    expect(dialog.querySelector('[role="status"]')?.textContent).toContain(
+      "still has accessibility problems that need a fix"
+    );
+    expect(button("Download PowerPoint", dialog).disabled).toBe(false);
+    await click(button("Close", document.body));
+    await upload("new.pdf");
+    await click(button("Convert"));
+    expect(requests()).toHaveLength(1);
+    expect((requests()[0].get("file") as File).name).toBe("new.pdf");
+  });
+
   it("distinguishes completed conversions needing review from failed conversions", async () => {
     await mount([
       savedDocument("needs-review", "success", {

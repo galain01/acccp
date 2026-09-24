@@ -236,6 +236,14 @@ export default function ConversionResultDialog({
           <p className="text-sm text-destructive">{document.errorMessage}</p>
         )}
 
+        {isSuccess && isPowerPoint && errorCount > 0 && (
+          <p role="status" className="text-sm text-destructive">
+            This file still has accessibility problems that need a fix. Download
+            it and address the items marked “Needs a fix” in PowerPoint before
+            sharing it with students.
+          </p>
+        )}
+
         {isSuccess && !isPowerPoint && !html && (
           <p className="text-sm text-muted-foreground">
             {isLoadingHtml

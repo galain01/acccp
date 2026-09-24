@@ -7,7 +7,12 @@ import {
   PptxPackageError,
   validatePptxRepairPlan,
 } from "./pptx-package";
-import type { PptxFinding, PptxInspection, PptxRepairPlan } from "./pptx-types";
+import type {
+  PptxChange,
+  PptxFinding,
+  PptxInspection,
+  PptxRepairPlan,
+} from "./pptx-types";
 import {
   renderPowerPointToPdf,
   PowerPointRenderingError,
@@ -56,7 +61,7 @@ const REVIEW: PptxFinding = {
   code: "powerpoint-check",
   severity: "warning",
   message:
-    "The repaired presentation needs a final check in PowerPoint. Its slide images matched in this app's renderer, but PowerPoint may use different fonts or render complex objects differently.",
+    "The updated presentation needs a final check in PowerPoint. The app checked its structure and compared slide previews, but PowerPoint may use different fonts or render complex objects differently.",
   suggestion:
     "Open the downloaded file in PowerPoint. Choose Review > Check Accessibility, review the reading order and image descriptions, and check any remaining items listed here. Play media and animations, if present.",
 };
@@ -214,12 +219,17 @@ function visualInput(pdf: Buffer, rendered: RenderedPdf): LiteLLMContentPart[] {
  * Compare decoded slide pixels, allowing only bounded text-edge rasterization
  * noise observed when reading-order changes alter PDF font-subset emission.
  * At most 0.05% of pixels may differ, with channel deltas <=32; at most 0.005%
- * may differ by more than 2. Alpha, dimensions and slide identity must match.
+ * may differ by more than 2. Alpha outside permitted repairs, dimensions and
+ * slide identity must match. Only a successfully applied caption/table repair
+ * permits intentional changes inside the ORIGINAL caption row. The engine
+ * computes that region and it must fit the original table's source bounds;
+ * model-supplied rectangles are never accepted.
  * Source text/object preservation is independently checked by the package engine.
  */
 export async function changedPowerPointSlides(
   before: RenderedPdf,
-  after: RenderedPdf
+  after: RenderedPdf,
+  repairs?: { source: PptxInspection; changes: readonly PptxChange[] }
 ): Promise<number[]> {
   if (before.pageCount !== after.pageCount)
     return before.pages.map((p) => p.pageNumber);
@@ -244,10 +254,70 @@ export async function changedPowerPointSlides(
     context.clearRect(0, 0, a.width, a.height);
     context.drawImage(await loadImage(b.png), 0, 0);
     const output = context.getImageData(0, 0, a.width, a.height).data;
-    const pixelCount = a.width * a.height;
+    const mask = new Uint8Array(a.width * a.height);
+    for (const change of repairs?.changes ?? []) {
+      if (
+        change.slideNumber !== a.pageNumber ||
+        change.type !== "table-caption"
+      )
+        continue;
+      const source = repairs!.source;
+      const table = source.slides
+        .find((s) => s.slideNumber === a.pageNumber)
+        ?.objects.find((o) => o.id === change.objectId && o.kind === "table");
+      const bounds = table?.rect;
+      const rect = change.visualRegion;
+      if (
+        !rect ||
+        source.width <= 0 ||
+        source.height <= 0 ||
+        !bounds ||
+        rect.x !== bounds.x ||
+        rect.y !== bounds.y ||
+        rect.width !== bounds.width ||
+        rect.height > bounds.height ||
+        ![
+          rect.x,
+          rect.y,
+          rect.width,
+          rect.height,
+          source.width,
+          source.height,
+        ].every(Number.isFinite) ||
+        rect.x < 0 ||
+        rect.y < 0 ||
+        rect.width <= 0 ||
+        rect.height <= 0 ||
+        rect.x + rect.width > source.width ||
+        rect.y + rect.height > source.height
+      )
+        throw new PowerPointPlanError("pptx_visual_change");
+      // Two pixels cover antialiasing at the existing table's outer border.
+      const left = Math.max(
+        0,
+        Math.floor((rect.x / source.width) * a.width) - 2
+      );
+      const right = Math.min(
+        a.width,
+        Math.ceil(((rect.x + rect.width) / source.width) * a.width) + 2
+      );
+      const top = Math.max(
+        0,
+        Math.floor((rect.y / source.height) * a.height) - 2
+      );
+      const bottom = Math.min(
+        a.height,
+        Math.ceil(((rect.y + rect.height) / source.height) * a.height) + 2
+      );
+      for (let y = top; y < bottom; y++)
+        mask.fill(1, y * a.width + left, y * a.width + right);
+    }
+    const pixelCount =
+      mask.length - mask.reduce((total, value) => total + value, 0);
     let differing = 0;
     let aboveRounding = 0;
     for (let offset = 0; offset < pixels.length; offset += 4) {
+      if (mask[offset / 4]) continue;
       const delta = Math.max(
         Math.abs(pixels[offset] - output[offset]),
         Math.abs(pixels[offset + 1] - output[offset + 1]),
@@ -337,11 +407,14 @@ export async function convertPowerPoint(
     let repaired = await applyPptxRepairs(buffer, plan);
     stage = "pptx_prepare";
     let reverted: PptxFinding[] = [];
+    let outputImages = sourceImages;
     if (!repaired.buffer.equals(buffer)) {
       const { images: candidateImages } = await renderSlides(repaired.buffer);
+      outputImages = candidateImages;
       const changed = await changedPowerPointSlides(
         sourceImages,
-        candidateImages
+        candidateImages,
+        { source, changes: repaired.changes }
       );
       if (changed.length) {
         // Rebuild from immutable source. Keep only description metadata on changed slides.
@@ -358,13 +431,19 @@ export async function convertPowerPoint(
           severity: "warning",
           slideNumber,
           message:
-            "A proposed structural repair changed this slide's appearance, so the app kept its original structure and applied only safe description changes.",
+            "A proposed repair changed this slide's appearance outside the supported repair area, so the app kept its original structure and applied only safe description changes.",
           suggestion:
             "In PowerPoint, review this slide's title, table headers and reading order while keeping its intended layout.",
         }));
         const { images: fallbackImages } = await renderSlides(repaired.buffer);
+        outputImages = fallbackImages;
         if (
-          (await changedPowerPointSlides(sourceImages, fallbackImages)).length
+          (
+            await changedPowerPointSlides(sourceImages, fallbackImages, {
+              source,
+              changes: repaired.changes,
+            })
+          ).length
         ) {
           throw new PowerPointPlanError("pptx_visual_change");
         }
@@ -384,9 +463,30 @@ export async function convertPowerPoint(
         [
           {
             type: "text",
-            text: `Original object inventory:\n${JSON.stringify(source)}\nRepaired object inventory re-read from the output PPTX:\n${JSON.stringify(repaired.inspection)}`,
+            text: `Original object inventory:\n${JSON.stringify(source)}\nRepaired object inventory re-read from the output PPTX:\n${JSON.stringify(repaired.inspection)}\nApplied changes:\n${JSON.stringify(repaired.changes)}`,
           },
           ...visualInput(sourcePdf, sourceImages),
+          ...outputImages.pages
+            .filter((page) =>
+              repaired.changes.some(
+                (change) =>
+                  change.type === "table-caption" &&
+                  change.slideNumber === page.pageNumber
+              )
+            )
+            .flatMap((page): LiteLLMContentPart[] => [
+              {
+                type: "text",
+                text: `ACTUAL REPAIRED slide ${page.pageNumber}: its table/caption structure intentionally changed. Compare this output image with the original above. Verify the new header meanings, preserved cell relationships, readable text, caption placement and lack of clipping. This image comes from the saved PPTX.`,
+              },
+              {
+                type: "image_url",
+                image_url: {
+                  url: `data:image/png;base64,${page.png.toString("base64")}`,
+                  detail: "high",
+                },
+              },
+            ]),
         ],
         auditConfig,
         AbortSignal.timeout(Math.floor(Math.min(110_000, remaining())))

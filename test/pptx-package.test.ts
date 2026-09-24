@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ZipFile } from "yazl";
 import { fromBufferPromise } from "yauzl";
 import { DOMParser } from "@xmldom/xmldom";
+import { pptxElementHash } from "../lib/pptx-table-caption";
 import {
   applyPptxRepairs,
   inspectPptx,
@@ -33,6 +34,28 @@ function table(id: number, merged = false): string {
 }
 function slide(objects: string, options = "", extra = ""): string {
   return `<p:sld xmlns:p="${P}" xmlns:a="${A}" xmlns:r="${R}" ${options}><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>${objects}</p:spTree></p:cSld>${extra}</p:sld>`;
+}
+const captionCells = [
+  ["Group discussion", ""],
+  ["Pair A", "Compare leaf shapes"],
+  ["Pair B", "Compare soil texture"],
+];
+const splitCaption = {
+  objectId: "3",
+  captionText: "Group discussion",
+  headerTexts: ["Pair", "Discussion task"],
+  sourceCells: captionCells,
+};
+function captionTable(): string {
+  const cell = (value: string, attrs = "", caption = false) =>
+    `<a:tc ${attrs}><a:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr sz="2100"${caption ? ' b="1"' : ""}><a:solidFill><a:srgbClr val="${caption ? "FFFFFF" : "18334B"}"/></a:solidFill><a:latin typeface="Arial"/></a:rPr><a:t>${value}</a:t></a:r></a:p></a:txBody><a:tcPr marL="114300" marR="114300" marT="114300" marB="114300"><a:solidFill><a:srgbClr val="${caption ? "245574" : "FFFFFF"}"/></a:solidFill></a:tcPr></a:tc>`;
+  return `<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="3" name="Group discussion table"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr><p:xfrm><a:off x="685800" y="2238375"/><a:ext cx="7334250" cy="2571750"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table"><a:tbl><a:tblPr firstRow="0" bandRow="0"/><a:tblGrid><a:gridCol w="3667125"/><a:gridCol w="3667125"/></a:tblGrid><a:tr h="857250">${cell("Group discussion", 'gridSpan="2"', true)}${cell("", 'hMerge="1"', true)}</a:tr>${captionCells
+    .slice(1)
+    .map(
+      (row) =>
+        `<a:tr h="857250">${row.map((value) => cell(value)).join("")}</a:tr>`
+    )
+    .join("")}</a:tbl></a:graphicData></a:graphic></p:graphicFrame>`;
 }
 async function zip(entries: [string, Buffer | string][]): Promise<Buffer> {
   const archive = new ZipFile();
@@ -93,6 +116,197 @@ async function unzip(buffer: Buffer): Promise<Map<string, Buffer>> {
 }
 
 describe("PowerPoint package remediation", () => {
+  it("splits a merged caption into editable text and real headers while preserving every body row", async () => {
+    const original = await zip(
+      entries(slide(text(2, "Discussion groups") + captionTable()))
+    );
+    const result = await applyPptxRepairs(original, {
+      slides: [{ slideNumber: 1, splitTableCaption: [splitCaption] }],
+    });
+    expect(result.changes).toHaveLength(1);
+    expect(result.changes[0]).toMatchObject({
+      type: "table-caption",
+      objectId: "3",
+      visualRegion: { x: 685800, y: 2238375, width: 7334250, height: 857250 },
+    });
+    const objects = result.inspection.slides[0].objects;
+    expect(objects.map((o) => o.id)).toEqual(["2", "4", "3"]);
+    expect(objects[1]).toMatchObject({
+      kind: "text",
+      text: "Group discussion",
+      rect: { x: 685800, y: 2238375, width: 7334250, height: 428400 },
+    });
+    expect(objects[2]).toMatchObject({
+      table: {
+        firstRow: true,
+        complex: false,
+        cells: [["Pair", "Discussion task"], ...captionCells.slice(1)],
+      },
+      rect: { x: 685800, y: 2666775, width: 7334250, height: 2143350 },
+    });
+    expect(2238375 + 857250).toBe(objects[2].rect!.y + 428850);
+    const before = await unzip(original),
+      after = await unzip(result.buffer);
+    const parse = (parts: Map<string, Buffer>) =>
+      new DOMParser().parseFromString(
+        parts.get("ppt/slides/slide1.xml")!.toString(),
+        "application/xml"
+      );
+    const originalRows = Array.from(
+      parse(before).getElementsByTagNameNS(A, "tr")
+    );
+    const outputRows = Array.from(parse(after).getElementsByTagNameNS(A, "tr"));
+    expect(outputRows.slice(1).map(pptxElementHash)).toEqual(
+      originalRows.slice(1).map(pptxElementHash)
+    );
+    expect(after.get("ppt/slides/slide1.xml")!.toString()).toContain(
+      'sz="2100"'
+    );
+    for (const [name, bytes] of before)
+      if (name !== "ppt/slides/slide1.xml")
+        expect(after.get(name)).toEqual(bytes);
+    expect(
+      result.findings.some((f) => f.code === "missing-table-headers")
+    ).toBe(false);
+  });
+
+  it.each([
+    [
+      "additional body merge",
+      (xml: string) =>
+        xml.replace("<a:tc ><a:txBody>", '<a:tc rowSpan="2"><a:txBody>'),
+    ],
+    [
+      "caption with several runs",
+      (xml: string) =>
+        xml.replace(
+          "<a:t>Group discussion</a:t></a:r>",
+          "<a:t>Group discussion</a:t></a:r><a:r><a:t/></a:r>"
+        ),
+    ],
+    [
+      "insufficient row height",
+      (xml: string) =>
+        xml
+          .replaceAll('h="857250"', 'h="100000"')
+          .replace('cy="2571750"', 'cy="300000"'),
+    ],
+    [
+      "caption contains a link",
+      (xml: string) =>
+        xml.replace(
+          '<a:rPr sz="2100" b="1">',
+          '<a:rPr sz="2100" b="1"><a:hlinkClick/>'
+        ),
+    ],
+    [
+      "hidden table",
+      (xml: string) =>
+        xml.replace(
+          'name="Group discussion table"',
+          'name="Group discussion table" hidden="1"'
+        ),
+    ],
+    [
+      "unequal frame and row heights",
+      (xml: string) => xml.replace('cy="2571750"', 'cy="2571751"'),
+    ],
+  ])(
+    "leaves %s unchanged and reports missing real headers",
+    async (_name, mutate) => {
+      const original = await zip(entries(slide(mutate(captionTable()))));
+      const result = await applyPptxRepairs(original, {
+        slides: [{ slideNumber: 1, splitTableCaption: [splitCaption] }],
+      });
+      expect(result.buffer).toEqual(original);
+      expect(result.changes).toEqual([]);
+      expect(result.findings).toContainEqual(
+        expect.objectContaining({
+          code: "missing-table-headers",
+          severity: "error",
+          slideNumber: 1,
+          objectId: "3",
+        })
+      );
+    }
+  );
+
+  it("rejects caption repair when source cells disagree, objects overlap, or proposed labels do not fit", async () => {
+    const original = await zip(entries(slide(captionTable())));
+    for (const repair of [
+      {
+        ...splitCaption,
+        sourceCells: [
+          ["Group discussion", ""],
+          ["Changed data", "Compare leaf shapes"],
+          captionCells[2],
+        ],
+      },
+      { ...splitCaption, headerTexts: ["W".repeat(40), "Discussion task"] },
+    ]) {
+      const result = await applyPptxRepairs(original, {
+        slides: [{ slideNumber: 1, splitTableCaption: [repair] }],
+      });
+      expect(result.buffer).toEqual(original);
+    }
+    const overlapping = await zip(
+      entries(
+        slide(captionTable() + text(7, "Overlapping content", 700000, 2240000))
+      )
+    );
+    const result = await applyPptxRepairs(overlapping, {
+      slides: [{ slideNumber: 1, splitTableCaption: [splitCaption] }],
+    });
+    expect(result.buffer).toEqual(overlapping);
+  });
+
+  it("detects missing table headers deterministically when a model proposes no repair", async () => {
+    const original = await zip(entries(slide(captionTable())));
+    const result = await applyPptxRepairs(original, { slides: [] });
+    expect(result.findings).toContainEqual(
+      expect.objectContaining({
+        code: "missing-table-headers",
+        severity: "error",
+        slideNumber: 1,
+        objectId: "3",
+      })
+    );
+    expect(
+      validatePptxRepairPlan({
+        slides: [
+          {
+            slideNumber: 1,
+            splitTableCaption: [{ ...splitCaption, headerTexts: ["Pair", ""] }],
+          },
+        ],
+      })
+    ).toBe(false);
+  });
+
+  it("keeps a generated caption immediately before its table when an old-ID reading-order plan is unsafe", async () => {
+    const original = await zip(
+      entries(slide(text(2, "Discussion groups") + captionTable()))
+    );
+    const result = await applyPptxRepairs(original, {
+      slides: [
+        {
+          slideNumber: 1,
+          splitTableCaption: [splitCaption],
+          readingOrder: ["3", "2"],
+        },
+      ],
+    });
+    expect(
+      result.inspection.slides[0].objects.map((object) => object.id)
+    ).toEqual(["2", "4", "3"]);
+    expect(result.changes.map((change) => change.type)).toEqual([
+      "table-caption",
+    ]);
+    expect(
+      result.findings.some((finding) => finding.code === "reading-order-review")
+    ).toBe(true);
+  });
+
   it.each([
     ["direct paragraph", "135000", "120000", "110000", "105000", "135000"],
     ["local list style", "", "120000", "110000", "105000", "120000"],

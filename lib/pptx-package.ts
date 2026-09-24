@@ -11,6 +11,11 @@ import {
 import { SaxesParser } from "saxes";
 import { fromBufferPromise } from "yauzl";
 import { ZipFile } from "yazl";
+import {
+  buildTableCaptionPatch,
+  pptxElementHash,
+  type TableCaptionPatch,
+} from "./pptx-table-caption";
 import type {
   PptxChange,
   PptxFinding,
@@ -209,6 +214,7 @@ interface InternalSlide {
   info: PptxSlide;
   placeholderIndices: Set<string>;
   sourceTextStyles: Element[];
+  captionPatches: TableCaptionPatch[];
 }
 
 function validPartName(name: string): boolean {
@@ -884,6 +890,7 @@ async function loadPackage(
       sourceTextStyles: [otherStyle, defaultStyle].filter(
         (style): style is Element => Boolean(style)
       ),
+      captionPatches: [],
       placeholderIndices: new Set(
         [
           ...descendants(document, P, "ph"),
@@ -958,6 +965,7 @@ export function validatePptxRepairPlan(
         "titleObjectId",
         "descriptions",
         "tableHeaders",
+        "splitTableCaption",
         "readingOrder",
         "language",
       ]) ||
@@ -1003,6 +1011,44 @@ export function validatePptxRepairPlan(
         ) ||
         new Set(slide.tableHeaders.map((table) => table.objectId)).size !==
           slide.tableHeaders.length)
+    )
+      return false;
+    if (
+      slide.splitTableCaption !== undefined &&
+      (!Array.isArray(slide.splitTableCaption) ||
+        slide.splitTableCaption.length > 10 ||
+        !slide.splitTableCaption.every(
+          (table) =>
+            isRecord(table) &&
+            onlyKeys(table, [
+              "objectId",
+              "captionText",
+              "headerTexts",
+              "sourceCells",
+            ]) &&
+            id(table.objectId) &&
+            validText(table.captionText, 200) &&
+            Array.isArray(table.headerTexts) &&
+            table.headerTexts.length === 2 &&
+            table.headerTexts.every((text: unknown) => validText(text, 60)) &&
+            Array.isArray(table.sourceCells) &&
+            table.sourceCells.length >= 2 &&
+            table.sourceCells.length <= 30 &&
+            table.sourceCells.every(
+              (row: unknown) =>
+                Array.isArray(row) &&
+                row.length === 2 &&
+                row.every(
+                  (text: unknown) =>
+                    typeof text === "string" &&
+                    text.length <= LIMITS.text &&
+                    text.isWellFormed() &&
+                    !/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(text)
+                )
+            )
+        ) ||
+        new Set(slide.splitTableCaption.map((table) => table.objectId)).size !==
+          slide.splitTableCaption.length)
     )
       return false;
     if (
@@ -1227,6 +1273,65 @@ function applySlide(
       });
     }
   }
+  for (const repairTable of repair.splitTableCaption ?? []) {
+    const object = getObject(repairTable.objectId);
+    const rect = object?.info.rect;
+    const sourceIds = descendants(slide.document, P, "cNvPr").map((element) =>
+      Number(element.getAttribute("id"))
+    );
+    const newId = Math.max(0, ...sourceIds) + 1;
+    const safe =
+      object &&
+      rect &&
+      object.info.kind === "table" &&
+      !object.info.grouped &&
+      !object.info.hidden &&
+      !object.info.decorative &&
+      !object.info.description.trim() &&
+      !object.info.title.trim() &&
+      !slide.info.hasTiming &&
+      Number.isSafeInteger(newId) &&
+      newId < 4294967295 &&
+      !slide.objects.some(
+        (other) =>
+          other !== object &&
+          !other.info.hidden &&
+          (!other.info.rect || overlapping(rect, other.info.rect))
+      ) &&
+      !descendants(slide.document, A, "effectLst").some(
+        (effect) => children(effect).length
+      ) &&
+      !descendants(slide.document, A, "effectDag").length;
+    const patch = safe
+      ? buildTableCaptionPatch(
+          slide.document,
+          object.element,
+          rect,
+          repairTable,
+          String(newId)
+        )
+      : null;
+    if (!patch || !object) {
+      review(
+        "table-caption-review",
+        "This table still needs separate column labels. Its merged caption could not be safely separated within the existing space.",
+        "In PowerPoint, move the table caption into a text box, add clear labels above both columns, remove merged cells, and select Table Design > Header Row.",
+        repairTable.objectId
+      );
+      continue;
+    }
+    slide.tree.insertBefore(patch.caption, object.element);
+    slide.tree.replaceChild(patch.table, object.element);
+    object.element = patch.table;
+    slide.captionPatches.push(patch);
+    changes.push({
+      type: "table-caption",
+      slideNumber,
+      objectId: repairTable.objectId,
+      message: `Moved the existing table caption above separate column labels (${repairTable.headerTexts.join("; ")}); kept the data rows, font size, and table area.`,
+      visualRegion: patch.visualRegion,
+    });
+  }
   if (repair.readingOrder !== undefined) {
     const directObjects = slide.objects.filter(
       (object) => !object.info.grouped
@@ -1373,6 +1478,21 @@ function unresolved(inspection: PptxInspection): PptxFinding[] {
     }
     for (const object of slide.objects) {
       if (
+        object.table &&
+        (!object.table.firstRow ||
+          object.table.cells[0]?.some((cell) => !cell.trim()))
+      )
+        findings.push(
+          finding(
+            "missing-table-headers",
+            "This table needs a header row that clearly labels every column.",
+            "In PowerPoint, add clear labels above the table's data and select Table Design > Header Row. A merged caption is a table title, not a set of column labels.",
+            slide.slideNumber,
+            object.id,
+            "error"
+          )
+        );
+      if (
         ["image", "chart", "smartart"].includes(object.kind) &&
         !object.decorative &&
         !object.description.trim() &&
@@ -1458,7 +1578,8 @@ export async function applyPptxRepairs(
     if (
       slide.partName !== after.partName ||
       slide.hidden !== after.hidden ||
-      slide.objects.length !== after.objects.length
+      slide.objects.length + pkg.slides[index].captionPatches.length !==
+        after.objects.length
     )
       throw new PptxPackageError(
         "pptx_integrity",
@@ -1466,6 +1587,32 @@ export async function applyPptxRepairs(
       );
     for (const object of slide.objects) {
       const current = after.objects.find((item) => item.id === object.id);
+      const patch = pkg.slides[index].captionPatches.find(
+        (item) => item.tableId === object.id
+      );
+      if (patch) {
+        const verifiedSlide = verified.slides[index];
+        const table = verifiedSlide.objects.find(
+          (item) => item.info.id === patch.tableId
+        );
+        const caption = verifiedSlide.objects.find(
+          (item) => item.info.id === patch.captionId
+        );
+        if (
+          !table ||
+          !caption ||
+          pptxElementHash(table.element) !== patch.tableHash ||
+          pptxElementHash(caption.element) !== patch.captionHash ||
+          caption.info.text !== patch.captionText ||
+          !table.info.table?.firstRow ||
+          table.info.table.complex
+        )
+          throw new PptxPackageError(
+            "pptx_integrity",
+            "The table repair failed its source-content preservation check."
+          );
+        continue;
+      }
       if (
         !current ||
         object.text !== current.text ||
