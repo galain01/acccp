@@ -5,6 +5,7 @@ import { DOMParser } from "@xmldom/xmldom";
 import { pptxElementHash } from "../lib/pptx-table-caption";
 import {
   applyPptxRepairs,
+  checkPptxAccessibility,
   inspectPptx,
   validatePptxRepairPlan,
 } from "../lib/pptx-package";
@@ -116,6 +117,107 @@ async function unzip(buffer: Buffer): Promise<Map<string, Buffer>> {
 }
 
 describe("PowerPoint package remediation", () => {
+  it("reports structural defects before a plan and clears them after verified repairs", async () => {
+    const original = await zip(
+      entries(slide(text(2, "Course overview") + image(3) + table(4)))
+    );
+    const source = await inspectPptx(original);
+    const before = JSON.stringify(source);
+    const defects = checkPptxAccessibility(source);
+    expect(
+      defects.map(({ code, severity, slideNumber, objectId }) => ({
+        code,
+        severity,
+        slideNumber,
+        objectId,
+      }))
+    ).toEqual([
+      {
+        code: "slide-title",
+        severity: "error",
+        slideNumber: 1,
+        objectId: undefined,
+      },
+      {
+        code: "missing-description",
+        severity: "error",
+        slideNumber: 1,
+        objectId: "3",
+      },
+      {
+        code: "missing-table-headers",
+        severity: "error",
+        slideNumber: 1,
+        objectId: "4",
+      },
+    ]);
+    expect(JSON.stringify(source)).toBe(before);
+    expect(
+      source.findings.some((finding) =>
+        defects.some((defect) => defect.code === finding.code)
+      )
+    ).toBe(false);
+    const repaired = await applyPptxRepairs(original, {
+      slides: [
+        {
+          slideNumber: 1,
+          titleObjectId: "2",
+          descriptions: [
+            {
+              objectId: "3",
+              text: "The source diagram illustrates the two classroom groups.",
+            },
+          ],
+          tableHeaders: [
+            { objectId: "4", firstRow: true, headerTexts: ["Group", "Count"] },
+          ],
+        },
+      ],
+    });
+    expect(checkPptxAccessibility(repaired.inspection)).toEqual([]);
+    expect(
+      repaired.findings.some((finding) =>
+        defects.some((defect) => defect.code === finding.code)
+      )
+    ).toBe(false);
+  });
+
+  it("keeps duplicate titles as review warnings and does not invent another slide for duplicate objects", async () => {
+    const titleShape = (id: number) =>
+      text(id, "Same title", 0, id * 1000, '<p:ph type="title"/>');
+    const source = await inspectPptx(await zip(entries(slide(titleShape(2)))));
+    const duplicateAcrossSlides = {
+      ...source,
+      slideCount: 2,
+      slides: [
+        source.slides[0],
+        {
+          ...source.slides[0],
+          slideNumber: 2,
+          partName: "ppt/slides/slide2.xml",
+        },
+      ],
+    };
+    expect(
+      checkPptxAccessibility(duplicateAcrossSlides).map(
+        ({ code, severity, slideNumber }) => ({ code, severity, slideNumber })
+      )
+    ).toEqual([
+      { code: "duplicate-title", severity: "warning", slideNumber: 1 },
+      { code: "duplicate-title", severity: "warning", slideNumber: 2 },
+    ]);
+    const sameSlide = await inspectPptx(
+      await zip(entries(slide(titleShape(2) + titleShape(3))))
+    );
+    expect(checkPptxAccessibility(sameSlide)).toEqual([
+      expect.objectContaining({
+        code: "slide-title",
+        severity: "error",
+        slideNumber: 1,
+      }),
+    ]);
+  });
+
   it("splits a merged caption into editable text and real headers while preserving every body row", async () => {
     const original = await zip(
       entries(slide(text(2, "Discussion groups") + captionTable()))

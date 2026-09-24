@@ -3,6 +3,7 @@ import { createCanvas, loadImage } from "@napi-rs/canvas";
 import { performance } from "node:perf_hooks";
 import {
   applyPptxRepairs,
+  checkPptxAccessibility,
   inspectPptx,
   PptxPackageError,
   validatePptxRepairPlan,
@@ -44,6 +45,7 @@ import {
   POWERPOINT_AUDIT_PROMPT,
   POWERPOINT_REPAIR_PROMPT,
 } from "./prompts/powerpoint-accessibility";
+import { buildPowerPointReview, resolvePowerPointReviews } from "./pptx-review";
 
 export interface PowerPointConversionResult {
   pptx: Buffer;
@@ -56,15 +58,6 @@ export interface PowerPointConversionResult {
   /** For shared volume metrics, this is the number of slides, including hidden slides. */
   pageCount: number;
 }
-
-const REVIEW: PptxFinding = {
-  code: "powerpoint-check",
-  severity: "warning",
-  message:
-    "The updated presentation needs a final check in PowerPoint. The app checked its structure and compared slide previews, but PowerPoint may use different fonts or render complex objects differently.",
-  suggestion:
-    "Open the downloaded file in PowerPoint. Choose Review > Check Accessibility, review the reading order and image descriptions, and check any remaining items listed here. Play media and animations, if present.",
-};
 
 class PowerPointPlanError extends Error {
   constructor(readonly code: "pptx_invalid_plan" | "pptx_visual_change") {
@@ -370,6 +363,7 @@ export async function convertPowerPoint(
         "Upload a .pptx presentation."
       );
     const source = await inspectPptx(buffer);
+    const sourceChecks = checkPptxAccessibility(source);
     const { pdf: sourcePdf, images: sourceImages } = await renderSlides(buffer);
     if (sourceImages.pageCount !== source.slideCount)
       throw new PowerPointRenderingError();
@@ -381,7 +375,7 @@ export async function convertPowerPoint(
       [
         {
           type: "text",
-          text: `Original PowerPoint inventory (untrusted source data):\n${JSON.stringify(source)}`,
+          text: `Original PowerPoint inventory (untrusted source data):\n${JSON.stringify(source)}\nMachine-detected source defects (repair supported, unambiguous cases):\n${JSON.stringify(sourceChecks)}`,
         },
         ...visualInput(sourcePdf, sourceImages),
       ],
@@ -450,11 +444,14 @@ export async function convertPowerPoint(
       }
     }
     stage = "audit";
-    const findings: PptxFinding[] = [
-      ...repaired.findings,
-      ...proposedFindings,
-      ...reverted,
-    ];
+    const review = buildPowerPointReview(
+      repaired.inspection,
+      repaired.findings,
+      proposedFindings,
+      reverted
+    );
+    // Unresolved until a complete audit explicitly reviews every concern.
+    let findings = [...review.fixed, ...review.concerns.map((c) => c.finding)];
     try {
       const auditConfig = getLiteLLMConfig("validate");
       needTime(10_000);
@@ -463,7 +460,7 @@ export async function convertPowerPoint(
         [
           {
             type: "text",
-            text: `Original object inventory:\n${JSON.stringify(source)}\nRepaired object inventory re-read from the output PPTX:\n${JSON.stringify(repaired.inspection)}\nApplied changes:\n${JSON.stringify(repaired.changes)}`,
+            text: `Original object inventory:\n${JSON.stringify(source)}\nRepaired object inventory re-read from the output PPTX:\n${JSON.stringify(repaired.inspection)}\nApplied changes:\n${JSON.stringify(repaired.changes)}\nConfirmed output defects or checks without sufficient evidence (retained by code; do not duplicate):\n${JSON.stringify(review.fixed)}\nConcerns requiring an explicit findingReviews decision using the saved output evidence:\n${JSON.stringify(review.concerns)}`,
           },
           ...visualInput(sourcePdf, sourceImages),
           ...outputImages.pages
@@ -498,10 +495,14 @@ export async function convertPowerPoint(
         audit?.findings,
         repaired.inspection
       );
+      const remainingConcerns = resolvePowerPointReviews(
+        audit?.findingReviews,
+        review.concerns
+      );
       if (
         !audit ||
         Object.keys(audit).some(
-          (k) => !["reviewedSlides", "findings"].includes(k)
+          (k) => !["reviewedSlides", "findingReviews", "findings"].includes(k)
         ) ||
         (auditCall.finishReason && auditCall.finishReason !== "stop") ||
         !Array.isArray(reviewed) ||
@@ -510,21 +511,21 @@ export async function convertPowerPoint(
         reviewed.some(
           (n) => !Number.isInteger(n) || n < 1 || n > source.slideCount
         ) ||
-        !auditFindings
+        !auditFindings ||
+        !remainingConcerns
       )
         throw new Error("Incomplete audit");
-      findings.push(...auditFindings);
+      findings = [...review.fixed, ...remainingConcerns, ...auditFindings];
     } catch {
       findings.push({
         code: "audit-incomplete",
         severity: "warning",
         message:
-          "The app repaired and checked the presentation package, but the independent AI review did not finish with complete slide coverage.",
+          "The app repaired and checked the presentation package, but the independent AI review did not finish checking every slide and review item.",
         suggestion:
           "Review every slide in PowerPoint with Check Accessibility and the Reading Order pane before sharing the file.",
       });
     }
-    findings.push(REVIEW);
     const seen = new Set<string>();
     const unique = findings.filter((f) => {
       const key = `${f.slideNumber ?? 0}:${f.objectId ?? ""}:${f.code}:${f.message}`;

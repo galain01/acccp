@@ -1451,9 +1451,12 @@ async function writeParts(
   return output;
 }
 
-function unresolved(inspection: PptxInspection): PptxFinding[] {
+/** Pure structural checks, usable on source inventories and re-read repaired output. */
+export function checkPptxAccessibility(
+  inspection: PptxInspection
+): PptxFinding[] {
   const findings: PptxFinding[] = [];
-  const titles = new Map<string, number[]>();
+  const titles = new Map<string, Set<number>>();
   for (const slide of inspection.slides) {
     const visibleTitles = slide.objects.filter(
       (object) => object.isTitle && !object.hidden && object.text.trim()
@@ -1466,15 +1469,16 @@ function unresolved(inspection: PptxInspection): PptxFinding[] {
             ? "This slide has more than one title object."
             : "This slide still needs a title identified for students who use a screen reader.",
           "In PowerPoint, use Accessibility > Slide Title to give the slide one meaningful title.",
-          slide.slideNumber
+          slide.slideNumber,
+          undefined,
+          "error"
         )
       );
     for (const object of visibleTitles) {
       const normalized = object.text.trim().toLowerCase();
-      titles.set(normalized, [
-        ...(titles.get(normalized) ?? []),
-        slide.slideNumber,
-      ]);
+      const numbers = titles.get(normalized) ?? new Set<number>();
+      numbers.add(slide.slideNumber);
+      titles.set(normalized, numbers);
     }
     for (const object of slide.objects) {
       if (
@@ -1504,13 +1508,14 @@ function unresolved(inspection: PptxInspection): PptxFinding[] {
             "This object still needs a description of its essential information.",
             "Select this object in PowerPoint and add Alt Text that explains what students need to understand.",
             slide.slideNumber,
-            object.id
+            object.id,
+            "error"
           )
         );
     }
   }
   for (const numbers of titles.values())
-    if (numbers.length > 1)
+    if (numbers.size > 1)
       for (const slideNumber of numbers)
         findings.push(
           finding(
@@ -1636,7 +1641,7 @@ export async function applyPptxRepairs(
     findings: [
       ...verified.inspection.findings,
       ...findings,
-      ...unresolved(verified.inspection),
+      ...checkPptxAccessibility(verified.inspection),
     ],
     inspection: verified.inspection,
   };

@@ -1,5 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { PptxChange, PptxInspection } from "../lib/pptx-types";
+import type {
+  PptxChange,
+  PptxFinding,
+  PptxInspection,
+} from "../lib/pptx-types";
 
 vi.mock("server-only", () => ({}));
 const mocks = vi.hoisted(() => ({
@@ -76,7 +80,7 @@ const inspection: PptxInspection = {
 const input = Buffer.from("original-pptx");
 const output = Buffer.from("repaired-pptx");
 const plan = { slides: [{ slideNumber: 1 }], findings: [] };
-const audit = { reviewedSlides: [1], findings: [] };
+const audit = { reviewedSlides: [1], findingReviews: [], findings: [] };
 const resultCall = (content: unknown) => ({
   content: JSON.stringify(content),
   model: "test-model",
@@ -133,8 +137,8 @@ describe("PowerPoint repair orchestration", () => {
       ["validate", 0.01],
     ]);
     expect(result.tokensUsed).toBe(300);
-    expect(result.errors).toHaveLength(1);
-    expect(result.errors[0].location?.sourceKind).toBe("slide");
+    expect(result.errors).toHaveLength(0);
+    expect(result.extractionWarnings).toEqual([]);
     expect(mocks.call.mock.calls[0][0]).toContain("PowerPoint");
     expect(mocks.call.mock.calls[1][0]).toContain("independently audit");
     expect(mocks.call.mock.calls[0][0]).not.toContain(
@@ -153,6 +157,193 @@ describe("PowerPoint repair orchestration", () => {
       calls: [{ costUsd: 0.01 }],
     });
     expect(mocks.repair).not.toHaveBeenCalled();
+  });
+
+  it("gives the repair model source defects confirmed by code", async () => {
+    const source = structuredClone(inspection);
+    source.slides[0].objects[0].isTitle = false;
+    mocks.inspect.mockResolvedValue(source);
+    await convertPowerPoint(input, "test.pptx");
+    const evidence = mocks.call.mock.calls[0][1];
+    expect(evidence).toContainEqual({
+      type: "text",
+      text: expect.stringContaining('"code":"slide-title"'),
+    });
+    expect(evidence).toContainEqual({
+      type: "text",
+      text: expect.stringContaining("Machine-detected source defects"),
+    });
+  });
+
+  const concern: PptxFinding = {
+    code: "complex-object-review",
+    severity: "warning",
+    slideNumber: 1,
+    objectId: "3",
+    message: "Review this chart's description.",
+    suggestion: "Check whether it explains the comparison.",
+  };
+  const chartInspection: PptxInspection = {
+    ...inspection,
+    slides: [
+      {
+        ...inspection.slides[0],
+        objects: [
+          ...inspection.slides[0].objects,
+          {
+            ...inspection.slides[0].objects[0],
+            id: "3",
+            name: "Observation chart",
+            kind: "chart",
+            isTitle: false,
+            text: "",
+            description:
+              "Group A recorded 10 observations and Group B recorded 20.",
+          },
+        ],
+      },
+    ],
+  };
+  const resolved = {
+    id: "review-1",
+    status: "resolved",
+    reason:
+      "The saved description states both groups' exact visible values and their comparison.",
+  };
+
+  it("removes a generic chart concern only after explicit output-based audit resolution", async () => {
+    mocks.repair.mockResolvedValue({
+      buffer: output,
+      inspection: chartInspection,
+      findings: [concern],
+      changes: [],
+    });
+    mocks.call
+      .mockReset()
+      .mockResolvedValueOnce(resultCall(plan))
+      .mockResolvedValueOnce(
+        resultCall({ ...audit, findingReviews: [resolved] })
+      );
+    const result = await convertPowerPoint(input, "chart.pptx");
+    if ("error" in result) throw new Error(result.error);
+    expect(result.errors).toEqual([]);
+    expect(mocks.call.mock.calls[1][1]).toContainEqual({
+      type: "text",
+      text: expect.stringContaining('"id":"review-1"'),
+    });
+  });
+
+  it.each([
+    ["missing decisions", undefined],
+    ["empty decisions", []],
+    ["unknown ID", [{ ...resolved, id: "review-99" }]],
+    ["duplicate ID", [resolved, resolved]],
+    ["unsupported claim", [{ ...resolved, reason: "Fixed" }]],
+  ])(
+    "keeps original concerns and completed costs for %s",
+    async (_label, decisions) => {
+      mocks.repair.mockResolvedValue({
+        buffer: output,
+        inspection: chartInspection,
+        findings: [concern],
+        changes: [],
+      });
+      mocks.call
+        .mockReset()
+        .mockResolvedValueOnce(resultCall(plan))
+        .mockResolvedValueOnce(
+          resultCall({ ...audit, findingReviews: decisions })
+        );
+      const result = await convertPowerPoint(input, "chart.pptx");
+      if ("error" in result) throw new Error(result.error);
+      expect(result.errors.map((f) => f.message)).toEqual([
+        concern.message,
+        expect.stringContaining("independent AI review did not finish"),
+      ]);
+      expect(result.calls.map((c) => c.costUsd)).toEqual([0.01, 0.01]);
+    }
+  );
+
+  it("clears a source concern after repair without hiding a separate confirmed output defect", async () => {
+    const stale = {
+      ...concern,
+      code: "chart-description-review",
+      message: "Check the original chart description.",
+    };
+    const confirmed = {
+      ...concern,
+      code: "missing-table-header",
+      severity: "error" as const,
+      objectId: "4",
+      message: "This table still lacks a header row.",
+    };
+    const inventory = structuredClone(chartInspection);
+    inventory.slides[0].objects.push({
+      ...inventory.slides[0].objects[1],
+      id: "4",
+      kind: "table",
+      name: "Observations table",
+    });
+    mocks.inspect.mockResolvedValue(inventory);
+    mocks.repair.mockResolvedValue({
+      buffer: output,
+      inspection: inventory,
+      findings: [confirmed],
+      changes: [],
+    });
+    mocks.call
+      .mockReset()
+      .mockResolvedValueOnce(resultCall({ ...plan, findings: [stale] }))
+      .mockResolvedValueOnce(
+        resultCall({ ...audit, findingReviews: [resolved] })
+      );
+    const result = await convertPowerPoint(input, "table.pptx");
+    if ("error" in result) throw new Error(result.error);
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toMatchObject({
+      severity: "error",
+      message: confirmed.message,
+    });
+  });
+
+  it("keeps ambiguous decisions and additional located audit defects", async () => {
+    mocks.repair.mockResolvedValue({
+      buffer: output,
+      inspection: chartInspection,
+      findings: [concern],
+      changes: [],
+    });
+    mocks.call
+      .mockReset()
+      .mockResolvedValueOnce(resultCall(plan))
+      .mockResolvedValueOnce(
+        resultCall({
+          ...audit,
+          findingReviews: [
+            {
+              id: "review-1",
+              status: "needs_review",
+              message: "The chart does not identify its units.",
+              suggestion: "Add the measurement units to its description.",
+            },
+          ],
+          findings: [
+            {
+              ...concern,
+              code: "chart-description-incorrect",
+              severity: "error",
+              message: "The description reverses Group A and Group B.",
+            },
+          ],
+        })
+      );
+    const result = await convertPowerPoint(input, "chart.pptx");
+    if ("error" in result) throw new Error(result.error);
+    expect(result.errors).toHaveLength(2);
+    expect(result.errors.map((f) => f.severity)).toEqual(["warning", "error"]);
+    expect(result.errors.every((f) => f.location?.sourcePages?.[0] === 1)).toBe(
+      true
+    );
   });
 
   it("fails before model work when PDF preview omits a slide", async () => {
