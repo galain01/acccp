@@ -30,7 +30,7 @@ try {
     )
       continue;
     if (
-      !/^(?:lib[/\\]pdf-(?:rendering-child|image-alternatives|revisions)\.mjs|node_modules[/\\](?:pdfjs-dist|@napi-rs)[/\\]|node_modules[/\\]pdf-lib[/\\]dist[/\\]pdf-lib\.min\.js$)/.test(
+      !/^(?:lib[/\\]pdf-(?:rendering-child|image-alternatives|revisions|render-warnings)\.mjs|node_modules[/\\](?:pdfjs-dist|@napi-rs)[/\\]|node_modules[/\\]pdf-lib[/\\]dist[/\\]pdf-lib\.min\.js$)/.test(
         sub
       )
     )
@@ -152,6 +152,7 @@ try {
         `--allow-fs-read=${childPath}`,
         `--allow-fs-read=${join(target, "lib/pdf-image-alternatives.mjs")}`,
         `--allow-fs-read=${join(target, "lib/pdf-revisions.mjs")}`,
+        `--allow-fs-read=${join(target, "lib/pdf-render-warnings.mjs")}`,
         `--allow-fs-read=${join(target, "node_modules/pdf-lib/dist/pdf-lib.min.js")}`,
         `--allow-fs-read=${join(target, "node_modules/pdfjs-dist")}`,
         `--allow-fs-read=${join(target, "node_modules/@napi-rs")}`,

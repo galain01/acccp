@@ -61,7 +61,20 @@ service is introduced. Output is bounded and stderr is capped at 16 KiB; failure
 discard partial output and use a safe faculty-facing message. Optional page text
 is capped at 100,000 characters per
 page and 500,000 total; unavailable text remains unknown rather than truncated
-evidence. Rendering warnings fail the operation to avoid silently omitted images.
+evidence. Content and unknown rendering warnings fail the operation to avoid
+silently omitted images or text. The one narrow exception is PDF.js's exact
+`Warning: TT: undefined function: N` message (one string argument, canonical
+integer 0–65535). In the pinned PDF.js 6.3.289, this disables invalid TrueType
+hint instructions while retaining glyph outlines; this renderer uses
+`disableFontFace: true`. Missing glyph/font/image, encoding and other warnings
+remain fatal. `lib/pdf-render-warnings.mjs` defines the exact classifier and is
+included in the traced runtime and child filesystem permissions. Reassess this
+exception when changing PDF.js or its font-rendering configuration.
+The relevant implementation is PDF.js's [font sanitization](https://github.com/mozilla/pdf.js/blob/master/src/core/fonts.js);
+the installed version's warning, hint-removal and outline-rendering paths were
+also checked directly. A five-slide PPTX preview reproduced this warning;
+both PDF.js and Poppler showed its complete text and images. After the narrow
+exception, the real application renderer and both model stages completed.
 
 Each Node process runs at most one renderer child at a time, with a FIFO queue
 of at most four waiting requests. A request waits at most 30 seconds for a slot,
