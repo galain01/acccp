@@ -208,6 +208,7 @@ interface InternalObject {
   element: Element;
   properties: Element;
   info: PptxObject;
+  emptyPlaceholderHash?: string;
 }
 interface InternalSlide {
   document: Document;
@@ -478,6 +479,438 @@ function placeholder(element: Element): Element | undefined {
   );
   const properties = container && direct(container, P, "nvPr");
   return properties && direct(properties, P, "ph");
+}
+
+const EMPTY_PLACEHOLDER_TYPES = new Set([
+  "obj",
+  "body",
+  "title",
+  "ctrTitle",
+  "subTitle",
+  "chart",
+  "tbl",
+  "clipArt",
+  "dgm",
+  "media",
+  "pic",
+]);
+const EMPTY_TEXT_FORMATTING = new Set([
+  "bodyPr",
+  "lstStyle",
+  "p",
+  "pPr",
+  "r",
+  "rPr",
+  "endParaRPr",
+  "defRPr",
+  "t",
+  "br",
+  "noAutofit",
+  "normAutofit",
+  "spAutoFit",
+  "defPPr",
+  "tabLst",
+  "tab",
+  "lnSpc",
+  "spcBef",
+  "spcAft",
+  "spcPct",
+  "spcPts",
+  "buNone",
+  "buFont",
+  "buChar",
+  "buAutoNum",
+  "buClr",
+  "buClrTx",
+  "buSzPct",
+  "buSzPts",
+  "buSzTx",
+  "buFontTx",
+  "latin",
+  "ea",
+  "cs",
+  "sym",
+  "solidFill",
+  "noFill",
+  "schemeClr",
+  "srgbClr",
+  "scrgbClr",
+  "prstClr",
+  "sysClr",
+  "hslClr",
+  "tint",
+  "shade",
+  "alpha",
+  "alphaOff",
+  "alphaMod",
+  "hue",
+  "hueOff",
+  "hueMod",
+  "sat",
+  "satOff",
+  "satMod",
+  "lum",
+  "lumOff",
+  "lumMod",
+  "red",
+  "redOff",
+  "redMod",
+  "green",
+  "greenOff",
+  "greenMod",
+  "blue",
+  "blueOff",
+  "blueMod",
+  "comp",
+  "inv",
+  "gray",
+  "gamma",
+  "invGamma",
+  "highlight",
+  ...Array.from({ length: 9 }, (_, index) => `lvl${index + 1}pPr`),
+]);
+
+function onlyMetadataAttributes(node: Element, allowed: string[]): boolean {
+  return Array.from(node.attributes).every(
+    (attribute) =>
+      attribute.namespaceURI === "http://www.w3.org/2000/xmlns/" ||
+      (!attribute.namespaceURI && allowed.includes(attribute.name))
+  );
+}
+function onlyMetadataContent(node: Element): boolean {
+  return Array.from(node.childNodes).every(
+    (child) =>
+      child.nodeType === 1 ||
+      ((child.nodeType === 3 || child.nodeType === 4) &&
+        !child.nodeValue?.trim())
+  );
+}
+
+/** This standard creation identifier has no rendered or spoken content. Unknown extensions stay protected. */
+function onlyCreationExtensions(properties: Element): boolean {
+  return (
+    onlyMetadataContent(properties) &&
+    children(properties).every(
+      (list) =>
+        list.namespaceURI === A &&
+        list.localName === "extLst" &&
+        onlyMetadataAttributes(list, []) &&
+        onlyMetadataContent(list) &&
+        children(list).every((extension) => {
+          const payload = children(extension);
+          const creation = payload[0];
+          return (
+            extension.namespaceURI === A &&
+            extension.localName === "ext" &&
+            extension.getAttribute("uri")?.toUpperCase() ===
+              "{FF2B5EF4-FFF2-40B4-BE49-F238E27FC236}" &&
+            onlyMetadataAttributes(extension, ["uri"]) &&
+            onlyMetadataContent(extension) &&
+            payload.length === 1 &&
+            creation.namespaceURI ===
+              "http://schemas.microsoft.com/office/drawing/2014/main" &&
+            creation.localName === "creationId" &&
+            children(creation).length === 0 &&
+            onlyMetadataContent(creation) &&
+            /^\{[0-9a-f-]{36}\}$/i.test(creation.getAttribute("id") ?? "") &&
+            onlyMetadataAttributes(creation, ["id"])
+          );
+        })
+    )
+  );
+}
+
+/** Native table/slide bookkeeping IDs identify their own container, not another slide object. */
+function bookkeepingExtensions(list: Element): boolean {
+  const parent = list.parentNode;
+  if (!parent || list.localName !== "extLst") return false;
+  if (parent.namespaceURI === P && parent.localName === "cNvPr")
+    return onlyCreationExtensions(parent as Element);
+  const drawing2014 = "http://schemas.microsoft.com/office/drawing/2014/main";
+  const powerpoint2010 =
+    "http://schemas.microsoft.com/office/powerpoint/2010/main";
+  const rule = [
+    {
+      parent: "gridCol",
+      namespace: A,
+      uri: "{9D8B030D-6E8A-4147-A177-3AD203B41FA5}",
+      payload: "colId",
+      payloadNamespace: drawing2014,
+    },
+    {
+      parent: "tr",
+      namespace: A,
+      uri: "{0D108BD9-81ED-4DB2-BD59-A6C34878D82A}",
+      payload: "rowId",
+      payloadNamespace: drawing2014,
+    },
+    {
+      parent: "nvPr",
+      namespace: P,
+      uri: "{D42A27DB-BD31-4B8C-83A1-F6EECF244321}",
+      payload: "modId",
+      payloadNamespace: powerpoint2010,
+    },
+    {
+      parent: "cSld",
+      namespace: P,
+      uri: "{BB962C8B-B14F-4D97-AF65-F5344CB8AC3E}",
+      payload: "creationId",
+      payloadNamespace: powerpoint2010,
+    },
+  ].find(
+    (entry) =>
+      parent.namespaceURI === entry.namespace &&
+      parent.localName === entry.parent &&
+      list.namespaceURI === entry.namespace
+  );
+  if (!rule) return false;
+  return (
+    onlyMetadataAttributes(list, []) &&
+    onlyMetadataContent(list) &&
+    children(list).every((extension) => {
+      const payload = children(extension);
+      const value = payload[0]?.getAttribute("val") ?? "";
+      return (
+        extension.namespaceURI === rule.namespace &&
+        extension.localName === "ext" &&
+        extension.getAttribute("uri")?.toUpperCase() === rule.uri &&
+        onlyMetadataAttributes(extension, ["uri"]) &&
+        onlyMetadataContent(extension) &&
+        payload.length === 1 &&
+        payload[0].namespaceURI === rule.payloadNamespace &&
+        payload[0].localName === rule.payload &&
+        children(payload[0]).length === 0 &&
+        onlyMetadataContent(payload[0]) &&
+        onlyMetadataAttributes(payload[0], ["val"]) &&
+        /^\d{1,10}$/.test(value) &&
+        Number(value) <= 0xffffffff
+      );
+    })
+  );
+}
+
+/** An empty placeholder may inherit prompt text, but never authored shape paint or a field. */
+function emptyPlaceholderShape(element: Element, template = false): boolean {
+  if (element.namespaceURI !== P || element.localName !== "sp") return false;
+  const ph = placeholder(element);
+  const properties = objectProperties(element);
+  const nonvisual = direct(element, P, "nvSpPr");
+  const shape = direct(element, P, "spPr");
+  const body = direct(element, P, "txBody");
+  if (
+    !ph ||
+    !properties ||
+    !nonvisual ||
+    !shape ||
+    !EMPTY_PLACEHOLDER_TYPES.has(ph.getAttribute("type") || "obj") ||
+    properties.getAttribute("descr")?.trim() ||
+    properties.getAttribute("title")?.trim() ||
+    (!template && textOf(element).trim()) ||
+    !onlyCreationExtensions(properties)
+  )
+    return false;
+  if (
+    children(element).some(
+      (node) =>
+        node.namespaceURI !== P ||
+        !["nvSpPr", "spPr", "txBody"].includes(node.localName ?? "")
+    ) ||
+    children(nonvisual).some(
+      (node) =>
+        node.namespaceURI !== P ||
+        !["cNvPr", "cNvSpPr", "nvPr"].includes(node.localName ?? "")
+    )
+  )
+    return false;
+  const specific = direct(nonvisual, P, "cNvSpPr");
+  const application = direct(nonvisual, P, "nvPr");
+  if (
+    !specific ||
+    !application ||
+    children(specific).some(
+      (node) =>
+        node.namespaceURI !== A ||
+        node.localName !== "spLocks" ||
+        children(node).length > 0
+    ) ||
+    children(application).some(
+      (node) => node !== ph && !bookkeepingExtensions(node)
+    ) ||
+    children(ph).length > 0
+  )
+    return false;
+  // No explicit or inherited fills, line paint, effects, custom geometry, or theme style references.
+  if (
+    children(shape).some((node) => {
+      if (node.namespaceURI !== A) return true;
+      if (node.localName === "xfrm")
+        return children(node).some(
+          (child) =>
+            child.namespaceURI !== A ||
+            !["off", "ext"].includes(child.localName ?? "") ||
+            children(child).length > 0
+        );
+      if (node.localName === "prstGeom")
+        return (
+          node.getAttribute("prst") !== "rect" ||
+          children(node).some(
+            (child) =>
+              child.namespaceURI !== A ||
+              child.localName !== "avLst" ||
+              children(child).length > 0
+          )
+        );
+      if (node.localName === "noFill" || node.localName === "effectLst")
+        return children(node).length > 0;
+      if (node.localName === "ln")
+        return (
+          !direct(node, A, "noFill") ||
+          children(node).some(
+            (child) =>
+              child.namespaceURI !== A ||
+              child.localName !== "noFill" ||
+              children(child).length > 0
+          )
+        );
+      return true;
+    })
+  )
+    return false;
+  const bodyNodes = body ? descendants(body, "*", "*") : [];
+  if (
+    bodyNodes.some(
+      (node) =>
+        node.namespaceURI !== A ||
+        !EMPTY_TEXT_FORMATTING.has(node.localName ?? "")
+    )
+  )
+    return false;
+  // Relationship-valued or opaque extension attributes can carry interactions/content.
+  return [element, ...descendants(element, "*", "*")].every((node) =>
+    Array.from(node.attributes).every(
+      (attribute) =>
+        !attribute.namespaceURI ||
+        attribute.namespaceURI === "http://www.w3.org/2000/xmlns/" ||
+        (attribute.namespaceURI === "http://www.w3.org/XML/1998/namespace" &&
+          attribute.localName === "space")
+    )
+  );
+}
+
+function markEmptyPlaceholders(
+  objects: InternalObject[],
+  document: Document,
+  layout: Document | undefined,
+  master: Document | undefined,
+  slideRelationships: Relationship[],
+  pkg: Package
+): void {
+  // Removing a referenced object could break animation or interactive structure.
+  if (
+    descendants(document, P, "timing").length ||
+    descendants(document, P, "bldLst").length ||
+    slideRelationships.some((relation) =>
+      /comments?|tags|vmlDrawing|control/i.test(relation.type)
+    )
+  )
+    return;
+  const slideElements = descendants(document, "*", "*");
+  // Opaque slide-level extensions or alternate content may reference shape IDs in an unknown form.
+  if (
+    slideElements.some(
+      (node) =>
+        node.localName === "AlternateContent" ||
+        (node.localName === "extLst" &&
+          children(node).length > 0 &&
+          !bookkeepingExtensions(node))
+    )
+  )
+    return;
+  const references = new Set<string>();
+  for (const node of slideElements)
+    for (const attribute of Array.from(node.attributes)) {
+      if (
+        /^(?:spid|shapeid|shape_id|shape-id)$/i.test(
+          attribute.localName ?? ""
+        ) ||
+        (attribute.localName === "id" &&
+          node.namespaceURI === A &&
+          ["stCxn", "endCxn"].includes(node.localName ?? ""))
+      )
+        references.add(attribute.value);
+    }
+  for (const object of objects) {
+    if (
+      object.info.grouped ||
+      references.has(object.info.id) ||
+      !emptyPlaceholderShape(object.element)
+    )
+      continue;
+    const ph = placeholder(object.element)!;
+    const inherited = layout
+      ? descendants(layout, "*", "*").filter((shape) => {
+          const other = placeholder(shape);
+          return (
+            other &&
+            (other.getAttribute("idx") ?? "0") ===
+              (ph.getAttribute("idx") ?? "0")
+          );
+        })
+      : [];
+    if (
+      inherited.length > 1 ||
+      inherited.some((shape) => !emptyPlaceholderShape(shape, true))
+    )
+      continue;
+    const type =
+      ph.getAttribute("type") ||
+      (inherited[0] && placeholder(inherited[0])?.getAttribute("type")) ||
+      "obj";
+    const masterType = ["obj", "body", "subTitle"].includes(type)
+      ? "body"
+      : ["title", "ctrTitle"].includes(type)
+        ? "title"
+        : type;
+    const masterShapes = master
+      ? descendants(master, "*", "*").filter(
+          (shape) => placeholder(shape)?.getAttribute("type") === masterType
+        )
+      : [];
+    if (
+      masterShapes.length > 1 ||
+      masterShapes.some((shape) => !emptyPlaceholderShape(shape, true))
+    )
+      continue;
+    // A creation ID referenced elsewhere may anchor comments or an extension we do not understand.
+    const creation = descendants(
+      object.element,
+      "http://schemas.microsoft.com/office/drawing/2014/main",
+      "creationId"
+    )[0]?.getAttribute("id");
+    if (
+      creation &&
+      [...pkg.xml.values()].some((part) =>
+        descendants(part, "*", "*").some(
+          (node) =>
+            !object.element.contains(node) &&
+            Array.from(node.attributes).some(
+              (attribute) =>
+                attribute.value === creation &&
+                !(
+                  node.namespaceURI ===
+                    "http://schemas.microsoft.com/office/drawing/2014/main" &&
+                  node.localName === "creationId" &&
+                  attribute.localName === "id"
+                )
+            )
+        )
+      )
+    )
+      continue;
+    object.info.emptyPlaceholder = true;
+    object.emptyPlaceholderHash = pptxElementHash(object.element);
+  }
 }
 
 function tableInfo(table: Element): NonNullable<PptxObject["table"]> {
@@ -945,6 +1378,7 @@ async function loadPackage(
       diagramTexts,
       slideRels
     );
+    markEmptyPlaceholders(objects, document, layout, master, slideRels, pkg);
     const hidden =
       root.getAttribute("show") === "0" ||
       root.getAttribute("show") === "false";
@@ -1056,6 +1490,7 @@ export function validatePptxRepairPlan(
       !isRecord(slide) ||
       !onlyKeys(slide, [
         "slideNumber",
+        "removeEmptyPlaceholders",
         "titleObjectId",
         "descriptions",
         "decorativeObjects",
@@ -1074,6 +1509,15 @@ export function validatePptxRepairPlan(
       (slide.slideNumber as number) < 1 ||
       (slide.slideNumber as number) > LIMITS.slides ||
       slides.has(slide.slideNumber as number)
+    )
+      return false;
+    if (
+      slide.removeEmptyPlaceholders !== undefined &&
+      (!Array.isArray(slide.removeEmptyPlaceholders) ||
+        slide.removeEmptyPlaceholders.length > 300 ||
+        !slide.removeEmptyPlaceholders.every(id) ||
+        new Set(slide.removeEmptyPlaceholders).size !==
+          slide.removeEmptyPlaceholders.length)
     )
       return false;
     if (
@@ -1263,6 +1707,7 @@ export function validatePptxRepairPlan(
               "description",
               "decorative",
               "long-description",
+              "empty-placeholder",
               "table-header",
               "table-caption",
               "reading-order",
@@ -1349,6 +1794,28 @@ export function validatePptxRepairPlan(
           (
             slide.decorativeObjects as PptxSlideRepairs["decorativeObjects"]
           )?.some((decorative) => decorative.objectId === entry.objectId)
+      )
+    )
+      return false;
+    if (
+      (slide.removeEmptyPlaceholders as string[] | undefined)?.some(
+        (objectId) =>
+          slide.titleObjectId === objectId ||
+          [
+            "descriptions",
+            "decorativeObjects",
+            "longDescriptions",
+            "tableHeaders",
+            "splitTableCaption",
+            "textLanguages",
+            "linkTexts",
+            "textStyles",
+            "objectBounds",
+          ].some((field) =>
+            (slide[field] as { objectId: string }[] | undefined)?.some(
+              (operation) => operation.objectId === objectId
+            )
+          )
       )
     )
       return false;
@@ -2053,6 +2520,32 @@ function applySlide(
       });
     }
   }
+  for (const objectId of repair.removeEmptyPlaceholders ?? []) {
+    const object = getObject(objectId);
+    if (
+      !revisioned ||
+      !object?.info.emptyPlaceholder ||
+      !object.emptyPlaceholderHash ||
+      object.element.parentNode !== slide.tree ||
+      pptxElementHash(object.element) !== object.emptyPlaceholderHash
+    ) {
+      review(
+        "empty-placeholder-review",
+        "This object was kept because it could not be verified as an unused, empty placeholder.",
+        "Check this object in PowerPoint before removing it; it may contain information, styling, a field, or a reference used elsewhere.",
+        objectId
+      );
+      continue;
+    }
+    slide.tree.removeChild(object.element);
+    changes.push({
+      type: "empty-placeholder",
+      slideNumber,
+      objectId,
+      message:
+        "Removed an unused empty placeholder from this slide; kept the reusable slide layout and master.",
+    });
+  }
   for (const change of changes.slice(before)) {
     change.operationId ??= `${slideNumber}:${change.type}:${change.objectId ?? "slide"}`;
   }
@@ -2431,10 +2924,21 @@ export async function applyPptxRepairs(
   // Text, grouping and visibility survive every permitted metadata/order repair.
   pkg.inspection.slides.forEach((slide, index) => {
     const after = verified.inspection.slides[index];
+    const removedIds = new Set(
+      changes
+        .filter(
+          (change) =>
+            change.type === "empty-placeholder" &&
+            change.slideNumber === slide.slideNumber
+        )
+        .map((change) => change.objectId)
+    );
     if (
       slide.partName !== after.partName ||
       slide.hidden !== after.hidden ||
-      slide.objects.length + pkg.slides[index].captionPatches.length !==
+      slide.objects.length -
+        removedIds.size +
+        pkg.slides[index].captionPatches.length !==
         after.objects.length
     )
       throw new PptxPackageError(
@@ -2443,6 +2947,20 @@ export async function applyPptxRepairs(
       );
     for (const object of slide.objects) {
       const current = after.objects.find((item) => item.id === object.id);
+      if (removedIds.has(object.id)) {
+        if (
+          !object.emptyPlaceholder ||
+          current ||
+          !plan.slides
+            .find((repair) => repair.slideNumber === slide.slideNumber)
+            ?.removeEmptyPlaceholders?.includes(object.id)
+        )
+          throw new PptxPackageError(
+            "pptx_integrity",
+            "A placeholder removal failed its content-preservation check."
+          );
+        continue;
+      }
       const patch = pkg.slides[index].captionPatches.find(
         (item) => item.tableId === object.id
       );

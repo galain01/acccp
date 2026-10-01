@@ -21,6 +21,7 @@ export interface PptxChange {
     | "description"
     | "decorative"
     | "long-description"
+    | "empty-placeholder"
     | "table-header"
     | "table-caption"
     | "reading-order"
@@ -62,6 +63,8 @@ export interface PptxObject {
   grouped: boolean;
   parentId: string | null;
   language: string | null;
+  /** Verified empty slide-local placeholder with no content, appearance or references to preserve. */
+  emptyPlaceholder?: true;
   /** Native shape interactions. Targets are read from relationships, never fetched. */
   actions?: {
     trigger: "click" | "hover";
@@ -109,6 +112,8 @@ export interface PptxInspection {
 
 export interface PptxSlideRepairs {
   slideNumber: number;
+  /** Remove only original objects independently verified as empty placeholders. */
+  removeEmptyPlaceholders?: string[];
   /** Select an existing, nonempty, top-level text object. Text is never rewritten. */
   titleObjectId?: string;
   /** Replacement of authored descriptions requires explicit revisioned mode. */

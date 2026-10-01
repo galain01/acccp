@@ -24,13 +24,59 @@ function invalid(
   throw new PptxPackageError("pptx_integrity", message);
 }
 
-/** No machine finding currently proves a missing title/header/description's intended meaning. */
+/** The package reader identifies empty placeholders using exact native evidence. */
 export function buildPptxMechanicalPlan(
   inspection: PptxInspection
 ): PptxRepairPlan {
   return {
-    slides: inspection.slides.map(({ slideNumber }) => ({ slideNumber })),
+    slides: inspection.slides.map(({ slideNumber, objects }) => {
+      const removeEmptyPlaceholders = objects
+        .filter((object) => object.emptyPlaceholder === true)
+        .map((object) => object.id);
+      return {
+        slideNumber,
+        ...(removeEmptyPlaceholders.length ? { removeEmptyPlaceholders } : {}),
+      };
+    }),
   };
+}
+
+/** Keep removed IDs in their original slots so a later restore has a full permutation. */
+export function normalizePptxReadingOrders(
+  plan: PptxRepairPlan,
+  original: PptxInspection
+): PptxRepairPlan {
+  if (!validatePptxRepairPlan(plan)) invalid();
+  const normalized = structuredClone(plan);
+  for (const repair of normalized.slides) {
+    if (!repair.readingOrder || !repair.removeEmptyPlaceholders?.length)
+      continue;
+    const slide = original.slides.find(
+      (item) => item.slideNumber === repair.slideNumber
+    );
+    if (!slide) invalid();
+    const objects = slide.objects.filter((object) => !object.grouped);
+    const originalIds = objects.map((object) => object.id);
+    const removed = new Set(repair.removeEmptyPlaceholders);
+    if (
+      [...removed].some(
+        (id) =>
+          !objects.some((object) => object.id === id && object.emptyPlaceholder)
+      )
+    )
+      invalid();
+    const order = repair.readingOrder;
+    const sameIds = (expected: string[]) =>
+      order.length === expected.length &&
+      expected.every((id) => order.includes(id));
+    if (sameIds(originalIds)) continue;
+    if (!sameIds(originalIds.filter((id) => !removed.has(id)))) invalid();
+    let index = 0;
+    repair.readingOrder = originalIds.map((id) =>
+      removed.has(id) ? id : order[index++]
+    );
+  }
+  return normalized;
 }
 
 /** Combine a corrective pass with earlier operations so export always starts at the original. */
@@ -54,6 +100,14 @@ export function mergePptxRepairPlans(
     if (next.readingOrder !== undefined)
       target.readingOrder = [...next.readingOrder];
     if (next.language !== undefined) target.language = { ...next.language };
+    if (next.removeEmptyPlaceholders?.length) {
+      target.removeEmptyPlaceholders = [
+        ...new Set([
+          ...(target.removeEmptyPlaceholders ?? []),
+          ...next.removeEmptyPlaceholders,
+        ]),
+      ];
+    }
     for (const key of [
       "descriptions",
       "decorativeObjects",
@@ -185,6 +239,12 @@ function revisionValues(
         before?.description || "No description",
         after?.description || "No description",
       ];
+    case "empty-placeholder":
+      if (!before?.emptyPlaceholder || after) invalid();
+      return [
+        `Empty placeholder: ${before.name || "Unnamed placeholder"}`,
+        "Removed from this slide. No lesson content was deleted.",
+      ];
     case "decorative":
       return [before, after].map((object) =>
         object?.decorative
@@ -224,16 +284,26 @@ function revisionValues(
       return [positionSummary(before), positionSummary(after)];
     case "link-text":
       return [before?.text ?? "", after?.text ?? ""];
-    case "reading-order":
+    case "reading-order": {
+      const removed = new Set(
+        beforeSlide.objects
+          .filter(
+            (object) =>
+              object.emptyPlaceholder &&
+              !afterSlide.objects.some((item) => item.id === object.id)
+          )
+          .map((object) => object.id)
+      );
       return [beforeSlide, afterSlide].map((slide) =>
         slide.objects
-          .filter((object) => !object.grouped)
+          .filter((object) => !object.grouped && !removed.has(object.id))
           .map(
             (object, index) =>
               `${index + 1}. ${objectLabel(beforeSlide.objects.find((source) => source.id === object.id) ?? object)}`
           )
           .join("\n")
       ) as [string, string];
+    }
     case "table-header":
       return [
         `First row is ${before?.table?.firstRow ? "" : "not "}marked as column labels: ${before?.table?.cells[0]?.join(" | ") ?? ""}`,
@@ -258,6 +328,7 @@ function revisionValues(
 const labels: Record<PptxChange["type"], string> = {
   title: "Identify the slide title",
   description: "Describe the object's information",
+  "empty-placeholder": "Remove empty placeholder",
   decorative: "Choose whether students hear this image",
   "long-description": "Add slides with the full image description",
   language: "Set the passage's spoken language",
@@ -446,6 +517,9 @@ function selectedPlan(
         target.titleObjectId = slide.titleObjectId;
       if (slide.readingOrder && operationIds.has(key("reading-order", "slide")))
         target.readingOrder = slide.readingOrder;
+      target.removeEmptyPlaceholders = slide.removeEmptyPlaceholders?.filter(
+        (id) => operationIds.has(key("empty-placeholder", id))
+      );
       const fields = {
         descriptions: "description",
         decorativeObjects: "decorative",

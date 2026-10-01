@@ -643,6 +643,258 @@ describe("PowerPoint repair orchestration", () => {
   });
 });
 
+describe("deterministic empty-placeholder preprocessing", () => {
+  const original = (): PptxInspection => {
+    const source = structuredClone(inspection);
+    source.slides[0].objects.push(
+      {
+        ...source.slides[0].objects[0],
+        id: "4",
+        name: "Content Placeholder 4",
+        text: "",
+        isTitle: false,
+        emptyPlaceholder: true,
+      },
+      {
+        ...source.slides[0].objects[0],
+        id: "3",
+        name: "Image 3",
+        kind: "image",
+        text: "",
+        isTitle: false,
+        description: "A tree beside the path.",
+      }
+    );
+    return source;
+  };
+  const cleaned = () => {
+    const source = original();
+    source.slides[0].objects = source.slides[0].objects.filter(
+      (object) => object.id !== "4"
+    );
+    return source;
+  };
+  const cleanupChange: PptxChange = {
+    type: "empty-placeholder",
+    slideNumber: 1,
+    objectId: "4",
+    message: "Removed an unused empty placeholder.",
+    operationId: "1:empty-placeholder:4",
+  };
+  const cleanBuffer = Buffer.from("mechanically-cleaned-pptx");
+  const prepare = () => {
+    mocks.inspect.mockResolvedValue(original());
+    mocks.repair.mockResolvedValueOnce({
+      buffer: cleanBuffer,
+      inspection: cleaned(),
+      findings: [],
+      changes: [cleanupChange],
+    });
+    mocks.repair.mockResolvedValue({
+      buffer: output,
+      inspection: cleaned(),
+      findings: [],
+      changes: [cleanupChange],
+    });
+    mocks.render
+      .mockResolvedValueOnce(Buffer.from("%PDF-original"))
+      .mockResolvedValueOnce(Buffer.from("%PDF-cleaned"))
+      .mockResolvedValue(Buffer.from("%PDF-final"));
+  };
+
+  it("removes verified placeholders before model interpretation and keeps original evidence for audit and replay", async () => {
+    prepare();
+    mocks.call
+      .mockReset()
+      .mockResolvedValueOnce(
+        resultCall({
+          slides: [{ slideNumber: 1, readingOrder: ["2", "3"] }],
+          findings: [],
+        })
+      )
+      .mockResolvedValueOnce(resultCall(audit));
+    const result = await convertPowerPoint(input, "test.pptx");
+    if ("error" in result) throw new Error(result.error);
+    expect(mocks.repair.mock.calls[0]).toEqual([
+      input,
+      { slides: [{ slideNumber: 1, removeEmptyPlaceholders: ["4"] }] },
+      { revisioned: true },
+    ]);
+    expect(mocks.render.mock.calls.map((call) => call[0])).toEqual([
+      input,
+      cleanBuffer,
+      output,
+    ]);
+    const repairEvidence = mocks.call.mock.calls[0][1];
+    const inventory = repairEvidence.find(
+      (part: { type: string; text?: string }) =>
+        part.type === "text" &&
+        part.text?.startsWith(
+          "PowerPoint inventory after deterministic cleanup"
+        )
+    );
+    expect(inventory.text).not.toContain('"id":"4"');
+    expect(repairEvidence).toContainEqual({
+      type: "file",
+      file: {
+        filename: "original-slides.pdf",
+        file_data: `data:application/pdf;base64,${Buffer.from("%PDF-cleaned").toString("base64")}`,
+      },
+    });
+    expect(mocks.tracked.mock.calls[0][0]).toEqual(input);
+    expect(mocks.tracked.mock.calls[0][1].slides[0]).toMatchObject({
+      removeEmptyPlaceholders: ["4"],
+      readingOrder: ["2", "4", "3"],
+    });
+    expect(mocks.call.mock.calls[1][1]).toContainEqual(
+      expect.objectContaining({
+        type: "text",
+        text: expect.stringContaining('"emptyPlaceholder":true'),
+      })
+    );
+    expect(mocks.call.mock.calls[1][0]).toContain(
+      "Their absence is intentional and is not lost teaching content"
+    );
+    expect(result.calls).toHaveLength(2);
+    expect(result.errors).toEqual([]);
+  });
+
+  it("rejects model-proposed deletion fields rather than replacing deterministic cleanup", async () => {
+    prepare();
+    mocks.call.mockReset().mockResolvedValueOnce(
+      resultCall({
+        slides: [{ slideNumber: 1, removeEmptyPlaceholders: [] }],
+        findings: [],
+      })
+    );
+    const result = await convertPowerPoint(input, "test.pptx");
+    expect(result).toMatchObject({
+      diagnostic: { code: "pptx_invalid_plan" },
+      calls: [{ costUsd: 0.01 }],
+    });
+    expect(mocks.tracked).not.toHaveBeenCalled();
+  });
+
+  it("normalizes an audit's cleaned reading order without dropping the original removal plan", async () => {
+    prepare();
+    mocks.repair.mockResolvedValueOnce({
+      buffer: output,
+      inspection: cleaned(),
+      findings: [],
+      changes: [cleanupChange],
+    });
+    mocks.repair.mockResolvedValue({
+      buffer: Buffer.from("corrected-order"),
+      inspection: cleaned(),
+      findings: [],
+      changes: [cleanupChange],
+    });
+    mocks.call
+      .mockReset()
+      .mockResolvedValueOnce(resultCall(plan))
+      .mockResolvedValueOnce(
+        resultCall({
+          ...audit,
+          correctivePlan: {
+            slides: [{ slideNumber: 1, readingOrder: ["3", "2"] }],
+          },
+        })
+      )
+      .mockResolvedValueOnce(resultCall(audit));
+    const result = await convertPowerPoint(input, "test.pptx");
+    if ("error" in result) throw new Error(result.error);
+    expect(mocks.tracked.mock.calls[1][1].slides[0]).toMatchObject({
+      removeEmptyPlaceholders: ["4"],
+      readingOrder: ["3", "4", "2"],
+    });
+    expect(result.calls).toHaveLength(3);
+    expect(result.errors).toEqual([]);
+  });
+
+  it.each([
+    { readingOrder: ["2"] },
+    {
+      objectBounds: [
+        {
+          objectId: "4",
+          sourceRect: { x: 0, y: 0, width: 50, height: 10 },
+          rect: { x: 0, y: 0, width: 60, height: 10 },
+        },
+      ],
+    },
+    {
+      revisionNotes: [
+        {
+          type: "empty-placeholder",
+          objectId: "4",
+          reason: "Replace the recorded mechanical explanation.",
+        },
+      ],
+    },
+  ])(
+    "rejects semantic edits to a placeholder already removed by code: %j",
+    async (operation) => {
+      prepare();
+      mocks.call.mockReset().mockResolvedValueOnce(
+        resultCall({
+          slides: [{ slideNumber: 1, ...operation }],
+          findings: [],
+        })
+      );
+      const result = await convertPowerPoint(input, "test.pptx");
+      expect(result).toMatchObject({
+        diagnostic: { code: "pptx_invalid_plan" },
+      });
+      expect(mocks.tracked).not.toHaveBeenCalled();
+    }
+  );
+
+  it("keeps the audited cleaned output if a corrective plan targets a removed placeholder", async () => {
+    prepare();
+    mocks.call
+      .mockReset()
+      .mockResolvedValueOnce(resultCall(plan))
+      .mockResolvedValueOnce(
+        resultCall({
+          ...audit,
+          correctivePlan: {
+            slides: [
+              {
+                slideNumber: 1,
+                descriptions: [
+                  { objectId: "4", text: "Bring back the unused box." },
+                ],
+              },
+            ],
+          },
+        })
+      );
+    const result = await convertPowerPoint(input, "test.pptx");
+    if ("error" in result) throw new Error(result.error);
+    expect(mocks.tracked).toHaveBeenCalledTimes(1);
+    expect(result.pptx).toEqual(output);
+    expect(result.calls).toHaveLength(2);
+    expect(
+      result.errors.some((finding) =>
+        finding.message.includes("previously checked version")
+      )
+    ).toBe(true);
+  });
+
+  it("keeps an intentionally restored placeholder during the selected-version check", async () => {
+    mocks.inspect.mockResolvedValue(original());
+    mocks.call.mockReset().mockResolvedValueOnce(resultCall(audit));
+    const result = await recheckPowerPointRevision(input, input);
+    if ("error" in result) throw new Error(result.error);
+    expect(result.pptx).toEqual(input);
+    expect(mocks.repair).not.toHaveBeenCalled();
+    expect(mocks.tracked).not.toHaveBeenCalled();
+    expect(mocks.call.mock.calls[0][0]).toContain(
+      "An instructor may restore an empty placeholder"
+    );
+  });
+});
+
 describe("appended image description slides", () => {
   const addedInspection = (): PptxInspection => ({
     ...structuredClone(inspection),

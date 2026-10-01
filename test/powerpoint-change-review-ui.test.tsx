@@ -141,6 +141,75 @@ afterEach(async () => {
 });
 
 describe("PowerPoint revision choices", () => {
+  it("explains empty placeholder removal with one context image and saves keep or restore choices", async () => {
+    const data = fixture();
+    data.changes = [
+      {
+        id: "empty-box",
+        type: "empty-placeholder",
+        slideNumber: 2,
+        objectId: "4",
+        label: "Remove empty placeholder",
+        before: "Empty placeholder: Content Placeholder 4",
+        after: "Removed from this slide. No lesson content was deleted.",
+        reason: "This unused box contains no authored content.",
+        operationIds: ["2:empty-placeholder:4"],
+        editableDescription: true,
+      },
+    ];
+    data.includedChangeIds = ["empty-box"];
+    data.previews = [
+      {
+        slideNumber: 2,
+        before: "data:image/png;base64,original",
+        after: "data:image/png;base64,repaired",
+      },
+    ];
+    await mount(data);
+    const article = host.querySelector("article")!;
+    expect(article.textContent).toContain("Original placeholder");
+    expect(article.textContent).toContain("Suggested placeholder change");
+    expect(article.textContent).toContain(
+      "Empty placeholder: Content Placeholder 4"
+    );
+    expect(article.textContent).toContain(
+      "Removed from this slide. No lesson content was deleted."
+    );
+    expect(article.textContent).toContain("Click to add text");
+    expect(article.textContent).toContain(
+      "Restore original brings the box back"
+    );
+    expect(article.textContent).toContain(
+      "not in the slide show or this preview"
+    );
+    expect(article.textContent).toContain("View slide for context");
+    expect(article.textContent).not.toContain("Compare slide appearance");
+    expect(article.querySelectorAll("img")).toHaveLength(1);
+    expect(article.querySelector("img")?.getAttribute("src")).toBe(
+      "data:image/png;base64,original"
+    );
+    expect(
+      Array.from(article.querySelectorAll("button")).some(
+        (item) => item.textContent === "Edit wording"
+      )
+    ).toBe(false);
+    expect(article.querySelector("textarea")).toBeNull();
+    await click(button("Check and download PowerPoint"));
+    expect(lastSelection().includedChangeIds).toEqual(["empty-box"]);
+    await click(button("Restore original"));
+    expect(article.textContent).toContain("Original will be used");
+    expect(article.textContent).toContain(
+      "The empty box will be included again"
+    );
+    await click(button("Check and download PowerPoint"));
+    expect(lastSelection().includedChangeIds).toEqual([]);
+    expect(lastSelection().descriptionEdits).toEqual({});
+    await click(button("Keep change"));
+    await click(button("Check and download PowerPoint"));
+    expect(lastSelection().includedChangeIds).toEqual(["empty-box"]);
+    expect(lastSelection().reviewedChangeIds).toEqual(["empty-box"]);
+  });
+
   it("explains a decorative image's reading setting and shows one original context image", async () => {
     const data = fixture();
     data.changes = [

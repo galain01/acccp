@@ -2,6 +2,7 @@ import "server-only";
 import { createCanvas, loadImage } from "@napi-rs/canvas";
 import { performance } from "node:perf_hooks";
 import {
+  applyPptxRepairs,
   checkPptxAccessibility,
   inspectPptx,
   PptxPackageError,
@@ -48,8 +49,10 @@ import {
 } from "./prompts/powerpoint-accessibility";
 import { buildPowerPointReview, resolvePowerPointReviews } from "./pptx-review";
 import {
+  buildPptxMechanicalPlan,
   createPptxRevisionBundle,
   mergePptxRepairPlans,
+  normalizePptxReadingOrders,
 } from "./pptx-revisions";
 
 export interface PowerPointConversionResult {
@@ -446,6 +449,41 @@ function hasOperations(plan: PptxRepairPlan): boolean {
   );
 }
 
+/** A semantic edit must not recreate or modify an object already removed by code. */
+function editsRemovedPlaceholder(
+  plan: PptxRepairPlan,
+  mechanical: PptxRepairPlan
+): boolean {
+  return plan.slides.some((slide) => {
+    const removed = new Set(
+      mechanical.slides.find((item) => item.slideNumber === slide.slideNumber)
+        ?.removeEmptyPlaceholders ?? []
+    );
+    if (slide.titleObjectId && removed.has(slide.titleObjectId)) return true;
+    if (
+      slide.revisionNotes?.some(
+        (note) =>
+          note.type === "empty-placeholder" ||
+          (note.objectId !== undefined && removed.has(note.objectId))
+      )
+    )
+      return true;
+    return (
+      [
+        "descriptions",
+        "decorativeObjects",
+        "longDescriptions",
+        "tableHeaders",
+        "splitTableCaption",
+        "textLanguages",
+        "linkTexts",
+        "textStyles",
+        "objectBounds",
+      ] as const
+    ).some((key) => slide[key]?.some((entry) => removed.has(entry.objectId)));
+  });
+}
+
 async function auditOutput(options: {
   source: PptxInspection;
   repaired: PptxRepairResult;
@@ -687,11 +725,18 @@ export async function convertPowerPoint(
         "pptx_invalid",
         "Upload a .pptx presentation."
       );
-    // Structural checks run before semantic repair. A missing title/description alone
-    // does not tell code the right wording or meaning, so it is never guessed here.
     const source = await inspectPptx(buffer);
-    const sourceChecks = checkPptxAccessibility(source);
+    const mechanicalPlan = buildPptxMechanicalPlan(source);
+    const mechanical = hasOperations(mechanicalPlan)
+      ? await applyPptxRepairs(buffer, mechanicalPlan, { revisioned: true })
+      : null;
+    const modelSource = mechanical?.inspection ?? source;
+    const sourceChecks = checkPptxAccessibility(modelSource);
     const sourceEvidence = await clock.render(buffer, source.slideCount);
+    const modelEvidence =
+      mechanical && !mechanical.buffer.equals(buffer)
+        ? await clock.render(mechanical.buffer, modelSource.slideCount)
+        : sourceEvidence;
     stage = "conversion";
     clock.needTime(45_000);
     const config = getLiteLLMConfig("convert");
@@ -700,9 +745,9 @@ export async function convertPowerPoint(
       [
         {
           type: "text",
-          text: `Original PowerPoint inventory (untrusted source data):\n${JSON.stringify(source)}\nMachine-detected source defects (repair supported, unambiguous cases):\n${JSON.stringify(sourceChecks)}`,
+          text: `PowerPoint inventory after deterministic cleanup (untrusted source data):\n${JSON.stringify(modelSource)}\nMachine-detected source defects (repair supported, unambiguous cases):\n${JSON.stringify(sourceChecks)}\nVerified empty placeholders have already been removed. Keep them removed; do not propose object deletion or restore absent placeholders.`,
         },
-        ...visualInput(sourceEvidence.pdf, sourceEvidence.images),
+        ...visualInput(modelEvidence.pdf, modelEvidence.images),
       ],
       config,
       AbortSignal.timeout(
@@ -713,18 +758,34 @@ export async function convertPowerPoint(
     );
     calls.push(await toModelCallUsage("convert", call, config));
     const response = jsonObject(call.content);
-    const plan = response ? { slides: response.slides } : null;
+    const semanticPlan = response ? { slides: response.slides } : null;
     if (
       (call.finishReason && call.finishReason !== "stop") ||
       !response ||
       Object.keys(response).some(
         (key) => !["slides", "findings"].includes(key)
       ) ||
-      !completePowerPointPlan(plan, source)
+      !completePowerPointPlan(semanticPlan, modelSource) ||
+      semanticPlan.slides.some(
+        (slide) => slide.removeEmptyPlaceholders !== undefined
+      ) ||
+      editsRemovedPlaceholder(semanticPlan, mechanicalPlan)
     )
       throw new PowerPointPlanError("pptx_invalid_plan");
-    const proposedFindings = parsePowerPointFindings(response.findings, source);
+    const proposedFindings = parsePowerPointFindings(
+      response.findings,
+      modelSource
+    );
     if (!proposedFindings) throw new PowerPointPlanError("pptx_invalid_plan");
+    let plan: PptxRepairPlan;
+    try {
+      plan = normalizePptxReadingOrders(
+        mergePptxRepairPlans(mechanicalPlan, semanticPlan),
+        source
+      );
+    } catch {
+      throw new PowerPointPlanError("pptx_invalid_plan");
+    }
     let tracked = await createPptxRevisionBundle(buffer, plan);
     stage = "pptx_prepare";
     // Always render the actual saved candidate, even for metadata-only changes.
@@ -749,7 +810,12 @@ export async function convertPowerPoint(
       clock.remaining() >= 55_000
     ) {
       try {
-        const merged = mergePptxRepairPlans(plan, audited.correction);
+        if (editsRemovedPlaceholder(audited.correction, mechanicalPlan))
+          throw new PowerPointPlanError("pptx_invalid_plan");
+        const merged = normalizePptxReadingOrders(
+          mergePptxRepairPlans(plan, audited.correction),
+          source
+        );
         const corrected = await createPptxRevisionBundle(buffer, merged);
         if (!corrected.result.buffer.equals(tracked.result.buffer)) {
           const correctedEvidence = await clock.render(

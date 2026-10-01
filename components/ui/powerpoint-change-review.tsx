@@ -56,6 +56,12 @@ const changeCopy: Record<
     help: "A complex image may need more explanation than a short description can provide. This change adds editable slides with a detailed explanation and updates the image’s short description to point students to them. Check the explanation against the image and your teaching intent.",
     contextOnly: true,
   },
+  "empty-placeholder": {
+    original: "Original placeholder",
+    suggested: "Suggested placeholder change",
+    help: "Unused empty boxes, such as “Click to add text,” are removed to make the presentation easier to edit. Restore original brings the box back.",
+    contextOnly: true,
+  },
   "table-header": {
     original: "Original table header setting",
     suggested: "Suggested table header setting",
@@ -506,9 +512,11 @@ function ReviewChoices({
                   {selectedCopy?.contextOnly
                     ? isLongDescription
                       ? "The original slide is shown for context. Each added slide below shows the suggested explanation as it would appear in PowerPoint. These reference previews stay the same when you keep or restore the change. Slide numbers refer to all suggested changes and may shift in your download if you exclude other added slides."
-                      : selected.type === "decorative"
-                        ? "Use this original slide to decide whether the image carries information students need. Changing whether reading software skips the image, or updating its description, leaves the image visible and does not change how the slide looks."
-                        : "Use this original slide to check whether the description above explains the important information. The description changes what reading software can read aloud; it does not change the slide’s appearance."
+                      : selected.type === "empty-placeholder"
+                        ? "This preview shows the original slide for context. Empty placeholder prompts appear while editing PowerPoint, but not in the slide show or this preview, so removing those prompts is not visible here."
+                        : selected.type === "decorative"
+                          ? "Use this original slide to decide whether the image carries information students need. Changing whether reading software skips the image, or updating its description, leaves the image visible and does not change how the slide looks."
+                          : "Use this original slide to check whether the description above explains the important information. The description changes what reading software can read aloud; it does not change the slide’s appearance."
                     : "These reference images show the original slide and the slide with all suggested changes. They stay the same when you keep or restore a change or edit a description, so they do not show your current selections."}
                 </p>
                 {!preview &&
@@ -697,27 +705,30 @@ function ReviewChoices({
                 >
                   Restore original
                 </Button>
-                {selected.editableDescription && !isLongDescription && (
-                  <Button
-                    variant="outline"
-                    disabled={exporting}
-                    onClick={() =>
-                      setDraft(
-                        descriptionEdits[selected.id] ??
-                          selected.descriptionAfter ??
-                          selected.after
-                      )
-                    }
-                  >
-                    Edit wording
-                  </Button>
-                )}
+                {selected.editableDescription &&
+                  (selected.type === "description" ||
+                    selected.type === "decorative") && (
+                    <Button
+                      variant="outline"
+                      disabled={exporting}
+                      onClick={() =>
+                        setDraft(
+                          descriptionEdits[selected.id] ??
+                            selected.descriptionAfter ??
+                            selected.after
+                        )
+                      }
+                    >
+                      Edit wording
+                    </Button>
+                  )}
               </div>
             )}
             {!included.has(selected.id) && (
               <p role="status" className="text-sm text-muted-foreground">
-                Restoring the original may bring back a problem. The PowerPoint
-                will be checked with your selections before download.
+                {selected.type === "empty-placeholder"
+                  ? "The empty box will be included again. The PowerPoint will be checked with your selections before download."
+                  : "Restoring the original may bring back a problem. The PowerPoint will be checked with your selections before download."}
               </p>
             )}
           </article>
