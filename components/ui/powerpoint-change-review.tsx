@@ -1,0 +1,552 @@
+"use client";
+
+import Image from "next/image";
+import { useEffect, useId, useRef, useState } from "react";
+import {
+  getPowerPointReview,
+  getPowerPointReviewPreview,
+} from "@/lib/actions/powerpoint-review";
+import type {
+  PowerPointReviewData,
+  PowerPointReviewExport,
+  PowerPointReviewPreview,
+} from "@/lib/powerpoint-review-contract";
+import type { PptxRevisionChange } from "@/lib/pptx-types";
+import { Badge } from "./badge";
+import { Button } from "./button";
+
+interface PowerPointChangeReviewProps {
+  documentId: string;
+  jobId: string;
+  onExportComplete: (result: PowerPointReviewExport) => void;
+}
+
+const unavailableMessage =
+  "The change history is unavailable for this conversion. Online copies expire after 14 days. An older conversion may need to be run again to create a change history.";
+
+type PreviewState =
+  | { status: "loading" | "error" | "unavailable" }
+  | { status: "ready"; preview: PowerPointReviewPreview };
+
+export default function PowerPointChangeReview(
+  props: PowerPointChangeReviewProps
+): React.JSX.Element {
+  const [review, setReview] = useState<PowerPointReviewData | null>();
+  const [loadError, setLoadError] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    getPowerPointReview(props.documentId, props.jobId)
+      .then((data) => {
+        if (!cancelled) setReview(data);
+      })
+      .catch(() => {
+        if (!cancelled) setLoadError(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [props.documentId, props.jobId, attempt]);
+
+  if (loadError) {
+    return (
+      <div role="alert" className="space-y-2 text-sm">
+        <p>The change history could not be loaded. Please try again.</p>
+        <Button
+          variant="outline"
+          onClick={() => {
+            setLoadError(false);
+            setAttempt((value) => value + 1);
+          }}
+        >
+          Try again
+        </Button>
+      </div>
+    );
+  }
+  if (review === undefined) {
+    return <p role="status">Loading the changes made to your PowerPoint…</p>;
+  }
+  if (!review) return <p role="status">{unavailableMessage}</p>;
+
+  return <ReviewChoices {...props} review={review} />;
+}
+
+function ReviewChoices({
+  review,
+  documentId,
+  jobId,
+  onExportComplete,
+}: PowerPointChangeReviewProps & { review: PowerPointReviewData }) {
+  const ordered = [...review.changes].sort(
+    (left, right) =>
+      Number(Boolean(right.assumption)) - Number(Boolean(left.assumption)) ||
+      left.slideNumber - right.slideNumber
+  );
+  const [selectedId, setSelectedId] = useState(ordered[0]?.id);
+  const [revisionToken, setRevisionToken] = useState(review.revisionToken);
+  const [included, setIncluded] = useState(new Set(review.includedChangeIds));
+  const [reviewed, setReviewed] = useState(new Set(review.reviewedChangeIds));
+  const [descriptionEdits, setDescriptionEdits] = useState(
+    review.descriptionEdits
+  );
+  const [draft, setDraft] = useState<string | null>(null);
+  const [exporting, setExporting] = useState(false);
+  const [exportMessage, setExportMessage] = useState<string | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
+  const [dirty, setDirty] = useState(false);
+  const [previewCache, setPreviewCache] = useState<
+    Record<number, PreviewState>
+  >({});
+  const pendingPreviews = useRef(new Set<number>());
+  const pending = useRef(false);
+  const mounted = useRef(false);
+  const inputId = useId();
+  const selected = review.changes.find((change) => change.id === selectedId);
+  const suppliedPreview = review.previews?.find(
+    (item) => item.slideNumber === selected?.slideNumber
+  );
+  const previewState = selected
+    ? previewCache[selected.slideNumber]
+    : undefined;
+  const preview =
+    suppliedPreview ??
+    (previewState?.status === "ready" ? previewState.preview : undefined);
+  const canPreview = Boolean(
+    suppliedPreview ||
+    (selected && review.previewSlideNumbers?.includes(selected.slideNumber))
+  );
+  const assumptions = ordered.filter((change) => change.assumption);
+  const routine = ordered.filter((change) => !change.assumption);
+  const remaining = assumptions.filter(
+    (change) => !reviewed.has(change.id)
+  ).length;
+  const allIncluded = included.size === review.changes.length;
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  const loadPreview = async (slideNumber: number) => {
+    if (pendingPreviews.current.has(slideNumber)) return;
+    pendingPreviews.current.add(slideNumber);
+    setPreviewCache((previous) => ({
+      ...previous,
+      [slideNumber]: { status: "loading" },
+    }));
+    try {
+      const image = await getPowerPointReviewPreview(
+        documentId,
+        jobId,
+        revisionToken,
+        slideNumber
+      );
+      if (mounted.current) {
+        setPreviewCache((previous) => ({
+          ...previous,
+          [slideNumber]: image
+            ? { status: "ready", preview: image }
+            : { status: "unavailable" },
+        }));
+      }
+    } catch {
+      if (mounted.current) {
+        setPreviewCache((previous) => ({
+          ...previous,
+          [slideNumber]: { status: "error" },
+        }));
+      }
+    } finally {
+      pendingPreviews.current.delete(slideNumber);
+    }
+  };
+
+  const choose = (change: PptxRevisionChange, keep: boolean) => {
+    setIncluded((previous) => {
+      const next = new Set(previous);
+      if (keep) next.add(change.id);
+      else next.delete(change.id);
+      return next;
+    });
+    setReviewed((previous) => new Set(previous).add(change.id));
+    setDirty(true);
+    setExportMessage(null);
+  };
+
+  const exportChoices = async () => {
+    if (pending.current || draft !== null) return;
+    pending.current = true;
+    setExporting(true);
+    setExportError(null);
+    setExportMessage(null);
+    try {
+      const response = await fetch("/api/powerpoint-review", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          documentId,
+          jobId,
+          revisionToken,
+          includedChangeIds: review.changes
+            .filter((change) => included.has(change.id))
+            .map((change) => change.id),
+          reviewedChangeIds: review.changes
+            .filter((change) => reviewed.has(change.id))
+            .map((change) => change.id),
+          descriptionEdits: Object.fromEntries(
+            Object.entries(descriptionEdits).filter(([id]) => included.has(id))
+          ),
+        }),
+      });
+      if (!mounted.current) return;
+      if (!response.ok) {
+        setExportError(
+          response.status === 409
+            ? "This conversion changed while you were reviewing it. Close the result and open it again to load the current changes."
+            : response.status === 404 || response.status === 410
+              ? "This online copy is no longer available. Online documents expire after 14 days; re-upload your original to process it again."
+              : "Your chosen version could not be prepared. Your choices are still here; please try again."
+        );
+        return;
+      }
+      const result: PowerPointReviewExport = await response.json();
+      if (!mounted.current) return;
+      onExportComplete(result);
+      setRevisionToken(result.revisionToken);
+      setDirty(false);
+      const count = result.findings.length;
+      setExportMessage(
+        count
+          ? `Your chosen version was checked and saved. The download has started. ${count} ${count === 1 ? "item still needs" : "items still need"} attention; see the updated items below.`
+          : "Your chosen version was checked and saved. The download has started. The checks reported no remaining items."
+      );
+      const anchor = window.document.createElement("a");
+      anchor.href = result.url;
+      anchor.download = result.filename;
+      anchor.click();
+    } catch {
+      if (mounted.current) {
+        setExportError(
+          "The download could not be completed. Your choices are still here; please try again."
+        );
+      }
+    } finally {
+      pending.current = false;
+      if (mounted.current) setExporting(false);
+    }
+  };
+
+  const changeButton = (change: PptxRevisionChange) => (
+    <li key={change.id}>
+      <button
+        type="button"
+        aria-current={selectedId === change.id ? "true" : undefined}
+        disabled={exporting || draft !== null}
+        onClick={() => setSelectedId(change.id)}
+        className="min-h-11 w-full rounded-lg border border-transparent p-2 text-left text-sm hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring disabled:opacity-50 aria-current:border-primary aria-current:bg-primary/5"
+      >
+        <span className="block font-medium">
+          Slide {change.slideNumber} · {change.label}
+        </span>
+        <span className="block text-xs text-muted-foreground">
+          {included.has(change.id) ? "Included" : "Original restored"}
+          {reviewed.has(change.id) ? " · Reviewed" : " · Not reviewed"}
+        </span>
+      </button>
+    </li>
+  );
+
+  return (
+    <section aria-label="Review PowerPoint changes" className="space-y-4">
+      <div>
+        <h2 className="font-semibold">Review changes</h2>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Start with decisions about what you intended to teach. Routine repairs
+          are already included and can be inspected below. Keep or restore each
+          change, then check and download your chosen version.
+        </p>
+        <p className="mt-2 text-sm" role="status">
+          {included.size} of {review.changes.length} changes included ·{" "}
+          {reviewed.size} reviewed
+          {remaining > 0 &&
+            ` · ${remaining} ${remaining === 1 ? "assumption" : "assumptions"} to review`}
+        </p>
+      </div>
+
+      {selected ? (
+        <div className="grid items-start gap-4 md:grid-cols-[15rem_minmax(0,1fr)]">
+          <nav
+            aria-label="Changes in this presentation"
+            className="min-w-0 space-y-3"
+          >
+            {assumptions.length > 0 && (
+              <div>
+                <h3 className="mb-2 text-sm font-medium">
+                  Check these assumptions
+                </h3>
+                <ul className="space-y-1">{assumptions.map(changeButton)}</ul>
+              </div>
+            )}
+            {routine.length > 0 && (
+              <details open={assumptions.length === 0}>
+                <summary className="min-h-11 cursor-pointer py-3 text-sm font-medium">
+                  Routine repairs ({routine.length})
+                </summary>
+                <ul className="space-y-1">{routine.map(changeButton)}</ul>
+              </details>
+            )}
+          </nav>
+
+          <article
+            aria-label={`Change: ${selected.label}`}
+            className="min-w-0 space-y-4 rounded-xl border p-4"
+          >
+            <div>
+              <p className="text-sm text-muted-foreground">
+                Slide {selected.slideNumber}
+              </p>
+              <h3 className="mt-1 font-semibold">{selected.label}</h3>
+              <div className="mt-2 flex flex-wrap gap-2">
+                <Badge
+                  variant={included.has(selected.id) ? "secondary" : "outline"}
+                >
+                  {included.has(selected.id) ? "Included" : "Original restored"}
+                </Badge>
+                <Badge variant="outline">
+                  {reviewed.has(selected.id) ? "Reviewed" : "Not reviewed"}
+                </Badge>
+              </div>
+            </div>
+            {selected.assumption && (
+              <div className="rounded-lg bg-primary/5 p-3 text-sm">
+                <h4 className="font-medium">Does this match your intention?</h4>
+                <p className="mt-1 break-words whitespace-pre-wrap">
+                  {selected.assumption}
+                </p>
+              </div>
+            )}
+            <div className="grid gap-3 sm:grid-cols-2">
+              <section
+                aria-label="Before this change"
+                className="min-w-0 rounded-lg bg-muted p-3"
+              >
+                <h4 className="text-sm font-medium">Original</h4>
+                <p className="mt-2 text-sm break-words whitespace-pre-wrap">
+                  {selected.before || "No value was set."}
+                </p>
+              </section>
+              <section
+                aria-label="After this change"
+                className="min-w-0 rounded-lg border border-primary/30 bg-primary/5 p-3"
+              >
+                <h4 className="text-sm font-medium">
+                  {included.has(selected.id)
+                    ? "Your chosen version"
+                    : "Proposed change · excluded"}
+                </h4>
+                <p className="mt-2 text-sm break-words whitespace-pre-wrap">
+                  {descriptionEdits[selected.id] ?? selected.after}
+                </p>
+              </section>
+            </div>
+            <div className="text-sm">
+              <h4 className="font-medium">Why this changed</h4>
+              <p className="mt-1 break-words whitespace-pre-wrap">
+                {selected.reason}
+              </p>
+              {selected.operationIds.length > 1 && (
+                <p className="mt-2 text-muted-foreground">
+                  These related edits work together and will be kept or restored
+                  as one change.
+                </p>
+              )}
+            </div>
+            {canPreview && (
+              <details
+                key={selected.slideNumber}
+                onToggle={(event) => {
+                  if (
+                    event.currentTarget.open &&
+                    !suppliedPreview &&
+                    !previewState
+                  ) {
+                    void loadPreview(selected.slideNumber);
+                  }
+                }}
+              >
+                <summary className="min-h-11 cursor-pointer py-3 text-sm font-medium">
+                  Compare slide appearance
+                </summary>
+                <p className="mb-2 text-xs text-muted-foreground">
+                  These previews show the original and the proposed repairs.
+                  They do not update as you change your choices. Descriptions
+                  and language settings are shown in the text comparison above.
+                </p>
+                {!preview &&
+                  (!previewState || previewState.status === "loading") && (
+                    <p role="status" className="text-sm">
+                      Loading this slide’s preview…
+                    </p>
+                  )}
+                {previewState?.status === "error" && (
+                  <div className="space-y-2 text-sm">
+                    <p role="alert">
+                      This slide preview could not be loaded. You can still keep
+                      or restore the change using the text comparison above.
+                    </p>
+                    <Button
+                      variant="outline"
+                      onClick={() => void loadPreview(selected.slideNumber)}
+                    >
+                      Try preview again
+                    </Button>
+                  </div>
+                )}
+                {previewState?.status === "unavailable" && (
+                  <p role="status" className="text-sm">
+                    This slide preview is unavailable. You can still keep or
+                    restore the change using the text comparison above.
+                  </p>
+                )}
+                {preview && (
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    {(["before", "after"] as const).map((side) => (
+                      <figure key={side}>
+                        <Image
+                          src={preview[side]}
+                          width={960}
+                          height={540}
+                          unoptimized
+                          alt={`Slide ${selected.slideNumber}: ${side === "before" ? "original appearance" : "appearance with proposed repairs"}`}
+                          className="h-auto w-full rounded border"
+                        />
+                        <figcaption className="mt-1 text-xs">
+                          {side === "before"
+                            ? "Original slide"
+                            : "Proposed repairs"}
+                        </figcaption>
+                      </figure>
+                    ))}
+                  </div>
+                )}
+              </details>
+            )}
+
+            {draft !== null ? (
+              <div className="space-y-2">
+                <label htmlFor={inputId} className="block text-sm font-medium">
+                  Description students will hear
+                </label>
+                <textarea
+                  id={inputId}
+                  value={draft}
+                  maxLength={2000}
+                  rows={5}
+                  onChange={(event) => setDraft(event.target.value)}
+                  className="w-full rounded-lg border border-input p-3 text-sm focus-visible:outline-2 focus-visible:outline-ring"
+                />
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    disabled={!draft.trim()}
+                    onClick={() => {
+                      setDescriptionEdits((previous) => ({
+                        ...previous,
+                        [selected.id]: draft.trim(),
+                      }));
+                      choose(selected, true);
+                      setDraft(null);
+                    }}
+                  >
+                    Use this wording
+                  </Button>
+                  <Button variant="outline" onClick={() => setDraft(null)}>
+                    Cancel edit
+                  </Button>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Your wording will be checked with the chosen version before
+                  download.
+                </p>
+              </div>
+            ) : (
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  disabled={exporting}
+                  onClick={() => choose(selected, true)}
+                >
+                  Keep change
+                </Button>
+                <Button
+                  variant="outline"
+                  disabled={exporting}
+                  onClick={() => choose(selected, false)}
+                >
+                  Restore original
+                </Button>
+                {selected.editableDescription && (
+                  <Button
+                    variant="outline"
+                    disabled={exporting}
+                    onClick={() =>
+                      setDraft(descriptionEdits[selected.id] ?? selected.after)
+                    }
+                  >
+                    Edit wording
+                  </Button>
+                )}
+              </div>
+            )}
+            {!included.has(selected.id) && (
+              <p role="status" className="text-sm text-muted-foreground">
+                The original value will be used. Restoring it may bring back a
+                problem; the chosen version will be checked before download.
+              </p>
+            )}
+          </article>
+        </div>
+      ) : (
+        <p className="text-sm">
+          No applied changes were recorded for this presentation. You can still
+          check and download it.
+        </p>
+      )}
+
+      <div className="space-y-2 border-t pt-4">
+        <Button
+          className="h-auto min-h-11 py-2 whitespace-normal"
+          disabled={exporting || draft !== null}
+          onClick={exportChoices}
+        >
+          {exporting
+            ? "Checking your chosen version…"
+            : "Check and download chosen version"}
+        </Button>
+        <p className="text-xs text-muted-foreground">
+          {dirty ? "Your choices have not been saved yet. " : ""}
+          Choices are saved when you check and download. Closing this review
+          discards unsaved choices. The original upload is kept until its 14-day
+          expiry.
+        </p>
+        {!allIncluded && (
+          <p className="text-xs text-muted-foreground">
+            Changes you restored will be excluded from your download.
+          </p>
+        )}
+        {exportMessage && (
+          <p role="status" className="text-sm">
+            {exportMessage}
+          </p>
+        )}
+        {exportError && (
+          <p role="alert" className="text-sm text-destructive">
+            {exportError}
+          </p>
+        )}
+      </div>
+    </section>
+  );
+}

@@ -58,6 +58,7 @@ import * as schema from "@/lib/db/schema";
 import { recordFailureCount } from "@/lib/failure-metrics";
 import { getFailureSummary } from "@/lib/actions/failure-metrics";
 import { createJobDiagnostic } from "@/lib/job-diagnostics";
+import { recordPowerPointReviewCalls } from "@/lib/powerpoint-review-costs";
 import {
   getCostSummary,
   getJobStatusSummary,
@@ -1149,5 +1150,149 @@ describe("anonymous failure history", () => {
           [stage, code, count]
         )
       ).rejects.toThrow();
+  });
+});
+
+describe("PowerPoint review usage when a document is deleted", () => {
+  const calls = [
+    {
+      stage: "validate",
+      model: "review-model",
+      promptTokens: 100,
+      completionTokens: 20,
+      costUsd: 0.1,
+      costSource: "gateway",
+    },
+    {
+      stage: "validate",
+      model: "review-model",
+      promptTokens: 50,
+      completionTokens: 10,
+      costUsd: 0.2,
+      costSource: "model-info",
+    },
+    {
+      stage: "validate",
+      model: "review-model",
+      promptTokens: 25,
+      completionTokens: 5,
+      costUsd: null,
+    },
+  ];
+
+  it("records completed calls on a tombstoned expired document without extending availability, then purge archives them once", async () => {
+    const document = await seedDocument(337, true);
+    const input = {
+      documentId: document.id,
+      jobId: document.jobId,
+      exportId: randomUUID(),
+      calls,
+    };
+    await recordPowerPointReviewCalls(input);
+    await recordPowerPointReviewCalls(input);
+    expect(
+      (
+        await pg.query(
+          "SELECT count(*)::int AS n FROM model_calls WHERE model='review-model'"
+        )
+      ).rows[0].n
+    ).toBe(3);
+    await expect(
+      withRetainedDocument(document.id, async () => null)
+    ).rejects.toBeInstanceOf(DocumentUnavailableError);
+    expect(await purgeDocumentIfEligible(document.id)).toBe("purged");
+    const totals = (
+      await pg.query(
+        "SELECT call_count::int,prompt_tokens::int,completion_tokens::int,cost_usd::text,priced_call_count::int,estimated_call_count::int,unpriced_call_count::int FROM retained_model_metrics WHERE model='review-model'"
+      )
+    ).rows;
+    expect(totals).toEqual([
+      {
+        call_count: 3,
+        prompt_tokens: 175,
+        completion_tokens: 35,
+        cost_usd: "0.3",
+        priced_call_count: 2,
+        estimated_call_count: 1,
+        unpriced_call_count: 1,
+      },
+    ]);
+    expect(
+      (await pg.query("SELECT * FROM model_calls WHERE model='review-model'"))
+        .rows
+    ).toEqual([]);
+  });
+
+  it("keeps only anonymous daily/model totals when purge finished before the audit", async () => {
+    const document = await seedDocument(337, true);
+    expect(await purgeDocumentIfEligible(document.id)).toBe("purged");
+    const before = await linkedCounts(document.id, document.jobId);
+    const jobStats = await archivedJobStats();
+    await recordPowerPointReviewCalls({
+      documentId: document.id,
+      jobId: document.jobId,
+      exportId: randomUUID(),
+      calls,
+    });
+    expect(await linkedCounts(document.id, document.jobId)).toEqual(before);
+    expect(await archivedJobStats()).toEqual(jobStats);
+    const totals = (
+      await pg.query(
+        "SELECT * FROM retained_model_metrics WHERE model='review-model'"
+      )
+    ).rows;
+    expect(totals).toHaveLength(1);
+    expect(Number(totals[0].cost_usd)).toBe(0.3);
+    expect(Number(totals[0].call_count)).toBe(3);
+    expect(Number(totals[0].priced_call_count)).toBe(2);
+    expect(Number(totals[0].estimated_call_count)).toBe(1);
+    expect(Number(totals[0].unpriced_call_count)).toBe(1);
+    expect(JSON.stringify(totals)).not.toContain(document.id);
+    expect(JSON.stringify(totals)).not.toContain(document.jobId);
+  });
+
+  it("rolls the entire anonymous usage batch back on a database failure", async () => {
+    await expect(
+      recordPowerPointReviewCalls({
+        documentId: randomUUID(),
+        jobId: randomUUID(),
+        exportId: randomUUID(),
+        calls: [calls[0], { ...calls[1], promptTokens: -500 }],
+      })
+    ).rejects.toThrow();
+    expect(
+      (
+        await pg.query(
+          "SELECT * FROM retained_model_metrics WHERE model='review-model'"
+        )
+      ).rows
+    ).toEqual([]);
+  });
+
+  it("purges retired reviewed files alongside replacement canonical outputs", async () => {
+    const document = await seedDocument(337, true);
+    const keys = [
+      `${sessionId}/${document.id}/${document.jobId}/review-old.pptx`,
+      `${sessionId}/${document.id}/${document.jobId}/review-old.json`,
+      `${sessionId}/${document.id}/${document.jobId}/output.pptx`,
+      `${sessionId}/${document.id}/${document.jobId}/review.json`,
+    ];
+    for (let index = 0; index < keys.length; index++) {
+      blobs.set(keys[index], "retained private review content");
+      await pg.query(
+        "INSERT INTO artifacts (job_id,artifact_type,artifact_status,filename,mime_type,storage_key) VALUES ($1,$2,$3,'output','application/test',$4)",
+        [
+          document.jobId,
+          index % 2 ? "review_metadata" : "pptx_output",
+          index < 2 ? "expired" : "available",
+          keys[index],
+        ]
+      );
+    }
+    expect(await purgeDocumentIfEligible(document.id)).toBe("purged");
+    for (const key of keys) expect(blobs.has(key)).toBe(false);
+    expect(fixture.remove.mock.calls.flatMap(([removed]) => removed)).toEqual(
+      expect.arrayContaining(keys)
+    );
   });
 });

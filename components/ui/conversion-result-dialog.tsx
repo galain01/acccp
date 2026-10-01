@@ -26,6 +26,8 @@ import {
   DialogTitle,
 } from "./dialog";
 import type { UploadedDocument } from "@/lib/types/document";
+import type { PowerPointReviewExport } from "@/lib/powerpoint-review-contract";
+import PowerPointChangeReview from "./powerpoint-change-review";
 
 function formatIssueType(type: string): string {
   const spaced = type.replace(/-/g, " ");
@@ -79,16 +81,21 @@ interface ConversionResultDialogProps {
   document: UploadedDocument | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  onReviewExport?: (result: PowerPointReviewExport) => void;
 }
 
 export default function ConversionResultDialog({
   document,
   open,
   onOpenChange,
+  onReviewExport,
 }: ConversionResultDialogProps): React.JSX.Element | null {
   const [copied, setCopied] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
   const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const [reviewedResult, setReviewedResult] =
+    useState<PowerPointReviewExport | null>(null);
   const downloadPending = useRef(false);
   // undefined = not fetched yet, null = unavailable. Written only from the
   // async callbacks below, so the effect never sets state synchronously.
@@ -126,7 +133,10 @@ export default function ConversionResultDialog({
   const html = document.html ?? fetchedHtml ?? undefined;
   const isSuccess = document.status === "success";
   const isError = document.status === "error";
-  const issues = (document.errors ?? []).map(presentFinding);
+  const issues = (reviewedResult?.findings ?? document.errors ?? []).map(
+    presentFinding
+  );
+  const changeSummaries = reviewedResult?.changes ?? document.changes;
   const errorCount = issues.filter(
     (issue) => issue.severity === "error"
   ).length;
@@ -186,7 +196,9 @@ export default function ConversionResultDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-2xl">
+      <DialogContent
+        className={`max-h-[calc(100dvh-2rem)] overflow-y-auto ${reviewOpen ? "sm:max-w-5xl" : "sm:max-w-2xl"}`}
+      >
         <DialogHeader>
           <DialogTitle>{document.name}</DialogTitle>
           <DialogDescription>
@@ -278,34 +290,58 @@ export default function ConversionResultDialog({
 
         {isSuccess && isPowerPoint && (
           <div className="flex flex-col gap-4">
-            <div>
-              <Button
-                onClick={handlePowerPointDownload}
-                disabled={!documentId || isDownloading}
-              >
-                {isDownloading ? "Preparing download…" : "Download PowerPoint"}
-              </Button>
+            <div className="flex flex-wrap gap-2">
+              {!reviewOpen && (
+                <Button
+                  onClick={handlePowerPointDownload}
+                  disabled={!documentId || isDownloading}
+                >
+                  {isDownloading
+                    ? "Preparing download…"
+                    : "Download PowerPoint"}
+                </Button>
+              )}
+              {documentId && document.jobId && (
+                <Button
+                  variant="outline"
+                  onClick={() => setReviewOpen((value) => !value)}
+                >
+                  {reviewOpen ? "Back to result" : "Review changes"}
+                </Button>
+              )}
               {downloadError && (
                 <p role="alert" className="mt-2 text-sm text-destructive">
                   {downloadError}
                 </p>
               )}
             </div>
-            <section aria-label="Changes made">
-              <h2 className="mb-2 font-medium">Changes made</h2>
-              {document.changes?.length ? (
-                <ul className="list-disc space-y-1 pl-5 text-sm">
-                  {document.changes.map((change, index) => (
-                    <li key={index}>{change}</li>
-                  ))}
-                </ul>
-              ) : (
-                <p className="text-sm text-muted-foreground">
-                  No automatic changes were reported. Review the presentation
-                  and the items below.
-                </p>
-              )}
-            </section>
+            {reviewOpen && open && documentId && document.jobId ? (
+              <PowerPointChangeReview
+                key={`${documentId}:${document.jobId}`}
+                documentId={documentId}
+                jobId={document.jobId}
+                onExportComplete={(result) => {
+                  setReviewedResult(result);
+                  onReviewExport?.(result);
+                }}
+              />
+            ) : (
+              <section aria-label="Changes made">
+                <h2 className="mb-2 font-medium">Changes made</h2>
+                {changeSummaries?.length ? (
+                  <ul className="list-disc space-y-1 pl-5 text-sm">
+                    {changeSummaries.map((change, index) => (
+                      <li key={index}>{change}</li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="text-sm text-muted-foreground">
+                    No automatic changes were reported. Review the presentation
+                    and the items below.
+                  </p>
+                )}
+              </section>
+            )}
           </div>
         )}
 

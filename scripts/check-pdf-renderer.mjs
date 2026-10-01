@@ -16,6 +16,14 @@ import { createCanvas, loadImage } from "@napi-rs/canvas";
 const app = process.cwd();
 const trace = join(app, ".next/server/app/api/convert/route.js.nft.json");
 const files = JSON.parse(await readFile(trace, "utf8")).files;
+// Both the initial conversion and selected-version export invoke this worker.
+const reviewTrace = join(app, ".next/server/app/api/powerpoint-review/route.js.nft.json");
+const reviewFiles = new Set(JSON.parse(await readFile(reviewTrace, "utf8")).files.map((item) => resolve(dirname(reviewTrace), item)));
+for (const item of files) {
+  const source = resolve(dirname(trace), item);
+  if (/(?:pdf-rendering-child|pdf-image-alternatives|pdf-revisions|pdf-render-warnings)\.mjs$|[/\\]pdfjs-dist[/\\]|[/\\]@napi-rs[/\\]/.test(source) && !reviewFiles.has(source))
+    throw new Error("PowerPoint review export is missing a traced renderer dependency.");
+}
 const target = await mkdtemp(join(tmpdir(), "acccp-pdf-build-"));
 try {
   let copied = 0;

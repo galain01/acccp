@@ -30,7 +30,7 @@
 import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { NextRequest, NextResponse } from "next/server";
-import { and, eq, isNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 
 import { verifyRoleOrUnauthorized } from "@/lib/auth";
 import { convertPowerPoint } from "@/lib/powerpoint-convert";
@@ -494,6 +494,10 @@ async function convertRequest(req: NextRequest) {
     profileVersion,
     changes,
     findings: result.errors,
+    ...("revisions" in result ? { revisions: result.revisions } : {}),
+    ...("reviewPreviews" in result
+      ? { reviewPreviews: result.reviewPreviews }
+      : {}),
   });
   const savingStartedAt = performance.now();
   try {
@@ -513,6 +517,24 @@ async function convertRequest(req: NextRequest) {
         await uploadObject(reviewKey, reviewBody, "application/json");
 
       const artifactsUpdatedAt = new Date().toISOString();
+
+      // A chosen PowerPoint export has its own immutable path. Preserve that
+      // discovery row on reconversion so purge can still remove the old file.
+      if (isPowerPoint) {
+        await tx
+          .update(artifacts)
+          .set({ artifactStatus: "expired" })
+          .where(
+            and(
+              eq(artifacts.jobId, jobId),
+              inArray(artifacts.artifactType, [
+                "pptx_output",
+                "review_metadata",
+              ]),
+              eq(artifacts.artifactStatus, "available")
+            )
+          );
+      }
 
       // uq_available_artifact_per_job_type allows one available artifact per type,
       // so a re-convert updates the existing row rather than inserting a second.

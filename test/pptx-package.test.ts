@@ -4,6 +4,13 @@ import { fromBufferPromise } from "yauzl";
 import { DOMParser } from "@xmldom/xmldom";
 import { pptxElementHash } from "../lib/pptx-table-caption";
 import {
+  buildPptxMechanicalPlan,
+  createPptxRevisionBundle,
+  mergePptxRepairPlans,
+  replayPptxRevisions,
+} from "../lib/pptx-revisions";
+import type { PptxRepairPlan } from "../lib/pptx-types";
+import {
   applyPptxRepairs,
   checkPptxAccessibility,
   inspectPptx,
@@ -15,6 +22,570 @@ const A = "http://schemas.openxmlformats.org/drawingml/2006/main";
 const R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const REL = "http://schemas.openxmlformats.org/package/2006/relationships";
 const CT = "http://schemas.openxmlformats.org/package/2006/content-types";
+
+describe("reviewable PowerPoint revisions", () => {
+  it("replaces authored descriptions explicitly, records actual values, and restores the exact source", async () => {
+    const source = await zip(
+      entries(
+        slide(text(2, "Course overview") + image(3, 'descr="Grading rubric"'))
+      )
+    );
+    const plan: PptxRepairPlan = {
+      slides: [
+        {
+          slideNumber: 1,
+          descriptions: [
+            {
+              objectId: "3",
+              text: "Homework 15%; exams 50%; projects 35%.",
+              replaceExisting: true,
+            },
+          ],
+          revisionNotes: [
+            {
+              type: "description",
+              objectId: "3",
+              reason: "Explain the grading information shown in the diagram.",
+              assumption: "The visible categories describe the course grade.",
+            },
+          ],
+        },
+      ],
+    };
+    const { result, bundle } = await createPptxRevisionBundle(source, plan);
+    expect(result.inspection.slides[0].objects[1].description).toBe(
+      plan.slides[0].descriptions![0].text
+    );
+    expect(bundle.changes).toHaveLength(1);
+    expect(bundle.changes[0]).toMatchObject({
+      before: "Grading rubric",
+      after: plan.slides[0].descriptions![0].text,
+      editableDescription: true,
+      assumption: "The visible categories describe the course grade.",
+    });
+    const restored = await replayPptxRevisions(source, bundle, []);
+    expect(restored.buffer.equals(source)).toBe(true);
+    const selected = await replayPptxRevisions(source, bundle, [
+      bundle.changes[0].id,
+    ]);
+    expect((await unzip(selected.buffer)).get("ppt/slides/slide1.xml")).toEqual(
+      (await unzip(result.buffer)).get("ppt/slides/slide1.xml")
+    );
+    const before = await unzip(source);
+    const after = await unzip(result.buffer);
+    for (const [name, bytes] of before)
+      if (name !== "ppt/slides/slide1.xml")
+        expect(after.get(name)).toEqual(bytes);
+  });
+
+  it("keeps approved wording edits independent of the immutable proposal and rejects invalid edits", async () => {
+    const source = await zip(entries());
+    const { bundle } = await createPptxRevisionBundle(source, {
+      slides: [
+        {
+          slideNumber: 1,
+          descriptions: [{ objectId: "3", text: "A tree in a meadow." }],
+        },
+      ],
+    });
+    const id = bundle.changes[0].id;
+    const saved = JSON.stringify(bundle);
+    const revised = await replayPptxRevisions(source, bundle, [id], {
+      [id]: "An oak tree beside the path.",
+    });
+    expect(revised.inspection.slides[0].objects[1].description).toBe(
+      "An oak tree beside the path."
+    );
+    expect(JSON.stringify(bundle)).toBe(saved);
+    expect(
+      (await replayPptxRevisions(source, bundle, [id])).inspection.slides[0]
+        .objects[1].description
+    ).toBe("A tree in a meadow.");
+    await expect(
+      replayPptxRevisions(source, bundle, [], { [id]: "Hidden edit" })
+    ).rejects.toHaveProperty("code", "pptx_integrity");
+    await expect(
+      replayPptxRevisions(source, bundle, [id], { [id]: "\u0000" })
+    ).rejects.toHaveProperty("code", "pptx_integrity");
+  });
+
+  it("sets only an exact French passage across runs, keeping English and all wording", async () => {
+    const object = text(
+      2,
+      "English before. Ce programme est disponible en français. English after."
+    ).replace(
+      "Ce programme est disponible",
+      'Ce programme</a:t></a:r><a:r><a:rPr lang="en-US" b="1"/><a:t> est disponible'
+    );
+    const source = await zip(entries(slide(object + image(3))));
+    const { result, bundle } = await createPptxRevisionBundle(source, {
+      slides: [
+        {
+          slideNumber: 1,
+          textLanguages: [
+            {
+              objectId: "2",
+              sourceText: "Ce programme est disponible en français.",
+              tag: "fr-FR",
+            },
+          ],
+        },
+      ],
+    });
+    const output = result.inspection.slides[0].objects[0];
+    expect(output.text).toBe(
+      "English before. Ce programme est disponible en français. English after."
+    );
+    expect(
+      output.textRuns?.map(({ text, language }) => ({ text, language }))
+    ).toEqual([
+      { text: "English before. ", language: "en-US" },
+      { text: "Ce programme", language: "fr-FR" },
+      { text: " est disponible en français.", language: "fr-FR" },
+      { text: " English after.", language: "en-US" },
+    ]);
+    expect(bundle.changes[0].after).toContain(
+      "fr-FR: Ce programme est disponible en français."
+    );
+    expect(
+      (await replayPptxRevisions(source, bundle, [])).buffer.equals(source)
+    ).toBe(true);
+  });
+
+  it("does not guess which repeated passage should receive a language", async () => {
+    const source = await zip(entries(slide(text(2, "Bonjour. Bonjour."))));
+    const { result, bundle } = await createPptxRevisionBundle(source, {
+      slides: [
+        {
+          slideNumber: 1,
+          textLanguages: [
+            { objectId: "2", sourceText: "Bonjour.", tag: "fr-FR" },
+          ],
+        },
+      ],
+    });
+    expect(result.buffer.equals(source)).toBe(true);
+    expect(bundle.changes).toEqual([]);
+    expect(
+      result.findings.some((item) => item.code === "language-review")
+    ).toBe(true);
+  });
+
+  it("permits reviewed reading-order edits with unknown geometry and keeps language independently reversible", async () => {
+    const source = await zip(
+      entries(
+        slide(
+          text(2, "Bonjour.")
+            .replace(/<a:xfrm>.*?<\/a:xfrm>/, "")
+            .replace(
+              '<a:rPr lang="en-US"/>',
+              '<a:rPr lang="en-US"><a:effectLst/></a:rPr>'
+            ) + text(3, "Objectives")
+        )
+      )
+    );
+    const { result, bundle } = await createPptxRevisionBundle(source, {
+      slides: [
+        {
+          slideNumber: 1,
+          textLanguages: [
+            { objectId: "2", sourceText: "Bonjour.", tag: "fr-FR" },
+          ],
+          readingOrder: ["3", "2"],
+        },
+      ],
+    });
+    expect(result.inspection.slides[0].objects.map((item) => item.id)).toEqual([
+      "3",
+      "2",
+    ]);
+    const order = bundle.changes.find(
+      (change) => change.type === "reading-order"
+    )!;
+    const selected = await replayPptxRevisions(source, bundle, [order.id]);
+    expect(
+      selected.inspection.slides[0].objects.map((item) => item.id)
+    ).toEqual(["3", "2"]);
+    expect(selected.inspection.slides[0].objects[1].language).toBe("en-US");
+  });
+
+  it("retains animation protection even when revisions are enabled", async () => {
+    const source = await zip(
+      entries(slide(text(2, "First") + text(3, "Second"), "", "<p:timing/>"))
+    );
+    const { result, bundle } = await createPptxRevisionBundle(source, {
+      slides: [{ slideNumber: 1, readingOrder: ["3", "2"] }],
+    });
+    expect(bundle.changes).toEqual([]);
+    expect(
+      result.findings.some((item) => item.code === "reading-order-review")
+    ).toBe(true);
+  });
+
+  it("updates a hyperlink label while preserving its exact target and unrelated text", async () => {
+    const parts = entries(
+      slide(
+        text(2, "https://example.edu/course").replace(
+          '<a:rPr lang="en-US"/>',
+          '<a:rPr lang="en-US"><a:hlinkClick r:id="rLink"/></a:rPr>'
+        ) + text(3, "Chapter 5 — 20%")
+      )
+    );
+    parts[5][1] = String(parts[5][1]).replace(
+      "</Relationships>",
+      `<Relationship Id="rLink" Type="${R}/hyperlink" Target="https://example.edu/course" TargetMode="External"/></Relationships>`
+    );
+    const source = await zip(parts);
+    const { result, bundle } = await createPptxRevisionBundle(source, {
+      slides: [
+        {
+          slideNumber: 1,
+          linkTexts: [
+            {
+              objectId: "2",
+              sourceText: "https://example.edu/course",
+              text: "Course materials",
+            },
+          ],
+        },
+      ],
+    });
+    expect(
+      result.inspection.slides[0].objects.map((object) => object.text)
+    ).toEqual(["Course materials", "Chapter 5 — 20%"]);
+    expect(
+      (await unzip(result.buffer)).get("ppt/slides/_rels/slide1.xml.rels")
+    ).toEqual((await unzip(source)).get("ppt/slides/_rels/slide1.xml.rels"));
+    expect(bundle.changes[0]).toMatchObject({
+      type: "link-text",
+      before: "https://example.edu/course",
+      after: "Course materials",
+    });
+  });
+
+  it("changes text size and color, preserving the exact language, other runs, and wording", async () => {
+    const source = await zip(
+      entries(slide(text(2, "Introduction and conclusion")))
+    );
+    const { result, bundle } = await createPptxRevisionBundle(source, {
+      slides: [
+        {
+          slideNumber: 1,
+          textStyles: [
+            {
+              objectId: "2",
+              sourceText: "Introduction",
+              fontSizePt: 24,
+              colorHex: "123abc",
+            },
+          ],
+        },
+      ],
+    });
+    expect(result.inspection.slides[0].objects[0].textRuns).toEqual([
+      {
+        text: "Introduction",
+        language: "en-US",
+        fontSizePt: 24,
+        colorHex: "123ABC",
+      },
+      { text: " and conclusion", language: "en-US" },
+    ]);
+    expect(bundle.changes[0].type).toBe("text-style");
+    expect(
+      (await replayPptxRevisions(source, bundle, [])).buffer.equals(source)
+    ).toBe(true);
+  });
+
+  it("moves/resizes an object using exact bounds and rejects off-slide destinations", async () => {
+    const source = await zip(entries(slide(text(2, "Course overview"))));
+    const original = { x: 0, y: 2000, width: 1000, height: 500 };
+    const plan: PptxRepairPlan = {
+      slides: [
+        {
+          slideNumber: 1,
+          objectBounds: [
+            {
+              objectId: "2",
+              sourceRect: original,
+              rect: { x: 100, y: 200, width: 2000, height: 1000 },
+            },
+          ],
+        },
+      ],
+    };
+    const { result, bundle } = await createPptxRevisionBundle(source, plan);
+    expect(result.inspection.slides[0].objects[0].rect).toEqual(
+      plan.slides[0].objectBounds![0].rect
+    );
+    expect(bundle.changes[0].type).toBe("position");
+    plan.slides[0].objectBounds![0].rect.x = 9144000;
+    const rejected = await createPptxRevisionBundle(source, plan);
+    expect(rejected.result.buffer.equals(source)).toBe(true);
+    expect(rejected.bundle.changes).toEqual([]);
+  });
+
+  it.each([
+    "wrong source",
+    "changed plan",
+    "forged ledger",
+    "unknown selection",
+    "duplicate selection",
+  ])("rejects %s when replaying", async (scenario) => {
+    const source = await zip(entries());
+    const { bundle } = await createPptxRevisionBundle(source, {
+      slides: [
+        { slideNumber: 1, descriptions: [{ objectId: "3", text: "A tree." }] },
+      ],
+    });
+    const ids = [bundle.changes[0].id];
+    let input = source;
+    if (scenario === "wrong source")
+      input = await zip(entries(slide(text(2, "Changed course") + image(3))));
+    if (scenario === "changed plan")
+      bundle.plan.slides[0].descriptions![0].text = "Forged edit";
+    if (scenario === "forged ledger")
+      bundle.changes[0].before = "Forged original";
+    if (scenario === "unknown selection") ids[0] = "missing";
+    if (scenario === "duplicate selection") ids.push(ids[0]);
+    await expect(
+      replayPptxRevisions(input, bundle, ids)
+    ).rejects.toHaveProperty("code", "pptx_integrity");
+  });
+
+  it("merges corrective edits against original evidence and exposes only net revisions", async () => {
+    const first: PptxRepairPlan = {
+      slides: [
+        {
+          slideNumber: 1,
+          descriptions: [{ objectId: "3", text: "An initial description." }],
+          textStyles: [
+            { objectId: "2", sourceText: "Course overview", fontSizePt: 24 },
+          ],
+          objectBounds: [
+            {
+              objectId: "2",
+              sourceRect: { x: 0, y: 2000, width: 1000, height: 500 },
+              rect: { x: 1, y: 2000, width: 1000, height: 500 },
+            },
+          ],
+        },
+      ],
+    };
+    const second: PptxRepairPlan = {
+      slides: [
+        {
+          slideNumber: 1,
+          descriptions: [
+            {
+              objectId: "3",
+              text: "The corrected description.",
+              replaceExisting: true,
+            },
+          ],
+          textStyles: [
+            {
+              objectId: "2",
+              sourceText: "Course overview",
+              colorHex: "333333",
+            },
+          ],
+          objectBounds: [
+            {
+              objectId: "2",
+              sourceRect: { x: 1, y: 2000, width: 1000, height: 500 },
+              rect: { x: 2, y: 2000, width: 1000, height: 500 },
+            },
+          ],
+        },
+      ],
+    };
+    const merged = mergePptxRepairPlans(first, second);
+    expect(merged.slides[0].objectBounds![0].sourceRect.x).toBe(0);
+    expect(merged.slides[0].textStyles![0]).toMatchObject({
+      fontSizePt: 24,
+      colorHex: "333333",
+    });
+    const { bundle } = await createPptxRevisionBundle(
+      await zip(entries()),
+      merged
+    );
+    expect(bundle.changes).toHaveLength(3);
+    expect(
+      bundle.changes.find((change) => change.type === "description")?.after
+    ).toBe("The corrected description.");
+  });
+
+  it("does not claim no-op edits or speculative mechanical repairs", async () => {
+    const source = await zip(
+      entries(slide(text(2, "Bonjour.") + image(3, 'descr="An oak tree."')))
+    );
+    const inspection = await inspectPptx(source);
+    const mechanical = await applyPptxRepairs(
+      source,
+      buildPptxMechanicalPlan(inspection)
+    );
+    expect(mechanical.buffer.equals(source)).toBe(true);
+    const { bundle } = await createPptxRevisionBundle(source, {
+      slides: [
+        {
+          slideNumber: 1,
+          descriptions: [
+            { objectId: "3", text: "An oak tree.", replaceExisting: true },
+          ],
+          textLanguages: [
+            { objectId: "2", sourceText: "Bonjour.", tag: "en-US" },
+          ],
+          readingOrder: ["2", "3"],
+        },
+      ],
+    });
+    expect(bundle.changes).toEqual([]);
+  });
+
+  it("can designate an existing body placeholder as the title without replacing its text or index", async () => {
+    const source = await zip(
+      entries(
+        slide(text(2, "Overview", 0, 2000, '<p:ph type="body" idx="4"/>'))
+      )
+    );
+    const { result, bundle } = await createPptxRevisionBundle(source, {
+      slides: [{ slideNumber: 1, titleObjectId: "2" }],
+    });
+    expect(result.inspection.slides[0].objects[0]).toMatchObject({
+      text: "Overview",
+      isTitle: true,
+    });
+    expect(
+      (await unzip(result.buffer)).get("ppt/slides/slide1.xml")?.toString()
+    ).toContain('type="title" idx="4"');
+    expect(bundle.changes[0].type).toBe("title");
+  });
+
+  it("keeps dependent table structure and appearance changes together", async () => {
+    const source = await zip(entries(slide(captionTable())));
+    const { bundle, result } = await createPptxRevisionBundle(source, {
+      slides: [
+        {
+          slideNumber: 1,
+          splitTableCaption: [splitCaption],
+          textStyles: [
+            {
+              objectId: "3",
+              sourceText: "Compare leaf shapes",
+              colorHex: "000000",
+            },
+          ],
+        },
+      ],
+    });
+    expect(bundle.changes).toHaveLength(1);
+    expect(bundle.changes[0]).toMatchObject({
+      type: "table-caption",
+      operationIds: ["1:table-caption:3", "1:text-style:0"],
+    });
+    expect(
+      result.inspection.slides[0].objects
+        .find((object) => object.id === "3")
+        ?.textRuns?.find((run) => run.text === "Compare leaf shapes")?.colorHex
+    ).toBe("000000");
+    expect(
+      (await replayPptxRevisions(source, bundle, [])).buffer.equals(source)
+    ).toBe(true);
+    const selected = await replayPptxRevisions(source, bundle, [
+      bundle.changes[0].id,
+    ]);
+    expect((await unzip(selected.buffer)).get("ppt/slides/slide1.xml")).toEqual(
+      (await unzip(result.buffer)).get("ppt/slides/slide1.xml")
+    );
+  });
+
+  it("uses identical object labels on both sides of a reading-order comparison", async () => {
+    const source = await zip(
+      entries(
+        slide(text(2, "Title") + image(3, 'descr="Original description"'))
+      )
+    );
+    const { bundle } = await createPptxRevisionBundle(source, {
+      slides: [
+        {
+          slideNumber: 1,
+          readingOrder: ["3", "2"],
+          descriptions: [
+            {
+              objectId: "3",
+              text: "Revised description",
+              replaceExisting: true,
+            },
+          ],
+        },
+      ],
+    });
+    const order = bundle.changes.find(
+      (change) => change.type === "reading-order"
+    )!;
+    expect(order.before).toContain("Original description");
+    expect(order.after).toContain("Original description");
+    expect(order.after).not.toContain("Revised description");
+  });
+
+  it("supports reviewed descriptions for native tables", async () => {
+    const source = await zip(entries(slide(table(3))));
+    const { result, bundle } = await createPptxRevisionBundle(source, {
+      slides: [
+        {
+          slideNumber: 1,
+          descriptions: [
+            {
+              objectId: "3",
+              text: "Two columns: group and count. North has ten.",
+              replaceExisting: true,
+            },
+          ],
+        },
+      ],
+    });
+    expect(result.inspection.slides[0].objects[0].description).toBe(
+      "Two columns: group and count. North has ten."
+    );
+    expect(bundle.changes[0].type).toBe("description");
+  });
+
+  it("exposes native diagram text without editing the SmartArt data part", async () => {
+    const diagram = `<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="3" name="Grades" descr="Grading rubric"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr><p:xfrm><a:off x="100" y="200"/><a:ext cx="2000" cy="1000"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/diagram"><dgm:relIds xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" r:dm="rDiagram"/></a:graphicData></a:graphic></p:graphicFrame>`;
+    const parts = entries(slide(text(2, "Grades") + diagram));
+    parts[5][1] = String(parts[5][1]).replace(
+      "</Relationships>",
+      `<Relationship Id="rDiagram" Type="${R}/diagramData" Target="../diagrams/data1.xml"/></Relationships>`
+    );
+    parts.push([
+      "ppt/diagrams/data1.xml",
+      `<dgm:dataModel xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" xmlns:a="${A}"><dgm:ptLst><dgm:pt><dgm:t><a:p><a:r><a:t>Homework: 15%</a:t></a:r></a:p></dgm:t></dgm:pt></dgm:ptLst></dgm:dataModel>`,
+    ]);
+    const source = await zip(parts);
+    const inspection = await inspectPptx(source);
+    expect(inspection.slides[0].objects[1].diagramText).toEqual([
+      "Homework: 15%",
+    ]);
+    const { result } = await createPptxRevisionBundle(source, {
+      slides: [
+        {
+          slideNumber: 1,
+          descriptions: [
+            {
+              objectId: "3",
+              text: "Homework is 15% of the course grade.",
+              replaceExisting: true,
+            },
+          ],
+        },
+      ],
+    });
+    expect((await unzip(result.buffer)).get("ppt/diagrams/data1.xml")).toEqual(
+      (await unzip(source)).get("ppt/diagrams/data1.xml")
+    );
+  });
+});
 
 function text(
   id: number,

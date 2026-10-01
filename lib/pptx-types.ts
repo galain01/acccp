@@ -22,12 +22,17 @@ export interface PptxChange {
     | "table-header"
     | "table-caption"
     | "reading-order"
-    | "language";
+    | "language"
+    | "link-text"
+    | "text-style"
+    | "position";
   slideNumber: number;
   objectId?: string;
   message: string;
   /** Trusted engine-computed bounds for a declared structural table repair. */
   visualRegion?: PptxRect;
+  /** Engine-assigned operation identifier, used to replay reviewed revisions. */
+  operationId?: string;
 }
 
 export interface PptxObject {
@@ -53,6 +58,16 @@ export interface PptxObject {
   grouped: boolean;
   parentId: string | null;
   language: string | null;
+  /** Actual text/language runs, including mixed-language objects. */
+  textRuns?: {
+    text: string;
+    language: string | null;
+    hyperlink?: boolean;
+    fontSizePt?: number;
+    colorHex?: string;
+  }[];
+  /** Native SmartArt data text, when present; its order alone does not prove reading order. */
+  diagramText?: string[];
   table?: {
     rows: number;
     columns: number;
@@ -84,8 +99,12 @@ export interface PptxSlideRepairs {
   slideNumber: number;
   /** Select an existing, nonempty, top-level text object. Text is never rewritten. */
   titleObjectId?: string;
-  /** Existing authored titles/descriptions and decorative objects are never overwritten. */
-  descriptions?: { objectId: string; text: string }[];
+  /** Replacement of authored descriptions requires explicit revisioned mode. */
+  descriptions?: {
+    objectId: string;
+    text: string;
+    replaceExisting?: boolean;
+  }[];
   /** Exact first-row text is required as a source-content guard. */
   tableHeaders?: { objectId: string; firstRow: true; headerTexts: string[] }[];
   /** Move one merged caption above new column labels; every source cell must match. */
@@ -99,6 +118,23 @@ export interface PptxSlideRepairs {
   readingOrder?: string[];
   /** Accepted for compatibility but never applied in v1: language inheritance needs review. */
   language?: { tag: string; evidenceText: string };
+  /** Exact, uniquely matched text within an object; only those runs receive the language. */
+  textLanguages?: { objectId: string; sourceText: string; tag: string }[];
+  /** Rename one exact hyperlink label while preserving its target relationship. */
+  linkTexts?: { objectId: string; sourceText: string; text: string }[];
+  textStyles?: {
+    objectId: string;
+    sourceText: string;
+    fontSizePt?: number;
+    colorHex?: string;
+  }[];
+  objectBounds?: { objectId: string; sourceRect: PptxRect; rect: PptxRect }[];
+  revisionNotes?: {
+    type: PptxChange["type"];
+    objectId?: string;
+    reason: string;
+    assumption?: string;
+  }[];
 }
 
 export interface PptxRepairPlan {
@@ -110,4 +146,26 @@ export interface PptxRepairResult {
   changes: PptxChange[];
   findings: PptxFinding[];
   inspection: PptxInspection;
+}
+
+export interface PptxRevisionChange {
+  id: string;
+  type: PptxChange["type"];
+  slideNumber: number;
+  objectId?: string;
+  label: string;
+  before: string;
+  after: string;
+  reason: string;
+  assumption?: string;
+  /** All operations in one change are accepted or restored together. */
+  operationIds: string[];
+  editableDescription?: boolean;
+}
+
+export interface PptxRevisionBundle {
+  version: 1;
+  sourceHash: string;
+  plan: PptxRepairPlan;
+  changes: PptxRevisionChange[];
 }

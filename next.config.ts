@@ -3,7 +3,7 @@ import type { NextConfig } from "next";
 const nextConfig: NextConfig = {
   serverExternalPackages: ["pdf-lib", "pdfjs-dist", "@napi-rs/canvas"],
   outputFileTracingIncludes: {
-    "/api/convert": [
+    "/api/{convert,powerpoint-review}": [
       "./node_modules/pdf-lib/dist/pdf-lib.min.js",
       "./lib/pdf-rendering-child.mjs",
       "./lib/pdf-image-alternatives.mjs",

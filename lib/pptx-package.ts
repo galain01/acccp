@@ -525,7 +525,8 @@ function inspectObjects(
   tree: Element,
   slideNumber: number,
   findings: PptxFinding[],
-  layout?: Document
+  layout?: Document,
+  diagramTexts = new Map<string, string[]>()
 ): InternalObject[] {
   const result: InternalObject[] = [];
   const ids = new Set<string>();
@@ -623,6 +624,42 @@ function inspectObjects(
       grouped: parentId !== null,
       parentId,
       language: languages.length === 1 ? languages[0] : null,
+      textRuns: descendants(element, A, "r").map((run) => {
+        const properties = direct(run, A, "rPr");
+        return {
+          text: direct(run, A, "t")?.textContent ?? "",
+          language: properties?.getAttribute("lang") || null,
+          ...(properties?.getAttribute("sz")
+            ? { fontSizePt: Number(properties.getAttribute("sz")) / 100 }
+            : {}),
+          ...(properties &&
+          direct(properties, A, "solidFill") &&
+          direct(direct(properties, A, "solidFill")!, A, "srgbClr")
+            ? {
+                colorHex:
+                  direct(
+                    direct(properties, A, "solidFill")!,
+                    A,
+                    "srgbClr"
+                  )!.getAttribute("val") ?? "",
+              }
+            : {}),
+          ...(properties && direct(properties, A, "hlinkClick")
+            ? { hyperlink: true }
+            : {}),
+        };
+      }),
+      ...(kind === "smartart"
+        ? {
+            diagramText: descendants(
+              element,
+              "http://schemas.openxmlformats.org/drawingml/2006/diagram",
+              "relIds"
+            ).flatMap(
+              (rel) => diagramTexts.get(rel.getAttributeNS(R, "dm") ?? "") ?? []
+            ),
+          }
+        : {}),
       ...(table && kind === "table" ? { table: tableInfo(table) } : {}),
     };
     result.push({ element, properties, info });
@@ -850,7 +887,24 @@ async function loadPackage(
       P,
       "defaultTextStyle"
     );
-    const objects = inspectObjects(tree, number, findings, layout);
+    const diagramTexts = new Map<string, string[]>();
+    for (const relation of slideRels) {
+      if (!relation.external && relation.type === `${R}/diagramData`) {
+        const data = xmlPart(pkg, relation.target);
+        const labels = descendants(data, A, "t")
+          .map((node) => node.textContent ?? "")
+          .filter(Boolean);
+        if (labels.join("").length > 32000 || labels.length > 1000) complex();
+        diagramTexts.set(relation.id, labels);
+      }
+    }
+    const objects = inspectObjects(
+      tree,
+      number,
+      findings,
+      layout,
+      diagramTexts
+    );
     const hidden =
       root.getAttribute("show") === "0" ||
       root.getAttribute("show") === "false";
@@ -968,6 +1022,11 @@ export function validatePptxRepairPlan(
         "splitTableCaption",
         "readingOrder",
         "language",
+        "textLanguages",
+        "linkTexts",
+        "revisionNotes",
+        "textStyles",
+        "objectBounds",
       ]) ||
       !Number.isSafeInteger(slide.slideNumber) ||
       (slide.slideNumber as number) < 1 ||
@@ -985,7 +1044,9 @@ export function validatePptxRepairPlan(
         !slide.descriptions.every(
           (description) =>
             isRecord(description) &&
-            onlyKeys(description, ["objectId", "text"]) &&
+            onlyKeys(description, ["objectId", "text", "replaceExisting"]) &&
+            (description.replaceExisting === undefined ||
+              typeof description.replaceExisting === "boolean") &&
             id(description.objectId) &&
             validText(description.text, 2000)
         ) ||
@@ -1068,6 +1129,118 @@ export function validatePptxRepairPlan(
         !validText(slide.language.evidenceText, 1000))
     )
       return false;
+    if (
+      slide.textLanguages !== undefined &&
+      (!Array.isArray(slide.textLanguages) ||
+        slide.textLanguages.length > 300 ||
+        !slide.textLanguages.every(
+          (entry) =>
+            isRecord(entry) &&
+            onlyKeys(entry, ["objectId", "sourceText", "tag"]) &&
+            id(entry.objectId) &&
+            validText(entry.sourceText, 8000) &&
+            typeof entry.tag === "string" &&
+            /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8}){0,3}$/.test(entry.tag)
+        ))
+    )
+      return false;
+    if (
+      slide.linkTexts !== undefined &&
+      (!Array.isArray(slide.linkTexts) ||
+        slide.linkTexts.length > 100 ||
+        !slide.linkTexts.every(
+          (entry) =>
+            isRecord(entry) &&
+            onlyKeys(entry, ["objectId", "sourceText", "text"]) &&
+            id(entry.objectId) &&
+            validText(entry.sourceText, 8000) &&
+            validText(entry.text, 1000)
+        ))
+    )
+      return false;
+    if (
+      slide.revisionNotes !== undefined &&
+      (!Array.isArray(slide.revisionNotes) ||
+        slide.revisionNotes.length > 500 ||
+        !slide.revisionNotes.every(
+          (entry) =>
+            isRecord(entry) &&
+            onlyKeys(entry, ["type", "objectId", "reason", "assumption"]) &&
+            [
+              "title",
+              "description",
+              "table-header",
+              "table-caption",
+              "reading-order",
+              "language",
+              "link-text",
+              "text-style",
+              "position",
+            ].includes(entry.type as string) &&
+            (entry.objectId === undefined || id(entry.objectId)) &&
+            validText(entry.reason, 2000) &&
+            (entry.assumption === undefined ||
+              validText(entry.assumption, 2000))
+        ))
+    )
+      return false;
+    if (
+      slide.textStyles !== undefined &&
+      (!Array.isArray(slide.textStyles) ||
+        slide.textStyles.length > 300 ||
+        !slide.textStyles.every(
+          (entry) =>
+            isRecord(entry) &&
+            onlyKeys(entry, [
+              "objectId",
+              "sourceText",
+              "fontSizePt",
+              "colorHex",
+            ]) &&
+            id(entry.objectId) &&
+            validText(entry.sourceText, 8000) &&
+            (entry.fontSizePt !== undefined || entry.colorHex !== undefined) &&
+            (entry.fontSizePt === undefined ||
+              (typeof entry.fontSizePt === "number" &&
+                Number.isFinite(entry.fontSizePt) &&
+                entry.fontSizePt >= 6 &&
+                entry.fontSizePt <= 120 &&
+                Math.round(entry.fontSizePt * 100) ===
+                  entry.fontSizePt * 100)) &&
+            (entry.colorHex === undefined ||
+              (typeof entry.colorHex === "string" &&
+                /^[A-Fa-f0-9]{6}$/.test(entry.colorHex)))
+        ))
+    )
+      return false;
+    const validRect = (value: unknown) =>
+      isRecord(value) &&
+      onlyKeys(value, ["x", "y", "width", "height"]) &&
+      ["x", "y", "width", "height"].every(
+        (key) =>
+          typeof value[key] === "number" &&
+          Number.isSafeInteger(value[key]) &&
+          (value[key] as number) >= 0 &&
+          (value[key] as number) < 100_000_000
+      ) &&
+      (value.width as number) > 0 &&
+      (value.height as number) > 0;
+    if (
+      slide.objectBounds !== undefined &&
+      (!Array.isArray(slide.objectBounds) ||
+        slide.objectBounds.length > 300 ||
+        !slide.objectBounds.every(
+          (entry) =>
+            isRecord(entry) &&
+            onlyKeys(entry, ["objectId", "sourceRect", "rect"]) &&
+            id(entry.objectId) &&
+            validRect(entry.sourceRect) &&
+            validRect(entry.rect)
+        ) ||
+        new Set(slide.objectBounds.map((entry) => entry.objectId)).size !==
+          slide.objectBounds.length)
+    )
+      return false;
     return true;
   });
 }
@@ -1125,11 +1298,121 @@ function preserveTitleLineSpacing(
   }
 }
 
+/** Change one unique text span, splitting runs without discarding their formatting. */
+function setTextProperties(
+  object: InternalObject,
+  sourceText: string,
+  edit: { tag?: string; fontSizePt?: number; colorHex?: string }
+): boolean | null {
+  const matches: { paragraph: Element; start: number; runs: Element[] }[] = [];
+  for (const paragraph of descendants(object.element, A, "p")) {
+    // Fields and explicit breaks require additional context; never join across them.
+    if (
+      children(paragraph).some((item) =>
+        ["fld", "br"].includes(item.localName ?? "")
+      )
+    )
+      continue;
+    const runs = children(paragraph).filter(
+      (item) => item.namespaceURI === A && item.localName === "r"
+    );
+    const text = runs
+      .map((run) => direct(run, A, "t")?.textContent ?? "")
+      .join("");
+    let offset = text.indexOf(sourceText);
+    while (offset >= 0) {
+      matches.push({ paragraph, start: offset, runs });
+      offset = text.indexOf(sourceText, offset + 1);
+    }
+  }
+  if (matches.length !== 1) return null;
+  const { paragraph, start, runs } = matches[0];
+  const end = start + sourceText.length;
+  let offset = 0;
+  let changed = false;
+  for (const run of runs) {
+    const value = direct(run, A, "t")?.textContent ?? "";
+    const from = Math.max(0, start - offset);
+    const to = Math.min(value.length, end - offset);
+    offset += value.length;
+    const oldProperties = direct(run, A, "rPr");
+    const oldFill = oldProperties && direct(oldProperties, A, "solidFill");
+    const oldColor = oldFill && direct(oldFill, A, "srgbClr");
+    const sameProperties =
+      (edit.tag === undefined ||
+        oldProperties?.getAttribute("lang") === edit.tag) &&
+      (edit.fontSizePt === undefined ||
+        oldProperties?.getAttribute("sz") ===
+          String(Math.round(edit.fontSizePt * 100))) &&
+      (edit.colorHex === undefined ||
+        oldColor?.getAttribute("val")?.toUpperCase() ===
+          edit.colorHex.toUpperCase());
+    if (from >= to || sameProperties) continue;
+    for (const [begin, finish, target] of [
+      [0, from, false],
+      [from, to, true],
+      [to, value.length, false],
+    ] as const) {
+      if (begin >= finish) continue;
+      const copy = run.cloneNode(true) as Element;
+      direct(copy, A, "t")!.textContent = value.slice(begin, finish);
+      if (target) {
+        let properties = direct(copy, A, "rPr");
+        if (!properties) {
+          properties = paragraph.ownerDocument!.createElementNS(A, "a:rPr");
+          copy.insertBefore(properties, copy.firstChild);
+        }
+        if (edit.tag !== undefined) properties.setAttribute("lang", edit.tag);
+        if (edit.fontSizePt !== undefined)
+          properties.setAttribute(
+            "sz",
+            String(Math.round(edit.fontSizePt * 100))
+          );
+        if (edit.colorHex !== undefined) {
+          for (const fill of children(properties).filter(
+            (child) =>
+              child.namespaceURI === A &&
+              [
+                "noFill",
+                "solidFill",
+                "gradFill",
+                "blipFill",
+                "pattFill",
+                "grpFill",
+              ].includes(child.localName ?? "")
+          ))
+            properties.removeChild(fill);
+          const fill = paragraph.ownerDocument!.createElementNS(
+            A,
+            "a:solidFill"
+          );
+          const color = paragraph.ownerDocument!.createElementNS(
+            A,
+            "a:srgbClr"
+          );
+          color.setAttribute("val", edit.colorHex.toUpperCase());
+          fill.appendChild(color);
+          const marker =
+            children(properties).find((child) => child.localName !== "ln") ??
+            null;
+          properties.insertBefore(fill, marker);
+        }
+      }
+      paragraph.insertBefore(copy, run);
+    }
+    paragraph.removeChild(run);
+    changed = true;
+  }
+  return changed;
+}
+
 function applySlide(
   slide: InternalSlide,
   repair: PptxSlideRepairs,
   changes: PptxChange[],
-  findings: PptxFinding[]
+  findings: PptxFinding[],
+  revisioned = false,
+  dimensions = { width: 0, height: 0 }
 ): boolean {
   const slideNumber = slide.info.slideNumber;
   const before = changes.length;
@@ -1152,8 +1435,8 @@ function applySlide(
       object.info.grouped ||
       object.info.hidden ||
       object.info.decorative ||
-      placeholder(object.element) !== undefined ||
-      rectangle(object.element) === null ||
+      (!revisioned && placeholder(object.element) !== undefined) ||
+      (!revisioned && rectangle(object.element) === null) ||
       slide.info.hasTiming ||
       !object.info.text.trim() ||
       existing.length > 0
@@ -1175,16 +1458,21 @@ function applySlide(
           object.info.id
         );
       else {
-        preserveTitleLineSpacing(slide, object);
+        const existingPlaceholder = placeholder(object.element);
+        if (!existingPlaceholder) preserveTitleLineSpacing(slide, object);
         // Do not repurpose a body/content placeholder or accidentally match its
         // layout index. Ordinary text boxes get a new, unused placeholder index.
         let index = 0;
         while (slide.placeholderIndices.has(String(index))) index++;
-        const ph = slide.document.createElementNS(P, "p:ph");
-        properties.insertBefore(ph, properties.firstChild);
+        const ph =
+          existingPlaceholder ?? slide.document.createElementNS(P, "p:ph");
+        if (!existingPlaceholder)
+          properties.insertBefore(ph, properties.firstChild);
         ph.setAttribute("type", "title");
-        ph.setAttribute("idx", String(index));
-        slide.placeholderIndices.add(String(index));
+        if (!existingPlaceholder) {
+          ph.setAttribute("idx", String(index));
+          slide.placeholderIndices.add(String(index));
+        }
         changes.push({
           type: "title",
           slideNumber,
@@ -1199,9 +1487,11 @@ function applySlide(
     const object = getObject(description.objectId);
     if (
       !object ||
-      !["image", "chart", "smartart", "shape", "media"].includes(
-        object.info.kind
-      ) ||
+      !(
+        revisioned
+          ? ["image", "chart", "smartart", "shape", "media", "table"]
+          : ["image", "chart", "smartart", "shape", "media"]
+      ).includes(object.info.kind) ||
       object.info.hidden
     )
       review(
@@ -1210,10 +1500,12 @@ function applySlide(
         "Select this object in PowerPoint and check its Alt Text pane.",
         description.objectId
       );
-    else if (
-      object.info.description.trim() ||
-      object.info.title.trim() ||
-      object.info.decorative
+    else if (object.info.description === description.text) {
+      /* Actual no-ops do not enter revision history. */
+    } else if (
+      object.info.decorative ||
+      ((object.info.description.trim() || object.info.title.trim()) &&
+        !(revisioned && description.replaceExisting))
     ) {
       if (object.info.description !== description.text)
         review(
@@ -1222,7 +1514,10 @@ function applySlide(
           "Check the existing Alt Text in PowerPoint. It was not replaced by a generated description.",
           object.info.id
         );
-    } else if (object.info.grouped || object.info.rect === null) {
+    } else if (
+      object.info.grouped ||
+      (!revisioned && object.info.rect === null)
+    ) {
       review(
         "description-identity-review",
         "A new description was not added because this object's position could not be matched reliably to the slide preview.",
@@ -1235,8 +1530,9 @@ function applySlide(
         type: "description",
         slideNumber,
         objectId: object.info.id,
-        message:
-          "Added an image description in the object's Alt Text metadata.",
+        message: object.info.description.trim()
+          ? "Updated the object's description to explain its information more fully."
+          : "Added an image description in the object's Alt Text metadata.",
       });
     }
   }
@@ -1353,32 +1649,35 @@ function applySlide(
         (object) =>
           object.info.kind === "group" ||
           object.info.hidden ||
-          !object.info.rect ||
-          descendants(object.element, A, "effectLst").length > 0 ||
-          descendants(object.element, A, "effectDag").length > 0
+          (!revisioned && !object.info.rect) ||
+          (!revisioned &&
+            descendants(object.element, A, "effectLst").length > 0) ||
+          (!revisioned &&
+            descendants(object.element, A, "effectDag").length > 0)
       ) ||
-      directObjects.some(
-        (object, index) =>
-          object.info.rect &&
-          directObjects
-            .slice(index + 1)
-            .some(
-              (other) =>
-                other.info.rect &&
-                overlapping(object.info.rect!, other.info.rect)
-            )
-      );
+      (!revisioned &&
+        directObjects.some(
+          (object, index) =>
+            object.info.rect &&
+            directObjects
+              .slice(index + 1)
+              .some(
+                (other) =>
+                  other.info.rect &&
+                  overlapping(object.info.rect!, other.info.rect)
+              )
+        ));
     if (same(original, repair.readingOrder)) {
       /* no edit required */
     } else if (unsafe)
       review(
         "reading-order-review",
-        "Reading order was left unchanged because reordering could alter overlapping, grouped, animated, or unmeasured content.",
+        "Reading order was left unchanged because this slide has grouped, hidden, animated, unsupported, or otherwise unsafe content.",
         "Open PowerPoint's Reading Order pane on this slide. Put the objects in the order students should hear, and check that the slide still looks correct."
       );
     else {
-      // spTree child order is both stacking and reading order. Only non-overlapping,
-      // ungrouped, unanimated measured shapes pass this conservative gate.
+      // spTree order also controls stacking. Revisioned mode requires the caller
+      // to render and audit the actual output before accepting this edit.
       const marker = direct(slide.tree, P, "extLst") ?? null;
       for (const objectId of repair.readingOrder)
         slide.tree.insertBefore(getObject(objectId)!.element, marker);
@@ -1399,6 +1698,159 @@ function applySlide(
       "Select the slide text and check Review > Language in PowerPoint. Preserve different languages where they are intentional."
     );
   }
+  for (const [index, language] of (repair.textLanguages ?? []).entries()) {
+    const object = getObject(language.objectId);
+    const applied =
+      revisioned && object && !object.info.grouped && !object.info.hidden
+        ? setTextProperties(object, language.sourceText, { tag: language.tag })
+        : null;
+    if (applied === null) {
+      review(
+        "language-review",
+        "The requested language could not be matched to one exact passage.",
+        "Select this passage in PowerPoint and set its language in Review > Language.",
+        language.objectId
+      );
+    } else if (applied)
+      changes.push({
+        type: "language",
+        slideNumber,
+        objectId: language.objectId,
+        operationId: `${slideNumber}:language:${index}`,
+        message: `Set the selected passage's language to ${language.tag}; kept its wording.`,
+      });
+  }
+  for (const [index, style] of (repair.textStyles ?? []).entries()) {
+    const object = getObject(style.objectId);
+    const applied =
+      revisioned &&
+      object &&
+      !object.info.grouped &&
+      !object.info.hidden &&
+      !slide.info.hasTiming
+        ? setTextProperties(object, style.sourceText, style)
+        : null;
+    if (applied === null)
+      review(
+        "text-style-review",
+        "The proposed text appearance could not be applied to one exact passage.",
+        "Check this passage's size, color, and fit on the slide in PowerPoint.",
+        style.objectId
+      );
+    else if (applied)
+      changes.push({
+        type: "text-style",
+        slideNumber,
+        objectId: style.objectId,
+        operationId: `${slideNumber}:text-style:${index}`,
+        message:
+          "Changed the selected passage's appearance while preserving its wording.",
+      });
+  }
+  for (const bounds of repair.objectBounds ?? []) {
+    const object = getObject(bounds.objectId);
+    const transform =
+      object &&
+      (direct(object.element, P, "xfrm") ??
+        (direct(object.element, P, "spPr") &&
+          direct(direct(object.element, P, "spPr")!, A, "xfrm")));
+    const sourceRect = object?.info.rect;
+    const matches =
+      sourceRect &&
+      ["x", "y", "width", "height"].every(
+        (key) =>
+          sourceRect[key as keyof PptxRect] ===
+          bounds.sourceRect[key as keyof PptxRect]
+      );
+    if (
+      !revisioned ||
+      !object ||
+      object.info.grouped ||
+      object.info.hidden ||
+      object.info.kind === "group" ||
+      slide.info.hasTiming ||
+      !matches ||
+      !transform ||
+      !direct(transform, A, "off") ||
+      !direct(transform, A, "ext") ||
+      transform.hasAttribute("rot") ||
+      transform.hasAttribute("flipH") ||
+      transform.hasAttribute("flipV") ||
+      bounds.rect.x + bounds.rect.width > dimensions.width ||
+      bounds.rect.y + bounds.rect.height > dimensions.height
+    ) {
+      review(
+        "position-review",
+        "The proposed position or size could not be confirmed against the object's original bounds.",
+        "Check this object's position, size, and overlap in PowerPoint.",
+        bounds.objectId
+      );
+    } else if (
+      ["x", "y", "width", "height"].some(
+        (key) =>
+          bounds.rect[key as keyof PptxRect] !==
+          sourceRect![key as keyof PptxRect]
+      )
+    ) {
+      const offset = direct(transform, A, "off")!;
+      const extent = direct(transform, A, "ext")!;
+      offset.setAttribute("x", String(bounds.rect.x));
+      offset.setAttribute("y", String(bounds.rect.y));
+      extent.setAttribute("cx", String(bounds.rect.width));
+      extent.setAttribute("cy", String(bounds.rect.height));
+      changes.push({
+        type: "position",
+        slideNumber,
+        objectId: bounds.objectId,
+        message:
+          "Changed the object's position or size to improve the slide's readability.",
+      });
+    }
+  }
+  for (const [index, link] of (repair.linkTexts ?? []).entries()) {
+    const object = getObject(link.objectId);
+    const matches = object
+      ? descendants(object.element, A, "r").filter(
+          (run) =>
+            direct(run, A, "t")?.textContent === link.sourceText &&
+            !!direct(run, A, "rPr") &&
+            !!direct(direct(run, A, "rPr")!, A, "hlinkClick")?.getAttributeNS(
+              R,
+              "id"
+            )
+        )
+      : [];
+    if (
+      !revisioned ||
+      !object ||
+      object.info.grouped ||
+      object.info.hidden ||
+      matches.length !== 1
+    ) {
+      review(
+        "link-text-review",
+        "The proposed link wording could not be matched to one exact linked passage.",
+        "Select the link in PowerPoint and edit its display text while keeping the same destination.",
+        link.objectId
+      );
+    } else if (link.sourceText !== link.text) {
+      direct(matches[0], A, "t")!.textContent = link.text;
+      changes.push({
+        type: "link-text",
+        slideNumber,
+        objectId: link.objectId,
+        operationId: `${slideNumber}:link-text:${index}`,
+        message: "Replaced the link's displayed wording; kept its destination.",
+      });
+    }
+  }
+  for (const change of changes.slice(before)) {
+    change.operationId ??= `${slideNumber}:${change.type}:${change.objectId ?? "slide"}`;
+  }
+  // A caption/table repair may also receive explicit, reviewed run or geometry
+  // edits above. The final integrity comparison must include those bounded edits.
+  for (const patch of slide.captionPatches)
+    patch.tableHash = pptxElementHash(patch.table);
   return changes.length !== before;
 }
 
@@ -1530,7 +1982,8 @@ export function checkPptxAccessibility(
 
 export async function applyPptxRepairs(
   buffer: Buffer,
-  plan: PptxRepairPlan
+  plan: PptxRepairPlan,
+  options: { revisioned?: boolean } = {}
 ): Promise<PptxRepairResult> {
   if (!validatePptxRepairPlan(plan))
     throw new PptxPackageError(
@@ -1545,7 +1998,16 @@ export async function applyPptxRepairs(
   const changed = new Map<string, Buffer>();
   for (const repair of plan.slides) {
     const slide = pkg.slides[repair.slideNumber - 1];
-    if (applySlide(slide, repair, changes, findings)) {
+    if (
+      applySlide(
+        slide,
+        repair,
+        changes,
+        findings,
+        options.revisioned,
+        pkg.inspection
+      )
+    ) {
       const bytes = serializeXml(
         slide.document,
         pkg.parts.get(slide.info.partName)!.bytes
@@ -1620,14 +2082,30 @@ export async function applyPptxRepairs(
       }
       if (
         !current ||
-        object.text !== current.text ||
+        (changes.some(
+          (change) =>
+            change.type === "link-text" &&
+            change.slideNumber === slide.slideNumber &&
+            change.objectId === object.id
+        )
+          ? textOf(
+              pkg.slides[index].objects.find(
+                (item) => item.info.id === object.id
+              )!.element
+            ) !== current.text
+          : object.text !== current.text) ||
         object.parentId !== current.parentId ||
         object.kind !== current.kind ||
         object.hidden !== current.hidden ||
         object.decorative !== current.decorative ||
         object.title !== current.title ||
-        (object.description.trim() &&
-          object.description !== current.description)
+        (object.description !== current.description &&
+          !changes.some(
+            (change) =>
+              change.type === "description" &&
+              change.slideNumber === slide.slideNumber &&
+              change.objectId === object.id
+          ))
       )
         throw new PptxPackageError(
           "pptx_integrity",

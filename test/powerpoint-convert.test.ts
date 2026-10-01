@@ -12,11 +12,16 @@ const mocks = vi.hoisted(() => ({
   render: vi.fn(),
   pages: vi.fn(),
   call: vi.fn(),
+  tracked: vi.fn(),
 }));
 vi.mock("../lib/pptx-package", async (original) => ({
   ...(await original<typeof import("../lib/pptx-package")>()),
   inspectPptx: mocks.inspect,
   applyPptxRepairs: mocks.repair,
+}));
+vi.mock("../lib/pptx-revisions", async (original) => ({
+  ...(await original<typeof import("../lib/pptx-revisions")>()),
+  createPptxRevisionBundle: mocks.tracked,
 }));
 vi.mock("../lib/powerpoint-rendering", async (original) => ({
   ...(await original<typeof import("../lib/powerpoint-rendering")>()),
@@ -41,6 +46,9 @@ import {
   convertPowerPoint,
   parsePowerPointFindings,
   changedPowerPointSlides,
+  recheckPowerPointRevision,
+  completePowerPointCorrection,
+  buildPowerPointReviewPreviews,
 } from "../lib/powerpoint-convert";
 import { createCanvas } from "@napi-rs/canvas";
 import { LiteLLMError } from "../lib/litellm";
@@ -89,7 +97,7 @@ const resultCall = (content: unknown) => ({
   responseCostUsd: 0.01,
   finishReason: "stop",
 });
-const pages = (png: Buffer = Buffer.from("identical-png")) => ({
+const pages = (png: Buffer = createCanvas(1, 1).toBuffer("image/png")) => ({
   pageCount: 1,
   pages: [
     {
@@ -106,6 +114,27 @@ const pages = (png: Buffer = Buffer.from("identical-png")) => ({
 beforeEach(() => {
   vi.resetAllMocks();
   mocks.inspect.mockResolvedValue(inspection);
+  mocks.tracked.mockImplementation(async (buffer, plan) => {
+    const result = await mocks.repair(buffer, plan);
+    return {
+      result,
+      bundle: {
+        version: 1,
+        sourceHash: "source-hash",
+        plan,
+        changes: result.changes.map((change: PptxChange, index: number) => ({
+          id: `change-${index + 1}`,
+          type: change.type,
+          slideNumber: change.slideNumber,
+          label: change.message,
+          before: "Before",
+          after: "After",
+          reason: "Repair",
+          operationIds: [],
+        })),
+      },
+    };
+  });
   mocks.repair.mockResolvedValue({
     buffer: output,
     inspection,
@@ -145,6 +174,16 @@ describe("PowerPoint repair orchestration", () => {
       "Canvas HTML compatibility"
     );
     expect(mocks.render.mock.calls.map((c) => c[0])).toEqual([input, output]);
+    expect(mocks.call.mock.calls[1][1]).toContainEqual(
+      expect.objectContaining({
+        type: "text",
+        text: expect.stringContaining("ACTUAL REPAIRED slide 1"),
+      })
+    );
+    expect(result.revisions?.changes).toHaveLength(1);
+    expect(result.reviewPreviews?.[0].after).toMatch(
+      /^data:image\/jpeg;base64,/
+    );
   });
 
   it("rejects incomplete repair coverage after recording the completed call cost", async () => {
@@ -388,54 +427,235 @@ describe("PowerPoint repair orchestration", () => {
     expect(JSON.stringify(result)).not.toContain("private provider");
   });
 
-  it("rebuilds changed slides from original bytes and retains descriptions only", async () => {
+  it("keeps intentional visible edits and gives the audit real before/after evidence", async () => {
     const blank = createCanvas(1, 1).toBuffer("image/png");
     const dark = createCanvas(1, 1);
     dark.getContext("2d").fillRect(0, 0, 1, 1);
+    const candidate = dark.toBuffer("image/png");
     mocks.pages
       .mockReset()
       .mockResolvedValueOnce(pages(blank))
-      .mockResolvedValueOnce(pages(dark.toBuffer("image/png")))
-      .mockResolvedValueOnce(pages(blank));
+      .mockResolvedValueOnce(pages(candidate));
+    const result = await convertPowerPoint(input, "test.pptx");
+    expect(result).not.toHaveProperty("error");
+    expect(mocks.repair).toHaveBeenCalledTimes(1);
+    const evidence = mocks.call.mock.calls[1][1];
+    expect(evidence).toContainEqual(
+      expect.objectContaining({
+        type: "text",
+        text: expect.stringContaining(
+          "ORIGINAL slide 1 before visible changes"
+        ),
+      })
+    );
+    expect(evidence).toContainEqual({
+      type: "image_url",
+      image_url: {
+        detail: "high",
+        url: `data:image/png;base64,${candidate.toString("base64")}`,
+      },
+    });
+  });
+
+  it("rejects a rendered candidate that omits slides before auditing", async () => {
+    mocks.pages
+      .mockReset()
+      .mockResolvedValueOnce(pages())
+      .mockResolvedValueOnce({ pageCount: 0, pages: [] });
+    const result = await convertPowerPoint(input, "test.pptx");
+    expect(result).toHaveProperty("error");
+    expect(result.calls).toHaveLength(1);
+    expect(mocks.call).toHaveBeenCalledTimes(1);
+  });
+
+  it("rechecks the chosen export without automatically restoring declined changes", async () => {
+    mocks.call.mockReset().mockResolvedValueOnce(resultCall(audit));
+    const result = await recheckPowerPointRevision(input, input);
+    expect(result).not.toHaveProperty("error");
+    expect(mocks.tracked).not.toHaveBeenCalled();
+    expect(mocks.repair).not.toHaveBeenCalled();
+    expect(mocks.call).toHaveBeenCalledTimes(1);
+    expect(mocks.call.mock.calls[0][1]).toContainEqual(
+      expect.objectContaining({
+        type: "text",
+        text: expect.stringContaining("Automatic correction DISABLED"),
+      })
+    );
+    expect(result.calls?.map((call) => call.stage)).toEqual(["validate"]);
+  });
+
+  it("does not hide a machine defect restored by undo", async () => {
+    const restored = structuredClone(inspection);
+    restored.slides[0].objects[0].isTitle = false;
+    mocks.inspect
+      .mockResolvedValueOnce(inspection)
+      .mockResolvedValueOnce(restored);
+    mocks.call.mockReset().mockResolvedValueOnce(resultCall(audit));
+    const result = await recheckPowerPointRevision(input, input);
+    if ("error" in result) throw new Error(result.error);
+    expect(result.errors).toContainEqual(
+      expect.objectContaining({
+        severity: "error",
+        message: expect.stringContaining("title identified"),
+      })
+    );
+  });
+
+  it("rejects a corrective plan in a selected-export audit and preserves audit charges", async () => {
+    mocks.call.mockReset().mockResolvedValueOnce(
+      resultCall({
+        ...audit,
+        correctivePlan: {
+          slides: [
+            {
+              slideNumber: 1,
+              descriptions: [{ objectId: "2", text: "Changed" }],
+            },
+          ],
+        },
+      })
+    );
+    const result = await recheckPowerPointRevision(input, input);
+    if ("error" in result) throw new Error(result.error);
+    expect(result.pptx).toEqual(input);
+    expect(
+      result.errors.some((finding) =>
+        finding.message.includes("independent AI review")
+      )
+    ).toBe(true);
+    expect(result.calls).toHaveLength(1);
+    expect(mocks.tracked).not.toHaveBeenCalled();
+  });
+
+  it("replays an auditor correction from the original and independently checks it once more", async () => {
+    const corrected = Buffer.from("corrected-pptx");
+    const correction = {
+      slides: [
+        {
+          slideNumber: 1,
+          descriptions: [{ objectId: "2", text: "Correct description" }],
+        },
+      ],
+    };
+    mocks.repair
+      .mockResolvedValueOnce({
+        buffer: output,
+        inspection,
+        findings: [],
+        changes: [],
+      })
+      .mockResolvedValueOnce({
+        buffer: corrected,
+        inspection,
+        findings: [],
+        changes: [],
+      });
     mocks.call
       .mockReset()
+      .mockResolvedValueOnce(resultCall(plan))
       .mockResolvedValueOnce(
-        resultCall({
-          slides: [{ slideNumber: 1, titleObjectId: "2", descriptions: [] }],
-          findings: [],
-        })
+        resultCall({ ...audit, correctivePlan: correction })
       )
       .mockResolvedValueOnce(resultCall(audit));
     const result = await convertPowerPoint(input, "test.pptx");
     if ("error" in result) throw new Error(result.error);
-    expect(mocks.repair.mock.calls[1]).toEqual([
-      input,
-      { slides: [{ slideNumber: 1, descriptions: [] }] },
+    expect(result.pptx).toEqual(corrected);
+    expect(mocks.tracked.mock.calls[1][0]).toEqual(input);
+    expect(mocks.tracked.mock.calls[1][1]).toMatchObject(correction);
+    expect(result.calls.map((call) => call.stage)).toEqual([
+      "convert",
+      "validate",
+      "validate",
     ]);
+    expect(result.tokensUsed).toBe(450);
+    expect(mocks.render.mock.calls.map((call) => call[0])).toEqual([
+      input,
+      output,
+      corrected,
+    ]);
+  });
+
+  it("keeps the prior audited candidate if the corrective output cannot be audited", async () => {
+    const correction = {
+      slides: [
+        {
+          slideNumber: 1,
+          descriptions: [{ objectId: "2", text: "Correct description" }],
+        },
+      ],
+    };
+    mocks.repair
+      .mockResolvedValueOnce({
+        buffer: output,
+        inspection,
+        findings: [],
+        changes: [],
+      })
+      .mockResolvedValueOnce({
+        buffer: Buffer.from("correction"),
+        inspection,
+        findings: [],
+        changes: [],
+      });
+    mocks.call
+      .mockReset()
+      .mockResolvedValueOnce(resultCall(plan))
+      .mockResolvedValueOnce(
+        resultCall({ ...audit, correctivePlan: correction })
+      )
+      .mockResolvedValueOnce(resultCall({ reviewedSlides: [] }));
+    const result = await convertPowerPoint(input, "test.pptx");
+    if ("error" in result) throw new Error(result.error);
+    expect(result.pptx).toEqual(output);
+    expect(result.calls).toHaveLength(3);
     expect(
-      result.errors.some((f) =>
-        f.message.includes("outside the supported repair area")
+      result.errors.some((finding) =>
+        finding.message.includes("previously checked version")
       )
     ).toBe(true);
   });
 
-  it("does not return a file if fallback still changes the slide pixels", async () => {
-    const blank = createCanvas(1, 1).toBuffer("image/png");
-    const dark = createCanvas(1, 1);
-    dark.getContext("2d").fillRect(0, 0, 1, 1);
-    mocks.pages
-      .mockReset()
-      .mockResolvedValueOnce(pages(blank))
-      .mockResolvedValue(pages(dark.toBuffer("image/png")));
-    const result = await convertPowerPoint(input, "test.pptx");
-    expect(result).toMatchObject({
-      diagnostic: { code: "pptx_visual_change" },
-    });
-    expect(result).not.toHaveProperty("pptx");
+  it("does not accept structural edits in the focused corrective pass", () => {
+    expect(
+      completePowerPointCorrection(
+        { slides: [{ slideNumber: 1, titleObjectId: "2" }] },
+        inspection
+      )
+    ).toBe(false);
+    expect(
+      completePowerPointCorrection(
+        {
+          slides: [
+            {
+              slideNumber: 1,
+              textLanguages: [
+                { objectId: "2", sourceText: "Sampling", tag: "en-US" },
+              ],
+            },
+          ],
+        },
+        inspection
+      )
+    ).toBe(true);
   });
 });
 
 describe("PowerPoint evidence boundaries", () => {
+  it("creates distinct bounded before/after previews for selected slides", async () => {
+    const before = createCanvas(1600, 900);
+    before.getContext("2d").fillRect(0, 0, 1600, 900);
+    const after = createCanvas(1600, 900);
+    const previews = await buildPowerPointReviewPreviews(
+      pages(before.toBuffer("image/png")),
+      pages(after.toBuffer("image/png")),
+      [1, 1, 99]
+    );
+    expect(previews).toHaveLength(1);
+    expect(previews[0].before).not.toEqual(previews[0].after);
+    expect(previews[0].before.length + previews[0].after.length).toBeLessThan(
+      8_000_000
+    );
+  });
   const raster = (edit?: (data: Uint8ClampedArray) => void) => {
     const canvas = createCanvas(400, 400);
     const context = canvas.getContext("2d");

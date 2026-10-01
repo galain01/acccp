@@ -8,6 +8,7 @@ import {
 } from "@/lib/output-formats";
 import { formatBytes, formatUploadTime } from "@/lib/format";
 import type { ConversionStatus, UploadedDocument } from "@/lib/types/document";
+import type { PowerPointReviewExport } from "@/lib/powerpoint-review-contract";
 import { Badge } from "./badge";
 import { Button } from "./button";
 import {
@@ -34,6 +35,7 @@ interface DocumentTableProps {
   onDeleteDocument: (docId: string) => void | Promise<void>;
   onReconvert: (docId: string) => void;
   isProcessing: boolean;
+  onReviewExport?: (documentId: string, result: PowerPointReviewExport) => void;
 }
 
 function statusBadge(
@@ -91,14 +93,17 @@ export default function DocumentTable({
   onDeleteDocument,
   onReconvert,
   isProcessing,
+  onReviewExport,
 }: DocumentTableProps): React.JSX.Element {
   const [selectedDocument, setSelectedDocument] =
     useState<UploadedDocument | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [resultViewId, setResultViewId] = useState(0);
 
   const openResult = (doc: UploadedDocument) => {
     if (doc.status !== "success" && doc.status !== "error") return;
     setSelectedDocument(doc);
+    setResultViewId((value) => value + 1);
     setDialogOpen(true);
   };
 
@@ -284,12 +289,21 @@ export default function DocumentTable({
         </CardContent>
       </Card>
 
-      {/* Keyed so the fetched html resets when a different document is opened. */}
+      {/* Keyed to the conversion so a different result cannot reuse review choices. */}
       <ConversionResultDialog
-        key={selectedDocument?.id}
+        key={`${selectedDocument?.id}:${selectedDocument?.jobId ?? ""}:${resultViewId}`}
         document={selectedDocument}
         open={dialogOpen}
         onOpenChange={setDialogOpen}
+        onReviewExport={(result) => {
+          if (!selectedDocument) return;
+          setSelectedDocument({
+            ...selectedDocument,
+            errors: result.findings,
+            changes: result.changes,
+          });
+          onReviewExport?.(selectedDocument.id, result);
+        }}
       />
     </>
   );

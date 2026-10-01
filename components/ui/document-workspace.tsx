@@ -310,6 +310,12 @@ export default function DocumentWorkspace({
         onDeleteDocument={handleDeleteDocument}
         onReconvert={reconvertDocument}
         isProcessing={isProcessing}
+        onReviewExport={(docId, result) =>
+          updateDocument(docId, {
+            errors: result.findings,
+            changes: result.changes,
+          })
+        }
       />
     </div>
   );

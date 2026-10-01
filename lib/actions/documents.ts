@@ -55,7 +55,7 @@ export async function listDocuments(
       status: conversionJobs.status,
       errorMessage: conversionJobs.errorMessage,
       outputTarget: conversionJobs.outputTarget,
-      changes: sql<unknown>`(select metadata -> 'changes' from job_events where job_events.job_id = ${conversionJobs.id} and event_type = 'conversion_completed' order by created_at desc, id desc limit 1)`,
+      changes: sql<unknown>`(select metadata -> 'changes' from job_events where job_events.job_id = ${conversionJobs.id} and event_type in ('conversion_completed', 'powerpoint_review_finished') and metadata ? 'changes' order by created_at desc, id desc limit 1)`,
     })
     .from(documents)
     .innerJoin(sessions, eq(sessions.id, documents.sessionId))

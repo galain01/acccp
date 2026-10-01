@@ -339,6 +339,41 @@ describe("document conversion route", () => {
     ]);
   });
 
+  it("preserves old reviewed-output storage keys as retired discovery rows before reconversion upserts", async () => {
+    ownedDocument("slides.pptx");
+    mocks.download.mockResolvedValueOnce(Buffer.from(DOCX));
+    const retired = chain();
+    mocks.db.update.mockImplementation((table) =>
+      table === artifacts ? retired : updated
+    );
+    const response = await POST(
+      request({ documentId: "doc-1", outputTarget: "accessible_pptx" })
+    );
+    expect(response.status).toBe(200);
+    // Changing only status keeps review-UUID.pptx/.json paths discoverable for purge.
+    expect(retired.set).toHaveBeenCalledWith({ artifactStatus: "expired" });
+    const predicate = new PgDialect().sqlToQuery(
+      retired.where.mock.calls[0][0] as SQL
+    );
+    expect(predicate.params).toEqual(
+      expect.arrayContaining([
+        "job-1",
+        "pptx_output",
+        "review_metadata",
+        "available",
+      ])
+    );
+    const firstArtifactInsertIndex = mocks.db.insert.mock.calls.findIndex(
+      ([table]) => table === artifacts
+    );
+    expect(retired.set.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.db.insert.mock.invocationCallOrder[firstArtifactInsertIndex]
+    );
+    expect(
+      mocks.db.delete.mock.calls.some(([table]) => table === artifacts)
+    ).toBe(false);
+  });
+
   it("rejects mismatched stored sources before downloading them", async () => {
     ownedDocument("slides.pptx");
     expect(

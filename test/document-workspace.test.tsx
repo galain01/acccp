@@ -15,6 +15,11 @@ vi.mock("@/lib/actions/documents", () => ({
   }),
 }));
 
+vi.mock("@/lib/actions/powerpoint-review", () => ({
+  getPowerPointReview: vi.fn().mockResolvedValue(null),
+  getPowerPointReviewPreview: vi.fn().mockResolvedValue(null),
+}));
+
 // Only replace the browser file picker. Selection, status changes, buttons,
 // and request construction remain the actual workspace and document table.
 vi.mock("@/components/ui/file-upload", () => ({
@@ -43,6 +48,7 @@ import {
   getDocumentHtml,
   getDocumentOutputDownload,
 } from "@/lib/actions/documents";
+import { getPowerPointReview } from "@/lib/actions/powerpoint-review";
 
 const SESSION_ID = "synthetic-session";
 let host: HTMLDivElement;
@@ -177,6 +183,7 @@ function requests(): FormData[] {
 }
 
 beforeEach(() => {
+  vi.mocked(getPowerPointReview).mockResolvedValue(null);
   vi.mocked(getDocumentHtml).mockResolvedValue("<h2>Saved result</h2>");
   vi.mocked(getDocumentOutputDownload).mockResolvedValue({
     url: "https://storage.example.test/result.pptx",
@@ -205,6 +212,70 @@ afterEach(async () => {
 });
 
 describe("DocumentWorkspace conversion selection", () => {
+  it("updates the saved row and reopened result with findings for the chosen PowerPoint version", async () => {
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    vi.mocked(getPowerPointReview).mockResolvedValue({
+      revisionToken: "a".repeat(64),
+      changes: [
+        {
+          id: "title",
+          type: "title",
+          slideNumber: 1,
+          label: "Identify title",
+          before: "No title identified",
+          after: "Course introduction",
+          reason: "Students can find the slide by its title.",
+          operationIds: ["title"],
+        },
+      ],
+      findings: [],
+      includedChangeIds: ["title"],
+      reviewedChangeIds: [],
+      descriptionEdits: {},
+    });
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        url: "https://storage.example.test/selected.pptx",
+        filename: "selected.pptx",
+        revisionToken: "b".repeat(64),
+        changes: [],
+        findings: [
+          {
+            type: "other",
+            severity: "error",
+            title: "Identify this slide's title",
+            message:
+              "Restoring this change leaves the slide without an identified title.",
+            suggestion:
+              "Keep the title change or identify a title in PowerPoint.",
+          },
+        ],
+      }),
+    } as Response);
+    await mount([
+      savedDocument("lecture", "success", {
+        name: "lecture.pptx",
+        outputTarget: "accessible_pptx",
+        jobId: "job-1",
+      }),
+    ]);
+    await click(button("lecture.pptx"));
+    await click(button("Review changes", document.body));
+    await click(button("Restore original", document.body));
+    await click(button("Check and download chosen version", document.body));
+    expect(row("lecture.pptx").textContent).toContain("Needs a fix");
+    expect(document.body.textContent).toContain(
+      "Restoring this change leaves the slide without an identified title."
+    );
+    await click(button("Close", document.body));
+    await click(button("lecture.pptx"));
+    expect(document.body.textContent).toContain(
+      "Restoring this change leaves the slide without an identified title."
+    );
+    expect(button("Download PowerPoint", document.body)).toBeDefined();
+    expect(getPowerPointReview).toHaveBeenCalledOnce();
+  });
   it("keeps each upload's output format when the selector changes and skips completed PowerPoints", async () => {
     await mount([
       savedDocument("done", "success", {
