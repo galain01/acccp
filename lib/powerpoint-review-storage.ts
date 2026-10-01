@@ -78,6 +78,41 @@ function parseReview(body: Buffer): StoredReview | null {
     throw new PowerPointReviewError(
       "This saved review could not be read. Convert the original presentation again."
     );
+  if (value.reviewPreviews !== undefined) {
+    const generated = new Set(
+      value.revisions.changes.flatMap((change) =>
+        change.type === "long-description"
+          ? (change.generatedSlideNumbers ?? [])
+          : []
+      )
+    );
+    const sourceCount = value.revisions.plan.slides.length;
+    const image = (data: unknown) =>
+      typeof data === "string" &&
+      data.length <= 3 * 1024 * 1024 &&
+      /^data:image\/(?:jpeg|png);base64,[A-Za-z0-9+/=]+$/.test(data);
+    if (
+      !Array.isArray(value.reviewPreviews) ||
+      value.reviewPreviews.length > 60 ||
+      new Set(value.reviewPreviews.map((preview) => preview?.slideNumber))
+        .size !== value.reviewPreviews.length ||
+      value.reviewPreviews.some(
+        (preview) =>
+          !preview ||
+          !Number.isInteger(preview.slideNumber) ||
+          preview.slideNumber < 1 ||
+          preview.slideNumber > 60 ||
+          !image(preview.after) ||
+          (preview.before === undefined
+            ? !generated.has(preview.slideNumber) ||
+              preview.slideNumber <= sourceCount
+            : !image(preview.before))
+      )
+    )
+      throw new PowerPointReviewError(
+        "This saved slide preview could not be read. Convert the original presentation again."
+      );
+  }
   return value;
 }
 

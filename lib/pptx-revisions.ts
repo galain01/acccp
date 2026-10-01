@@ -56,6 +56,8 @@ export function mergePptxRepairPlans(
     if (next.language !== undefined) target.language = { ...next.language };
     for (const key of [
       "descriptions",
+      "decorativeObjects",
+      "longDescriptions",
       "tableHeaders",
       "splitTableCaption",
       "objectBounds",
@@ -183,6 +185,30 @@ function revisionValues(
         before?.description || "No description",
         after?.description || "No description",
       ];
+    case "decorative":
+      return [before, after].map((object) =>
+        object?.decorative
+          ? "Skipped by screen readers (decorative image)"
+          : "Included for screen readers"
+      ) as [string, string];
+    case "long-description":
+      return [
+        before?.description || "No description",
+        `Short description: ${after?.description || "No description"}\n\n${
+          change.generatedSlideNumbers
+            ?.map((slideNumber) => {
+              const slide = output.slides.find(
+                (item) => item.slideNumber === slideNumber
+              );
+              if (!slide) invalid();
+              return `Added description slide ${slideNumber}:\n${slide.objects
+                .map((object) => object.text)
+                .filter(Boolean)
+                .join("\n")}`;
+            })
+            .join("\n\n") ?? ""
+        }`,
+      ];
     case "title":
       return [
         before?.isTitle
@@ -232,6 +258,8 @@ function revisionValues(
 const labels: Record<PptxChange["type"], string> = {
   title: "Identify the slide title",
   description: "Describe the object's information",
+  decorative: "Choose whether students hear this image",
+  "long-description": "Add slides with the full image description",
   language: "Set the passage's spoken language",
   "reading-order": "Set the order students hear",
   "table-header": "Identify the table's column labels",
@@ -264,9 +292,17 @@ export async function createPptxRevisionBundle(
         other.slideNumber === change.slideNumber &&
         other.objectId === change.objectId
     );
+    const imageAlternative =
+      (change.type === "description" || change.type === "decorative") &&
+      result.changes.some(
+        (other) =>
+          other.type === "decorative" &&
+          other.slideNumber === change.slideNumber &&
+          other.objectId === change.objectId
+      );
     const key = JSON.stringify([
       change.slideNumber,
-      caption ? "table-caption" : change.type,
+      caption ? "table-caption" : imageAlternative ? "decorative" : change.type,
       change.objectId,
     ]);
     groups.set(key, [...(groups.get(key) ?? []), change]);
@@ -274,7 +310,9 @@ export async function createPptxRevisionBundle(
   const changes: PptxRevisionChange[] = [];
   for (const group of groups.values()) {
     const first =
-      group.find((change) => change.type === "table-caption") ?? group[0];
+      group.find((change) => change.type === "table-caption") ??
+      group.find((change) => change.type === "decorative") ??
+      group[0];
     const values = new Map(group.map((change) => [change.type, change]));
     const pairs = [...values.values()].map((change) =>
       revisionValues(change, before, result.inspection)
@@ -326,6 +364,9 @@ export async function createPptxRevisionBundle(
     const operationIds = [
       ...new Set(group.map((change) => change.operationId!)),
     ];
+    const compositeDescription =
+      first.type === "decorative" &&
+      group.some((change) => change.type === "description");
     changes.push({
       id: `change-${digest(operationIds.join("\n")).slice(0, 20)}`,
       type: first.type,
@@ -347,7 +388,24 @@ export async function createPptxRevisionBundle(
         : (note?.reason ?? first.message),
       ...(assumption ? { assumption } : {}),
       operationIds,
-      ...(first.type === "description" ? { editableDescription: true } : {}),
+      ...(first.type === "description" || compositeDescription
+        ? { editableDescription: true }
+        : {}),
+      ...(compositeDescription
+        ? {
+            descriptionBefore:
+              before.slides[first.slideNumber - 1].objects.find(
+                (object) => object.id === first.objectId
+              )?.description ?? "",
+            descriptionAfter:
+              result.inspection.slides[first.slideNumber - 1].objects.find(
+                (object) => object.id === first.objectId
+              )?.description ?? "",
+          }
+        : {}),
+      ...(first.generatedSlideNumbers?.length
+        ? { generatedSlideNumbers: [...first.generatedSlideNumbers] }
+        : {}),
     });
   }
   return {
@@ -390,6 +448,8 @@ function selectedPlan(
         target.readingOrder = slide.readingOrder;
       const fields = {
         descriptions: "description",
+        decorativeObjects: "decorative",
+        longDescriptions: "long-description",
         tableHeaders: "table-header",
         splitTableCaption: "table-caption",
         objectBounds: "position",

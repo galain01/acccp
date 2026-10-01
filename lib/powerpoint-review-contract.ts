@@ -3,7 +3,7 @@ import type { PptxRevisionChange } from "./pptx-types";
 
 export interface PowerPointReviewPreview {
   slideNumber: number;
-  before: string;
+  before?: string;
   after: string;
 }
 

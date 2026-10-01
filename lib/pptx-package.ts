@@ -11,6 +11,7 @@ import {
 import { SaxesParser } from "saxes";
 import { fromBufferPromise } from "yauzl";
 import { ZipFile } from "yazl";
+import { appendPptxDescriptionSlides } from "./pptx-description-slides";
 import {
   buildTableCaptionPatch,
   pptxElementHash,
@@ -37,6 +38,7 @@ const REL = "http://schemas.openxmlformats.org/package/2006/relationships";
 const CT = "http://schemas.openxmlformats.org/package/2006/content-types";
 const DECORATIVE =
   "http://schemas.microsoft.com/office/drawing/2017/decorative";
+const DECORATIVE_EXTENSION = "{C183D7F6-B498-43B3-948B-1728B52AA6E4}";
 const MAIN_TYPE =
   "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml";
 const SLIDE_TYPE =
@@ -526,7 +528,8 @@ function inspectObjects(
   slideNumber: number,
   findings: PptxFinding[],
   layout?: Document,
-  diagramTexts = new Map<string, string[]>()
+  diagramTexts = new Map<string, string[]>(),
+  slideRelationships: Relationship[] = []
 ): InternalObject[] {
   const result: InternalObject[] = [];
   const ids = new Set<string>();
@@ -608,6 +611,41 @@ function inspectObjects(
           .filter((value): value is string => !!value)
       ),
     ];
+    const actions: NonNullable<PptxObject["actions"]> = children(properties)
+      .filter(
+        (node) =>
+          node.namespaceURI === A &&
+          ["hlinkClick", "hlinkHover"].includes(node.localName ?? "")
+      )
+      .map((node) => {
+        const relationshipId = node.getAttributeNS(R, "id") || undefined;
+        const relation = slideRelationships.find(
+          (entry) => entry.id === relationshipId
+        );
+        const action = node.getAttribute("action") || undefined;
+        if (
+          (relation?.target.length ?? 0) > 8000 ||
+          (action?.length ?? 0) > 1000
+        )
+          complex();
+        return {
+          trigger:
+            node.localName === "hlinkClick"
+              ? ("click" as const)
+              : ("hover" as const),
+          ...(relationshipId ? { relationshipId } : {}),
+          ...(relation
+            ? {
+                target: relation.target,
+                targetKind: relation.external
+                  ? ("external" as const)
+                  : ("internal" as const),
+              }
+            : {}),
+          ...(action ? { action } : {}),
+        };
+      });
+    if (actions.length > 2) complex();
     const info: PptxObject = {
       id,
       name: (properties.getAttribute("name") ?? "").slice(0, 240),
@@ -624,6 +662,7 @@ function inspectObjects(
       grouped: parentId !== null,
       parentId,
       language: languages.length === 1 ? languages[0] : null,
+      ...(actions.length ? { actions } : {}),
       textRuns: descendants(element, A, "r").map((run) => {
         const properties = direct(run, A, "rPr");
         return {
@@ -903,7 +942,8 @@ async function loadPackage(
       number,
       findings,
       layout,
-      diagramTexts
+      diagramTexts,
+      slideRels
     );
     const hidden =
       root.getAttribute("show") === "0" ||
@@ -1018,6 +1058,8 @@ export function validatePptxRepairPlan(
         "slideNumber",
         "titleObjectId",
         "descriptions",
+        "decorativeObjects",
+        "longDescriptions",
         "tableHeaders",
         "splitTableCaption",
         "readingOrder",
@@ -1032,6 +1074,56 @@ export function validatePptxRepairPlan(
       (slide.slideNumber as number) < 1 ||
       (slide.slideNumber as number) > LIMITS.slides ||
       slides.has(slide.slideNumber as number)
+    )
+      return false;
+    if (
+      slide.decorativeObjects !== undefined &&
+      (!Array.isArray(slide.decorativeObjects) ||
+        slide.decorativeObjects.length > 300 ||
+        !slide.decorativeObjects.every(
+          (entry) =>
+            isRecord(entry) &&
+            onlyKeys(entry, ["objectId", "decorative"]) &&
+            id(entry.objectId) &&
+            typeof entry.decorative === "boolean"
+        ) ||
+        new Set(slide.decorativeObjects.map((entry) => entry.objectId)).size !==
+          slide.decorativeObjects.length)
+    )
+      return false;
+    if (
+      slide.longDescriptions !== undefined &&
+      (!Array.isArray(slide.longDescriptions) ||
+        slide.longDescriptions.length > 20 ||
+        !slide.longDescriptions.every(
+          (entry) =>
+            isRecord(entry) &&
+            onlyKeys(entry, [
+              "objectId",
+              "title",
+              "summary",
+              "paragraphs",
+              "languageTag",
+            ]) &&
+            id(entry.objectId) &&
+            validText(entry.title, 120) &&
+            validText(entry.summary, 300) &&
+            (entry.languageTag === undefined ||
+              (typeof entry.languageTag === "string" &&
+                /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8}){0,3}$/.test(
+                  entry.languageTag
+                ))) &&
+            Array.isArray(entry.paragraphs) &&
+            entry.paragraphs.length > 0 &&
+            entry.paragraphs.length <= 20 &&
+            entry.paragraphs.every((paragraph) => validText(paragraph, 2000)) &&
+            entry.title.length +
+              entry.summary.length +
+              entry.paragraphs.join("").length <=
+              6000
+        ) ||
+        new Set(slide.longDescriptions.map((entry) => entry.objectId)).size !==
+          slide.longDescriptions.length)
     )
       return false;
     slides.add(slide.slideNumber as number);
@@ -1169,6 +1261,8 @@ export function validatePptxRepairPlan(
             [
               "title",
               "description",
+              "decorative",
+              "long-description",
               "table-header",
               "table-caption",
               "reading-order",
@@ -1239,6 +1333,23 @@ export function validatePptxRepairPlan(
         ) ||
         new Set(slide.objectBounds.map((entry) => entry.objectId)).size !==
           slide.objectBounds.length)
+    )
+      return false;
+    if (
+      slide.longDescriptions !== undefined &&
+      (
+        slide.longDescriptions as NonNullable<
+          PptxSlideRepairs["longDescriptions"]
+        >
+      ).some(
+        (entry) =>
+          (slide.descriptions as PptxSlideRepairs["descriptions"])?.some(
+            (description) => description.objectId === entry.objectId
+          ) ||
+          (
+            slide.decorativeObjects as PptxSlideRepairs["decorativeObjects"]
+          )?.some((decorative) => decorative.objectId === entry.objectId)
+      )
     )
       return false;
     return true;
@@ -1406,6 +1517,49 @@ function setTextProperties(
   return changed;
 }
 
+function decorativeFlag(properties: Element): boolean {
+  return descendants(properties, DECORATIVE, "decorative").some((node) =>
+    flag(node.getAttribute("val"))
+  );
+}
+
+/** Microsoft DrawingML's native decorative extension; other extension content survives. */
+function setDecorativeFlag(properties: Element, value: boolean): boolean {
+  const document = properties.ownerDocument!;
+  const lists = children(properties).filter(
+    (node) => node.namespaceURI === A && node.localName === "extLst"
+  );
+  if (lists.length > 1) return false;
+  const existing = descendants(properties, DECORATIVE, "decorative");
+  const extensions = lists.flatMap((list) =>
+    children(list).filter(
+      (node) =>
+        node.namespaceURI === A &&
+        node.localName === "ext" &&
+        node.getAttribute("uri")?.toUpperCase() === DECORATIVE_EXTENSION
+    )
+  );
+  if (existing.length > 1 || extensions.length > 1) return false;
+  if (existing.length) {
+    if (extensions.length !== 1 || existing[0].parentNode !== extensions[0])
+      return false;
+    existing[0].setAttribute("val", value ? "1" : "0");
+    return true;
+  }
+  // An occupied extension with unfamiliar content is not ours to replace.
+  if (extensions.length) return false;
+  if (!value) return true;
+  const list = lists[0] ?? document.createElementNS(A, "a:extLst");
+  if (!lists.length) properties.appendChild(list);
+  const extension = document.createElementNS(A, "a:ext");
+  extension.setAttribute("uri", DECORATIVE_EXTENSION);
+  const decorative = document.createElementNS(DECORATIVE, "adec:decorative");
+  decorative.setAttribute("val", "1");
+  extension.appendChild(decorative);
+  list.appendChild(extension);
+  return true;
+}
+
 function applySlide(
   slide: InternalSlide,
   repair: PptxSlideRepairs,
@@ -1424,6 +1578,61 @@ function applySlide(
     suggestion: string,
     objectId?: string
   ) => findings.push(finding(code, message, suggestion, slideNumber, objectId));
+  for (const decoration of repair.decorativeObjects ?? []) {
+    const object = getObject(decoration.objectId);
+    const functional =
+      object &&
+      ["hlinkClick", "hlinkHover", "hlinkMouseOver"].some(
+        (name) => descendants(object.element, A, name).length > 0
+      );
+    const linkedImage =
+      object &&
+      descendants(object.element, A, "blip").some(
+        (node) => !!node.getAttributeNS(R, "link")
+      );
+    if (
+      !revisioned ||
+      !object ||
+      object.info.kind !== "image" ||
+      object.info.grouped ||
+      object.info.hidden ||
+      slide.info.hidden ||
+      !object.info.rect ||
+      slide.info.hasTiming ||
+      placeholder(object.element) ||
+      linkedImage ||
+      (decoration.decorative && functional)
+    ) {
+      review(
+        "decorative-review",
+        decoration.decorative && functional
+          ? "This image has a link or action, so it was kept available to reading software."
+          : "The image's decorative setting could not be changed safely for this object.",
+        decoration.decorative && functional
+          ? "Give this image a short description of its link destination or action. Do not mark an interactive image as decorative."
+          : "Select this image in PowerPoint's Alt Text pane and confirm whether students need its information.",
+        decoration.objectId
+      );
+    } else if (object.info.decorative !== decoration.decorative) {
+      if (!setDecorativeFlag(object.properties, decoration.decorative)) {
+        review(
+          "decorative-review",
+          "This image has an unfamiliar or conflicting decorative setting, which was preserved.",
+          "Check the image's decorative setting in PowerPoint's Alt Text pane.",
+          decoration.objectId
+        );
+        continue;
+      }
+      changes.push({
+        type: "decorative",
+        slideNumber,
+        objectId: decoration.objectId,
+        message: decoration.decorative
+          ? "Marked this image as decorative so reading software can skip it; kept its stored description."
+          : "Made this image available to reading software instead of marking it as decorative.",
+      });
+    }
+  }
   if (repair.titleObjectId !== undefined) {
     const object = getObject(repair.titleObjectId);
     const existing = slide.objects.filter((item) => item.info.isTitle);
@@ -1434,7 +1643,7 @@ function applySlide(
       object.info.kind !== "text" ||
       object.info.grouped ||
       object.info.hidden ||
-      object.info.decorative ||
+      decorativeFlag(object.properties) ||
       (!revisioned && placeholder(object.element) !== undefined) ||
       (!revisioned && rectangle(object.element) === null) ||
       slide.info.hasTiming ||
@@ -1503,7 +1712,7 @@ function applySlide(
     else if (object.info.description === description.text) {
       /* Actual no-ops do not enter revision history. */
     } else if (
-      object.info.decorative ||
+      decorativeFlag(object.properties) ||
       ((object.info.description.trim() || object.info.title.trim()) &&
         !(revisioned && description.replaceExisting))
     ) {
@@ -1934,6 +2143,21 @@ export function checkPptxAccessibility(
     }
     for (const object of slide.objects) {
       if (
+        object.kind === "image" &&
+        object.decorative &&
+        object.actions?.length
+      )
+        findings.push(
+          finding(
+            "interactive-image-decorative",
+            "This image has a link or action but is marked decorative, which can hide that function from students who use reading software.",
+            "Unmark the image as decorative and describe its link destination or action in its Alt Text.",
+            slide.slideNumber,
+            object.id,
+            "error"
+          )
+        );
+      if (
         object.table &&
         (!object.table.firstRow ||
           object.table.cells[0]?.some((cell) => !cell.trim()))
@@ -1995,7 +2219,7 @@ export async function applyPptxRepairs(
     fail("The repair plan referenced a slide that does not exist.");
   const changes: PptxChange[] = [];
   const findings: PptxFinding[] = [];
-  const changed = new Map<string, Buffer>();
+  let changed = new Map<string, Buffer>();
   for (const repair of plan.slides) {
     const slide = pkg.slides[repair.slideNumber - 1];
     if (
@@ -2016,13 +2240,178 @@ export async function applyPptxRepairs(
       changed.set(slide.info.partName, bytes);
     }
   }
+  const outputParts = new Map(pkg.parts);
+  const expectedDescriptions = new Map<string, string>();
+  let addedSlidePartNames: string[] = [];
+  let addedSlideCount = 0;
+  if (plan.slides.some((slide) => slide.longDescriptions?.length)) {
+    if (!options.revisioned) {
+      for (const slide of plan.slides)
+        for (const item of slide.longDescriptions ?? [])
+          findings.push(
+            finding(
+              "long-description-review",
+              "Adding a separate image explanation requires the reviewable PowerPoint workflow.",
+              "Review the proposed description and its new slides before sharing the presentation.",
+              slide.slideNumber,
+              item.objectId
+            )
+          );
+    } else {
+      const appended = appendPptxDescriptionSlides({
+        parts: new Map(
+          Array.from(pkg.parts, ([name, part]) => [name, part.bytes])
+        ),
+        changedParts: changed,
+        inspection: pkg.inspection,
+        plan,
+      });
+      const integrity = () => {
+        throw new PptxPackageError(
+          "pptx_integrity",
+          "The image explanation failed its package-preservation check."
+        );
+      };
+      for (const [name, bytes] of appended.addedParts) {
+        if (
+          pkg.parts.has(name) ||
+          !/^ppt\/slides\/(?:_rels\/)?accessibility-description-\d+\.xml(?:\.rels)?$/.test(
+            name
+          )
+        )
+          integrity();
+        outputParts.set(name, { bytes, originalHash: hash(bytes) });
+      }
+      const appendedSlides = [...appended.addedParts.keys()].filter((name) =>
+        name.endsWith(".xml")
+      );
+      addedSlidePartNames = appendedSlides;
+      addedSlideCount = appendedSlides.length;
+      if (
+        appended.addedParts.size !== addedSlideCount * 2 ||
+        appendedSlides.some(
+          (name) => !appended.addedParts.has(relationshipPart(name))
+        )
+      )
+        integrity();
+      const generatedNumbers = appended.changes.flatMap(
+        (change) => change.generatedSlideNumbers ?? []
+      );
+      if (
+        generatedNumbers.length !== addedSlideCount ||
+        generatedNumbers.some(
+          (number, index) => number !== pkg.slides.length + index + 1
+        ) ||
+        appended.changes.length !== appended.descriptions.length
+      )
+        integrity();
+      const expectedSourceParts = new Map<string, Document>();
+      for (const description of appended.descriptions) {
+        const sourceSlide = pkg.slides[description.slideNumber - 1];
+        const change = appended.changes.find(
+          (item) =>
+            item.type === "long-description" &&
+            item.slideNumber === description.slideNumber &&
+            item.objectId === description.objectId
+        );
+        const key = `${description.slideNumber}:${description.objectId}`;
+        if (!sourceSlide || !change || expectedDescriptions.has(key))
+          integrity();
+        const name = sourceSlide.info.partName;
+        const document =
+          expectedSourceParts.get(name) ??
+          parseXml(changed.get(name) ?? pkg.parts.get(name)!.bytes);
+        const properties = descendants(document, P, "cNvPr").filter(
+          (element) => element.getAttribute("id") === description.objectId
+        );
+        if (properties.length !== 1) integrity();
+        properties[0].setAttribute("descr", description.text);
+        expectedSourceParts.set(name, document);
+        expectedDescriptions.set(key, description.text);
+      }
+      const presentationName = relationships(pkg, "").find((relation) =>
+        relation.type.endsWith("/officeDocument")
+      )!.target;
+      const metadata = new Map<
+        string,
+        { namespace: string; element: string; parent?: string }
+      >([
+        [
+          presentationName,
+          { namespace: P, element: "sldId", parent: "sldIdLst" },
+        ],
+        [
+          relationshipPart(presentationName),
+          { namespace: REL, element: "Relationship" },
+        ],
+        ["[Content_Types].xml", { namespace: CT, element: "Override" }],
+      ]);
+      for (const [name, bytes] of appended.changedParts) {
+        if (!pkg.parts.has(name)) integrity();
+        const previous = changed.get(name) ?? pkg.parts.get(name)!.bytes;
+        if (bytes.equals(previous)) continue;
+        const document = parseXml(bytes);
+        const expected = expectedSourceParts.get(name);
+        if (expected) {
+          if (
+            pptxElementHash(document.documentElement!) !==
+            pptxElementHash(expected.documentElement!)
+          )
+            integrity();
+          continue;
+        }
+        const rule = metadata.get(name);
+        if (!rule || !addedSlideCount) integrity();
+        const original = parseXml(previous);
+        const oldParent = rule!.parent
+          ? descendants(original, rule!.namespace, rule!.parent)[0]
+          : original.documentElement!;
+        const newParent = rule!.parent
+          ? descendants(document, rule!.namespace, rule!.parent)[0]
+          : document.documentElement!;
+        if (!oldParent || !newParent) integrity();
+        const originalCount = children(oldParent).length;
+        const additions = children(newParent).slice(originalCount);
+        if (
+          additions.length !==
+            (name === "[Content_Types].xml"
+              ? appended.addedParts.size
+              : addedSlideCount) ||
+          additions.some(
+            (node) =>
+              node.namespaceURI !== rule!.namespace ||
+              node.localName !== rule!.element
+          )
+        )
+          integrity();
+        for (const addition of additions) newParent.removeChild(addition);
+        if (
+          pptxElementHash(document.documentElement!) !==
+          pptxElementHash(original.documentElement!)
+        )
+          integrity();
+      }
+      for (const name of changed.keys())
+        if (!appended.changedParts.has(name)) integrity();
+      for (const name of expectedSourceParts.keys())
+        if (!appended.changedParts.has(name)) integrity();
+      changed = appended.changedParts;
+      changes.push(...appended.changes);
+      findings.push(...appended.findings);
+    }
+  }
   const output = changed.size
-    ? await writeParts(pkg.parts, changed)
+    ? await writeParts(outputParts, changed)
     : Buffer.from(buffer);
   const verified = await loadPackage(output, LIMITS.output);
   if (
-    verified.parts.size !== pkg.parts.size ||
-    verified.inspection.slideCount !== pkg.inspection.slideCount
+    verified.parts.size !== outputParts.size ||
+    verified.inspection.slideCount !==
+      pkg.inspection.slideCount + addedSlideCount ||
+    addedSlidePartNames.some(
+      (name, index) =>
+        verified.inspection.slides[pkg.slides.length + index]?.partName !== name
+    )
   )
     throw new PptxPackageError(
       "pptx_integrity",
@@ -2082,6 +2471,9 @@ export async function applyPptxRepairs(
       }
       if (
         !current ||
+        (expectedDescriptions.has(`${slide.slideNumber}:${object.id}`) &&
+          current.description !==
+            expectedDescriptions.get(`${slide.slideNumber}:${object.id}`)) ||
         (changes.some(
           (change) =>
             change.type === "link-text" &&
@@ -2097,9 +2489,22 @@ export async function applyPptxRepairs(
         object.parentId !== current.parentId ||
         object.kind !== current.kind ||
         object.hidden !== current.hidden ||
-        object.decorative !== current.decorative ||
+        (object.decorative !== current.decorative &&
+          (!changes.some(
+            (change) =>
+              change.type === "decorative" &&
+              change.slideNumber === slide.slideNumber &&
+              change.objectId === object.id
+          ) ||
+            plan.slides
+              .find((repair) => repair.slideNumber === slide.slideNumber)
+              ?.decorativeObjects?.find(
+                (decoration) => decoration.objectId === object.id
+              )?.decorative !== current.decorative)) ||
         object.title !== current.title ||
         (object.description !== current.description &&
+          current.description !==
+            expectedDescriptions.get(`${slide.slideNumber}:${object.id}`) &&
           !changes.some(
             (change) =>
               change.type === "description" &&

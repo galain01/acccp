@@ -178,6 +178,54 @@ beforeEach(() => {
 });
 
 describe("PowerPoint review ownership and retained storage", () => {
+  it("loads an added description slide without inventing an original image", async () => {
+    const preview = { slideNumber: 2, after: "data:image/jpeg;base64,Yg==" };
+    const saved = Buffer.from(
+      JSON.stringify({
+        ...record,
+        revisions: {
+          ...record.revisions,
+          plan: { slides: [{ slideNumber: 1 }] },
+          changes: [
+            { ...change, type: "long-description", generatedSlideNumbers: [2] },
+          ],
+        },
+        reviewPreviews: [preview],
+      })
+    );
+    mock.download.mockResolvedValue(saved);
+    selections = [[owned], [{ storageKey: "saved.json" }]];
+    expect(
+      await readOwnedPowerPointPreview(
+        "owner",
+        documentId,
+        jobId,
+        createHash("sha256").update(saved).digest("hex"),
+        2
+      )
+    ).toEqual(preview);
+  });
+
+  it.each([
+    { slideNumber: 2, after: "data:image/jpeg;base64,Yg==" },
+    {
+      slideNumber: 1,
+      before: "https://unrelated.example/image.jpg",
+      after: "data:image/jpeg;base64,Yg==",
+    },
+  ])(
+    "rejects unverified added-slide previews and remote images: %j",
+    async (preview) => {
+      mock.download.mockResolvedValue(
+        Buffer.from(JSON.stringify({ ...record, reviewPreviews: [preview] }))
+      );
+      selections = [[owned], [{ storageKey: "saved.json" }]];
+      await expect(
+        readOwnedPowerPointReview("owner", documentId, jobId)
+      ).rejects.toThrow("saved slide preview could not be read");
+    }
+  );
+
   it("loads slide image pairs individually instead of returning an oversized review response", async () => {
     const preview = {
       slideNumber: 1,

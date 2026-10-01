@@ -131,6 +131,9 @@ beforeEach(() => {
           after: "After",
           reason: "Repair",
           operationIds: [],
+          ...(change.generatedSlideNumbers
+            ? { generatedSlideNumbers: change.generatedSlideNumbers }
+            : {}),
         })),
       },
     };
@@ -640,6 +643,266 @@ describe("PowerPoint repair orchestration", () => {
   });
 });
 
+describe("appended image description slides", () => {
+  const addedInspection = (): PptxInspection => ({
+    ...structuredClone(inspection),
+    slideCount: 2,
+    slides: [
+      structuredClone(inspection.slides[0]),
+      {
+        ...structuredClone(inspection.slides[0]),
+        slideNumber: 2,
+        partName: "ppt/slides/description1.xml",
+        objects: [
+          {
+            ...structuredClone(inspection.slides[0].objects[0]),
+            text: "Sampling image: full description",
+          },
+        ],
+      },
+    ],
+  });
+  const addedPages = () => ({
+    pageCount: 2,
+    pages: [pages().pages[0], { ...pages().pages[0], pageNumber: 2 }],
+  });
+  const changes: PptxChange[] = [
+    {
+      type: "long-description",
+      slideNumber: 1,
+      objectId: "2",
+      message: "Added a description slide.",
+      generatedSlideNumbers: [2],
+    },
+  ];
+  const prepareOutput = () => {
+    mocks.repair.mockResolvedValue({
+      buffer: output,
+      inspection: addedInspection(),
+      findings: [],
+      changes,
+    });
+    mocks.pages
+      .mockReset()
+      .mockResolvedValueOnce(pages())
+      .mockResolvedValue(addedPages());
+  };
+
+  it("renders and audits every actual output slide and exposes an after-only added preview", async () => {
+    prepareOutput();
+    mocks.call
+      .mockReset()
+      .mockResolvedValueOnce(resultCall(plan))
+      .mockResolvedValueOnce(resultCall({ ...audit, reviewedSlides: [1, 2] }));
+    const result = await convertPowerPoint(input, "test.pptx");
+    if ("error" in result) throw new Error(result.error);
+    expect(result.pageCount).toBe(2);
+    expect(result.errors).toEqual([]);
+    expect(result.calls).toHaveLength(2);
+    expect(mocks.call.mock.calls[1][1]).toContainEqual(
+      expect.objectContaining({
+        type: "text",
+        text: expect.stringContaining("ACTUAL REPAIRED slide 2"),
+      })
+    );
+    expect(mocks.call.mock.calls[1][1]).not.toContainEqual(
+      expect.objectContaining({
+        type: "text",
+        text: expect.stringContaining(
+          "ORIGINAL slide 1 before visible changes"
+        ),
+      })
+    );
+    expect(
+      result.reviewPreviews?.map((preview) => preview.slideNumber)
+    ).toEqual([1, 2]);
+    expect(result.reviewPreviews?.[1]).not.toHaveProperty("before");
+    expect(result.reviewPreviews?.[1].after).toMatch(
+      /^data:image\/jpeg;base64,/
+    );
+  });
+
+  it("retains an incomplete-audit warning when the auditor misses the appended slide", async () => {
+    prepareOutput();
+    const result = await convertPowerPoint(input, "test.pptx");
+    if ("error" in result) throw new Error(result.error);
+    expect(
+      result.errors.some((finding) =>
+        finding.message.includes("independent AI review")
+      )
+    ).toBe(true);
+    expect(result.calls).toHaveLength(2);
+  });
+
+  it("trims empty appended-slide correction entries before replaying against the original", async () => {
+    prepareOutput();
+    mocks.repair
+      .mockResolvedValueOnce({
+        buffer: output,
+        inspection: addedInspection(),
+        findings: [],
+        changes,
+      })
+      .mockResolvedValue({
+        buffer: Buffer.from("corrected with added slide"),
+        inspection: addedInspection(),
+        findings: [],
+        changes,
+      });
+    mocks.call
+      .mockReset()
+      .mockResolvedValueOnce(resultCall(plan))
+      .mockResolvedValueOnce(
+        resultCall({
+          ...audit,
+          reviewedSlides: [1, 2],
+          correctivePlan: {
+            slides: [
+              {
+                slideNumber: 1,
+                decorativeObjects: [{ objectId: "2", decorative: false }],
+              },
+              { slideNumber: 2 },
+            ],
+          },
+        })
+      )
+      .mockResolvedValueOnce(resultCall({ ...audit, reviewedSlides: [1, 2] }));
+    const result = await convertPowerPoint(input, "test.pptx");
+    if ("error" in result) throw new Error(result.error);
+    expect(mocks.tracked).toHaveBeenCalledTimes(2);
+    expect(
+      mocks.tracked.mock.calls[1][1].slides.map(
+        (slide: { slideNumber: number }) => slide.slideNumber
+      )
+    ).toEqual([1]);
+    expect(result.calls).toHaveLength(3);
+    expect(result.errors).toEqual([]);
+  });
+
+  it("allows original-slide decorative corrections but rejects edits to appended slides or additional descriptions", () => {
+    const repair = { objectId: "2", decorative: false };
+    expect(
+      completePowerPointCorrection(
+        {
+          slides: [
+            { slideNumber: 1, decorativeObjects: [repair] },
+            { slideNumber: 2 },
+          ],
+        },
+        addedInspection(),
+        1
+      )
+    ).toBe(true);
+    expect(
+      completePowerPointCorrection(
+        {
+          slides: [
+            { slideNumber: 1 },
+            { slideNumber: 2, decorativeObjects: [repair] },
+          ],
+        },
+        addedInspection(),
+        1
+      )
+    ).toBe(false);
+    expect(
+      completePowerPointCorrection(
+        {
+          slides: [
+            {
+              slideNumber: 1,
+              longDescriptions: [
+                {
+                  objectId: "2",
+                  title: "Chart description",
+                  summary: "Chart details on the description slide.",
+                  paragraphs: ["The chart contains ten observations."],
+                },
+              ],
+            },
+            { slideNumber: 2 },
+          ],
+        },
+        addedInspection(),
+        1
+      )
+    ).toBe(false);
+  });
+
+  it("audits all slides of a replayed selection without regenerating declined changes", async () => {
+    mocks.inspect
+      .mockResolvedValueOnce(inspection)
+      .mockResolvedValueOnce(addedInspection());
+    mocks.pages
+      .mockReset()
+      .mockResolvedValueOnce(pages())
+      .mockResolvedValueOnce(addedPages());
+    mocks.call
+      .mockReset()
+      .mockResolvedValueOnce(resultCall({ ...audit, reviewedSlides: [1, 2] }));
+    const result = await recheckPowerPointRevision(input, output, changes);
+    if ("error" in result) throw new Error(result.error);
+    expect(result.errors).toEqual([]);
+    expect(result.pageCount).toBe(2);
+    expect(result.calls).toHaveLength(1);
+    expect(mocks.repair).not.toHaveBeenCalled();
+    expect(result.reviewPreviews?.[1]).not.toHaveProperty("before");
+  });
+
+  it.each([
+    "unrecorded",
+    "duplicate",
+    "outside-output",
+    "source-renamed",
+    "unknown-source-object",
+  ])(
+    "rejects %s appended-slide evidence before model work",
+    async (scenario) => {
+      const candidate = addedInspection();
+      const declared = structuredClone(changes);
+      if (scenario === "unrecorded") declared.length = 0;
+      if (scenario === "duplicate") declared[0].generatedSlideNumbers = [2, 2];
+      if (scenario === "outside-output")
+        declared[0].generatedSlideNumbers = [3];
+      if (scenario === "source-renamed")
+        candidate.slides[0].partName = "ppt/slides/swapped.xml";
+      if (scenario === "unknown-source-object") declared[0].objectId = "999";
+      mocks.inspect
+        .mockResolvedValueOnce(inspection)
+        .mockResolvedValueOnce(candidate);
+      const result = await recheckPowerPointRevision(input, output, declared);
+      expect(result).toMatchObject({
+        diagnostic: { code: "pptx_invalid_plan" },
+        calls: [],
+      });
+      expect(mocks.render).not.toHaveBeenCalled();
+      expect(mocks.call).not.toHaveBeenCalled();
+    }
+  );
+
+  it("requires trusted generated-slide identities for previews without an original", async () => {
+    await expect(
+      buildPowerPointReviewPreviews(pages(), addedPages(), [2])
+    ).rejects.toHaveProperty("code", "pptx_invalid_plan");
+    const preview = await buildPowerPointReviewPreviews(
+      pages(),
+      addedPages(),
+      [2],
+      [2]
+    );
+    expect(preview[0]).not.toHaveProperty("before");
+    await expect(
+      buildPowerPointReviewPreviews(
+        { pageCount: 1, pages: [] },
+        pages(),
+        [1],
+        [1]
+      )
+    ).rejects.toHaveProperty("code", "pptx_invalid_plan");
+  });
+});
+
 describe("PowerPoint evidence boundaries", () => {
   it("creates distinct bounded before/after previews for selected slides", async () => {
     const before = createCanvas(1600, 900);
@@ -652,7 +915,7 @@ describe("PowerPoint evidence boundaries", () => {
     );
     expect(previews).toHaveLength(1);
     expect(previews[0].before).not.toEqual(previews[0].after);
-    expect(previews[0].before.length + previews[0].after.length).toBeLessThan(
+    expect(previews[0].before!.length + previews[0].after.length).toBeLessThan(
       8_000_000
     );
   });

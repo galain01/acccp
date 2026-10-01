@@ -141,6 +141,179 @@ afterEach(async () => {
 });
 
 describe("PowerPoint revision choices", () => {
+  it("explains a decorative image's reading setting and shows one original context image", async () => {
+    const data = fixture();
+    data.changes = [
+      {
+        id: "decorative",
+        type: "decorative",
+        slideNumber: 2,
+        objectId: "image-1",
+        label: "Skip a repeated border image",
+        before: "Not marked decorative; no description provided.",
+        after: "Marked decorative; reading software skips this image.",
+        reason:
+          "The border repeats a visual motif and adds no teaching information.",
+        assumption: "Can students skip this border without losing information?",
+        operationIds: ["decorative-1"],
+      },
+    ];
+    data.includedChangeIds = ["decorative"];
+    data.previews = [
+      {
+        slideNumber: 2,
+        before: "data:image/png;base64,original",
+        after: "data:image/png;base64,repaired",
+      },
+    ];
+    await mount(data);
+    const article = host.querySelector("article")!;
+    expect(article.textContent).toContain("Original image reading setting");
+    expect(article.textContent).toContain("Suggested image reading setting");
+    expect(article.textContent).toContain("stays visible");
+    expect(article.textContent).toContain(
+      "software that reads slides aloud skips it"
+    );
+    expect(article.textContent).toContain(
+      "Not marked decorative; no description provided."
+    );
+    expect(article.textContent).toContain("View slide for context");
+    expect(article.querySelectorAll("img")).toHaveLength(1);
+    expect(article.querySelector("img")?.getAttribute("src")).toBe(
+      "data:image/png;base64,original"
+    );
+    await click(button("Restore original"));
+    expect(article.textContent).toContain("Original will be used");
+    await click(button("Check and download PowerPoint"));
+    expect(lastSelection().includedChangeIds).toEqual([]);
+  });
+
+  it("edits only the wording in a grouped image-reading change while preserving the measured setting", async () => {
+    const data = fixture();
+    data.changes = [
+      {
+        id: "image-role",
+        type: "decorative",
+        slideNumber: 2,
+        objectId: "image-1",
+        label: "Read the image description",
+        before: "Marked decorative; no description provided.",
+        after:
+          "Not marked decorative. Description: A diagram of the water cycle.",
+        reason: "The diagram explains course content and needs a description.",
+        operationIds: ["unmark-1", "describe-1"],
+        editableDescription: true,
+        descriptionBefore: "",
+        descriptionAfter: "A diagram of the water cycle.",
+      },
+    ];
+    data.includedChangeIds = ["image-role"];
+    await mount(data);
+    await click(button("Edit wording"));
+    const textarea = host.querySelector("textarea")!;
+    expect(textarea.value).toBe("A diagram of the water cycle.");
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(
+        HTMLTextAreaElement.prototype,
+        "value"
+      )!.set!.call(textarea, "Water evaporates, condenses, and falls as rain.");
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await click(button("Use this wording"));
+    expect(host.querySelector("article")?.textContent).toContain(
+      "Not marked decorative. Description: A diagram of the water cycle."
+    );
+    expect(host.querySelector("article")?.textContent).toContain(
+      "Your edited description"
+    );
+    expect(host.querySelector("article")?.textContent).toContain(
+      "The image’s reading setting stays as shown"
+    );
+    await click(button("Check and download PowerPoint"));
+    expect(lastSelection().descriptionEdits).toEqual({
+      "image-role": "Water evaporates, condenses, and falls as rain.",
+    });
+    await click(button("Restore original"));
+    await click(button("Check and download PowerPoint"));
+    expect(lastSelection().includedChangeIds).toEqual([]);
+    expect(lastSelection().descriptionEdits).toEqual({});
+  });
+
+  it("shows added description slides separately from the original without inventing before images", async () => {
+    const data = fixture();
+    data.changes = [
+      {
+        id: "detail",
+        type: "long-description",
+        slideNumber: 5,
+        objectId: "chart-1",
+        label: "Add a detailed image description",
+        before: "Chart with no description.",
+        after:
+          "Short description: Course participation; detailed explanation follows.\nAdded explanation: Participation rises from 20 to 35 students.",
+        reason: "The chart's values need a longer explanation.",
+        operationIds: ["long-description-1"],
+        generatedSlideNumbers: [6, 7],
+      },
+    ];
+    data.includedChangeIds = ["detail"];
+    data.previewSlideNumbers = [5, 6, 7];
+    vi.mocked(getPowerPointReviewPreview).mockImplementation(
+      async (_document, _job, _token, slideNumber) =>
+        slideNumber === 5
+          ? {
+              slideNumber,
+              before: "data:image/png;base64,source",
+              after: "data:image/png;base64,source-proposal",
+            }
+          : { slideNumber, after: `data:image/png;base64,added-${slideNumber}` }
+    );
+    await mount(data);
+    const parent = host.querySelector("article details") as HTMLDetailsElement;
+    await act(async () => {
+      parent.open = true;
+      parent.dispatchEvent(new Event("toggle"));
+    });
+    expect(host.querySelectorAll("article img")).toHaveLength(1);
+    expect(getPowerPointReviewPreview).toHaveBeenCalledExactlyOnceWith(
+      "doc-1",
+      "job-1",
+      "a".repeat(64),
+      5
+    );
+    const added = parent.querySelectorAll("details");
+    expect(added).toHaveLength(2);
+    for (const disclosure of added) {
+      await act(async () => {
+        disclosure.open = true;
+        disclosure.dispatchEvent(new Event("toggle"));
+      });
+    }
+    expect(
+      Array.from(host.querySelectorAll("article img")).map((image) =>
+        image.getAttribute("src")
+      )
+    ).toEqual([
+      "data:image/png;base64,source",
+      "data:image/png;base64,added-6",
+      "data:image/png;base64,added-7",
+    ]);
+    expect(host.textContent).toContain("Added description slide 6");
+    expect(host.textContent).toContain("Added description slide 7");
+    expect(host.textContent).toContain(
+      "edit the explanation on those slides in PowerPoint"
+    );
+    expect(
+      Array.from(host.querySelectorAll("button")).some(
+        (item) => item.textContent === "Edit wording"
+      )
+    ).toBe(false);
+    await click(button("Restore original"));
+    expect(parent.textContent).toContain("Excluded from download");
+    await click(button("Check and download PowerPoint"));
+    expect(lastSelection().includedChangeIds).toEqual([]);
+  });
+
   it("loads only the expanded slide preview and reuses it when returning to that slide", async () => {
     const data = fixture();
     data.previewSlideNumbers = [3, 5];

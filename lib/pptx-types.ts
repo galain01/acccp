@@ -19,6 +19,8 @@ export interface PptxChange {
   type:
     | "title"
     | "description"
+    | "decorative"
+    | "long-description"
     | "table-header"
     | "table-caption"
     | "reading-order"
@@ -33,6 +35,8 @@ export interface PptxChange {
   visualRegion?: PptxRect;
   /** Engine-assigned operation identifier, used to replay reviewed revisions. */
   operationId?: string;
+  /** Native description slides appended for this source object. */
+  generatedSlideNumbers?: number[];
 }
 
 export interface PptxObject {
@@ -58,6 +62,14 @@ export interface PptxObject {
   grouped: boolean;
   parentId: string | null;
   language: string | null;
+  /** Native shape interactions. Targets are read from relationships, never fetched. */
+  actions?: {
+    trigger: "click" | "hover";
+    relationshipId?: string;
+    target?: string;
+    targetKind?: "external" | "internal";
+    action?: string;
+  }[];
   /** Actual text/language runs, including mixed-language objects. */
   textRuns?: {
     text: string;
@@ -104,6 +116,16 @@ export interface PptxSlideRepairs {
     objectId: string;
     text: string;
     replaceExisting?: boolean;
+  }[];
+  /** Explicitly change whether a visible native image is skipped by reading software. */
+  decorativeObjects?: { objectId: string; decorative: boolean }[];
+  /** Append editable description slides and point the object's short alternative to them. */
+  longDescriptions?: {
+    objectId: string;
+    title: string;
+    summary: string;
+    paragraphs: string[];
+    languageTag?: string;
   }[];
   /** Exact first-row text is required as a source-content guard. */
   tableHeaders?: { objectId: string; firstRow: true; headerTexts: string[] }[];
@@ -161,6 +183,10 @@ export interface PptxRevisionChange {
   /** All operations in one change are accepted or restored together. */
   operationIds: string[];
   editableDescription?: boolean;
+  /** Raw wording for a combined image-role/description revision's text editor. */
+  descriptionBefore?: string;
+  descriptionAfter?: string;
+  generatedSlideNumbers?: number[];
 }
 
 export interface PptxRevisionBundle {

@@ -68,7 +68,7 @@ export interface PowerPointConversionResult {
 
 export interface PowerPointReviewPreview {
   slideNumber: number;
-  before: string;
+  before?: string;
   after: string;
 }
 
@@ -409,23 +409,28 @@ const incompleteAudit = (): PptxFinding => ({
 /** Only these operations can correct the first candidate; structural edits are not repeated. */
 export function completePowerPointCorrection(
   value: unknown,
-  inspection: PptxInspection
+  inspection: PptxInspection,
+  originalSlideCount = inspection.slideCount
 ): value is PptxRepairPlan {
   return (
     completePowerPointPlan(value, inspection) &&
-    value.slides.every((slide) =>
-      Object.keys(slide).every((key) =>
-        [
-          "slideNumber",
-          "descriptions",
-          "textLanguages",
-          "readingOrder",
-          "linkTexts",
-          "textStyles",
-          "objectBounds",
-          "revisionNotes",
-        ].includes(key)
-      )
+    value.slides.every(
+      (slide) =>
+        (slide.slideNumber <= originalSlideCount ||
+          !hasOperations({ slides: [slide] })) &&
+        Object.keys(slide).every((key) =>
+          [
+            "slideNumber",
+            "descriptions",
+            "decorativeObjects",
+            "textLanguages",
+            "readingOrder",
+            "linkTexts",
+            "textStyles",
+            "objectBounds",
+            "revisionNotes",
+          ].includes(key)
+        )
     )
   );
 }
@@ -470,9 +475,20 @@ async function auditOutput(options: {
   ];
   try {
     // Pixel changes identify comparison evidence; they do not reject intentional repairs.
+    // Appended description slides have no original counterpart. Compare the
+    // preserved source prefix, then send every actual output slide below.
     const visiblyChanged = await changedPowerPointSlides(
       sourceEvidence.images,
-      outputEvidence.images
+      outputEvidence.images.pageCount >= sourceEvidence.images.pageCount
+        ? {
+            ...outputEvidence.images,
+            pageCount: sourceEvidence.images.pageCount,
+            pages: outputEvidence.images.pages.slice(
+              0,
+              sourceEvidence.images.pageCount
+            ),
+          }
+        : outputEvidence.images
     );
     const auditConfig = getLiteLLMConfig("validate");
     clock.needTime(10_000);
@@ -529,22 +545,34 @@ async function auditOutput(options: {
       ) ||
       (call.finishReason && call.finishReason !== "stop") ||
       !Array.isArray(reviewed) ||
-      reviewed.length !== source.slideCount ||
-      new Set(reviewed).size !== source.slideCount ||
+      reviewed.length !== repaired.inspection.slideCount ||
+      new Set(reviewed).size !== repaired.inspection.slideCount ||
       reviewed.some(
         (number) =>
-          !Number.isInteger(number) || number < 1 || number > source.slideCount
+          !Number.isInteger(number) ||
+          number < 1 ||
+          number > repaired.inspection.slideCount
       ) ||
       !findings ||
       !concerns ||
       (correction !== null &&
         (!options.allowCorrection ||
-          !completePowerPointCorrection(correction, repaired.inspection)))
+          !completePowerPointCorrection(
+            correction,
+            repaired.inspection,
+            source.slideCount
+          )))
     )
       throw new Error("Incomplete audit");
     return {
       findings: uniqueFindings([...review.fixed, ...concerns, ...findings]),
-      correction: correction as PptxRepairPlan | null,
+      correction: correction
+        ? {
+            slides: (correction as PptxRepairPlan).slides.filter(
+              (slide) => slide.slideNumber <= source.slideCount
+            ),
+          }
+        : null,
     };
   } catch {
     return {
@@ -558,7 +586,8 @@ async function auditOutput(options: {
 export async function buildPowerPointReviewPreviews(
   before: RenderedPdf,
   after: RenderedPdf,
-  slideNumbers: readonly number[]
+  slideNumbers: readonly number[],
+  generatedSlideNumbers: readonly number[] = []
 ): Promise<PowerPointReviewPreview[]> {
   const previews: PowerPointReviewPreview[] = [];
   let bytes = 0;
@@ -579,13 +608,19 @@ export async function buildPowerPointReviewPreviews(
   for (const slideNumber of [...new Set(slideNumbers)].slice(0, 60)) {
     const a = before.pages.find((page) => page.pageNumber === slideNumber);
     const b = after.pages.find((page) => page.pageNumber === slideNumber);
-    if (!a || !b) continue;
+    if (!b) continue;
+    if (
+      !a &&
+      (slideNumber <= before.pageCount ||
+        !generatedSlideNumbers.includes(slideNumber))
+    )
+      throw new PowerPointPlanError("pptx_invalid_plan");
     const pair = {
       slideNumber,
-      before: await resize(a.png),
+      ...(a ? { before: await resize(a.png) } : {}),
       after: await resize(b.png),
     };
-    bytes += pair.before.length + pair.after.length;
+    bytes += (pair.before?.length ?? 0) + pair.after.length;
     if (bytes > 8_000_000) break;
     previews.push(pair);
   }
@@ -695,7 +730,7 @@ export async function convertPowerPoint(
     // Always render the actual saved candidate, even for metadata-only changes.
     let outputEvidence = await clock.render(
       tracked.result.buffer,
-      source.slideCount
+      tracked.result.inspection.slideCount
     );
     stage = "audit";
     let audited = await auditOutput({
@@ -719,7 +754,7 @@ export async function convertPowerPoint(
         if (!corrected.result.buffer.equals(tracked.result.buffer)) {
           const correctedEvidence = await clock.render(
             corrected.result.buffer,
-            source.slideCount
+            corrected.result.inspection.slideCount
           );
           // A second independent audit is the final authority; no unverified loop.
           const finalAudit = await auditOutput({
@@ -758,7 +793,13 @@ export async function convertPowerPoint(
     const previews = await buildPowerPointReviewPreviews(
       sourceEvidence.images,
       outputEvidence.images,
-      tracked.bundle.changes.map((change) => change.slideNumber)
+      tracked.bundle.changes.flatMap((change) => [
+        change.slideNumber,
+        ...(change.generatedSlideNumbers ?? []),
+      ]),
+      tracked.bundle.changes.flatMap(
+        (change) => change.generatedSlideNumbers ?? []
+      )
     );
     return finishResult(
       tracked.result,
@@ -784,10 +825,39 @@ export async function recheckPowerPointRevision(
   try {
     const source = await inspectPptx(sourceBuffer);
     const inspection = await inspectPptx(candidate);
-    if (inspection.slideCount !== source.slideCount)
+    const appendedSlides = changes.flatMap((change) =>
+      change.type === "long-description"
+        ? (change.generatedSlideNumbers ?? [])
+        : []
+    );
+    if (
+      inspection.slideCount < source.slideCount ||
+      inspection.slideCount > 60 ||
+      appendedSlides.length !== inspection.slideCount - source.slideCount ||
+      new Set(appendedSlides).size !== appendedSlides.length ||
+      appendedSlides.some(
+        (number) =>
+          !Number.isInteger(number) ||
+          number <= source.slideCount ||
+          number > inspection.slideCount
+      ) ||
+      source.slides.some(
+        (slide, index) => inspection.slides[index]?.partName !== slide.partName
+      ) ||
+      changes.some(
+        (change) =>
+          change.type === "long-description" &&
+          (!source.slides.some(
+            (slide) =>
+              slide.slideNumber === change.slideNumber &&
+              slide.objects.some((object) => object.id === change.objectId)
+          ) ||
+            !change.generatedSlideNumbers?.length)
+      )
+    )
       throw new PowerPointPlanError("pptx_invalid_plan");
     const sourceEvidence = await clock.render(sourceBuffer, source.slideCount);
-    const outputEvidence = await clock.render(candidate, source.slideCount);
+    const outputEvidence = await clock.render(candidate, inspection.slideCount);
     const repaired: PptxRepairResult = {
       buffer: candidate,
       inspection,
@@ -811,7 +881,11 @@ export async function recheckPowerPointRevision(
     const previews = await buildPowerPointReviewPreviews(
       sourceEvidence.images,
       outputEvidence.images,
-      changes.map((change) => change.slideNumber)
+      changes.flatMap((change) => [
+        change.slideNumber,
+        ...(change.generatedSlideNumbers ?? []),
+      ]),
+      appendedSlides
     );
     return finishResult(repaired, audited.findings, calls, previews);
   } catch (error) {

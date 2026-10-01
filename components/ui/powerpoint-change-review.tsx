@@ -44,6 +44,18 @@ const changeCopy: Record<
     help: "A description is text that reading software uses to explain this item. Changing the description does not change how the slide looks.",
     contextOnly: true,
   },
+  decorative: {
+    original: "Original image reading setting",
+    suggested: "Suggested image reading setting",
+    help: "An image marked decorative stays visible, but software that reads slides aloud skips it. Use that setting only when skipping the image will not lose information students need.",
+    contextOnly: true,
+  },
+  "long-description": {
+    original: "Original image description",
+    suggested: "Suggested detailed description",
+    help: "A complex image may need more explanation than a short description can provide. This change adds editable slides with a detailed explanation and updates the image’s short description to point students to them. Check the explanation against the image and your teaching intent.",
+    contextOnly: true,
+  },
   "table-header": {
     original: "Original table header setting",
     suggested: "Suggested table header setting",
@@ -165,6 +177,8 @@ function ReviewChoices({
   const inputId = useId();
   const selected = review.changes.find((change) => change.id === selectedId);
   const selectedCopy = selected ? changeCopy[selected.type] : undefined;
+  const generatedSlideNumbers = selected?.generatedSlideNumbers ?? [];
+  const isLongDescription = selected?.type === "long-description";
   const suppliedPreview = review.previews?.find(
     (item) => item.slideNumber === selected?.slideNumber
   );
@@ -176,7 +190,12 @@ function ReviewChoices({
     (previewState?.status === "ready" ? previewState.preview : undefined);
   const canPreview = Boolean(
     suppliedPreview ||
-    (selected && review.previewSlideNumbers?.includes(selected.slideNumber))
+    (selected && review.previewSlideNumbers?.includes(selected.slideNumber)) ||
+    generatedSlideNumbers.some(
+      (slideNumber) =>
+        review.previewSlideNumbers?.includes(slideNumber) ||
+        review.previews?.some((item) => item.slideNumber === slideNumber)
+    )
   );
   const assumptions = ordered.filter((change) => change.assumption);
   const routine = ordered.filter((change) => !change.assumption);
@@ -407,7 +426,10 @@ function ReviewChoices({
                   {selectedCopy?.original}
                 </h4>
                 <p className="mt-2 text-sm break-words whitespace-pre-wrap">
-                  {selected.before || "No value was set."}
+                  {selected.before ||
+                    (selected.type === "description"
+                      ? "No description was provided."
+                      : "No value was set.")}
                 </p>
               </section>
               <section
@@ -421,8 +443,25 @@ function ReviewChoices({
                     : selectedCopy?.suggested}
                 </h4>
                 <p className="mt-2 text-sm break-words whitespace-pre-wrap">
-                  {descriptionEdits[selected.id] ?? selected.after}
+                  {selected.type === "description"
+                    ? (descriptionEdits[selected.id] ?? selected.after)
+                    : selected.after}
                 </p>
+                {selected.type === "decorative" &&
+                  descriptionEdits[selected.id] !== undefined && (
+                    <div className="mt-3 border-t border-primary/20 pt-3">
+                      <h5 className="text-sm font-medium">
+                        Your edited description
+                      </h5>
+                      <p className="mt-1 text-sm break-words whitespace-pre-wrap">
+                        {descriptionEdits[selected.id]}
+                      </p>
+                      <p className="mt-2 text-xs text-muted-foreground">
+                        This wording replaces the suggested description above.
+                        The image’s reading setting stays as shown.
+                      </p>
+                    </div>
+                  )}
                 {!included.has(selected.id) && (
                   <p className="mt-2 text-sm font-medium">
                     This suggestion is excluded. The original will be used in
@@ -458,12 +497,18 @@ function ReviewChoices({
               >
                 <summary className="min-h-11 cursor-pointer py-3 text-sm font-medium">
                   {selectedCopy?.contextOnly
-                    ? "View slide for context"
+                    ? isLongDescription
+                      ? "View original and added description slides"
+                      : "View slide for context"
                     : "Compare slide appearance"}
                 </summary>
                 <p className="mb-2 text-xs text-muted-foreground">
                   {selectedCopy?.contextOnly
-                    ? "Use this original slide to check whether the description above explains the important information. The description changes what reading software can read aloud; it does not change the slide’s appearance."
+                    ? isLongDescription
+                      ? "The original slide is shown for context. Each added slide below shows the suggested explanation as it would appear in PowerPoint. These reference previews stay the same when you keep or restore the change. Slide numbers refer to all suggested changes and may shift in your download if you exclude other added slides."
+                      : selected.type === "decorative"
+                        ? "Use this original slide to decide whether the image carries information students need. Changing whether reading software skips the image, or updating its description, leaves the image visible and does not change how the slide looks."
+                        : "Use this original slide to check whether the description above explains the important information. The description changes what reading software can read aloud; it does not change the slide’s appearance."
                     : "These reference images show the original slide and the slide with all suggested changes. They stay the same when you keep or restore a change or edit a description, so they do not show your current selections."}
                 </p>
                 {!preview &&
@@ -499,26 +544,106 @@ function ReviewChoices({
                     {(selectedCopy?.contextOnly
                       ? (["before"] as const)
                       : (["before", "after"] as const)
-                    ).map((side) => (
-                      <figure key={side}>
-                        <Image
-                          src={preview[side]}
-                          width={960}
-                          height={540}
-                          unoptimized
-                          alt={`Slide ${selected.slideNumber}: ${side === "before" ? "original appearance" : "appearance with all suggested changes"}`}
-                          className="h-auto w-full rounded border"
-                        />
-                        <figcaption className="mt-1 text-xs">
-                          {side === "before"
-                            ? "Original slide"
-                            : "With all suggested changes"}
-                        </figcaption>
-                      </figure>
-                    ))}
+                    )
+                      .filter((side) => Boolean(preview[side]))
+                      .map((side) => (
+                        <figure key={side}>
+                          <Image
+                            src={preview[side]!}
+                            width={960}
+                            height={540}
+                            unoptimized
+                            alt={`Slide ${selected.slideNumber}: ${side === "before" ? "original appearance" : "appearance with all suggested changes"}`}
+                            className="h-auto w-full rounded border"
+                          />
+                          <figcaption className="mt-1 text-xs">
+                            {side === "before"
+                              ? "Original slide"
+                              : "With all suggested changes"}
+                          </figcaption>
+                        </figure>
+                      ))}
                   </div>
                 )}
+                {isLongDescription &&
+                  generatedSlideNumbers.map((slideNumber) => {
+                    const addedState = previewCache[slideNumber];
+                    const addedPreview =
+                      review.previews?.find(
+                        (item) => item.slideNumber === slideNumber
+                      ) ??
+                      (addedState?.status === "ready"
+                        ? addedState.preview
+                        : undefined);
+                    return (
+                      <details
+                        key={slideNumber}
+                        className="mt-3 rounded-lg border p-3"
+                        onToggle={(event) => {
+                          if (
+                            event.currentTarget.open &&
+                            !addedPreview &&
+                            !addedState
+                          )
+                            void loadPreview(slideNumber);
+                        }}
+                      >
+                        <summary className="min-h-11 cursor-pointer py-3 text-sm font-medium">
+                          Added description slide {slideNumber}
+                        </summary>
+                        {addedPreview ? (
+                          <figure>
+                            <Image
+                              src={addedPreview.after}
+                              width={960}
+                              height={540}
+                              unoptimized
+                              alt={`Added description slide ${slideNumber} with the suggested explanation`}
+                              className="h-auto w-full rounded border"
+                            />
+                            <figcaption className="mt-1 text-xs">
+                              Added description slide {slideNumber} ·{" "}
+                              {included.has(selected.id)
+                                ? "Included in download"
+                                : "Excluded from download"}
+                            </figcaption>
+                          </figure>
+                        ) : addedState?.status === "error" ? (
+                          <div className="space-y-2 text-sm">
+                            <p role="alert">
+                              This added slide preview could not be loaded. The
+                              explanation is still available in the text
+                              comparison above.
+                            </p>
+                            <Button
+                              variant="outline"
+                              onClick={() => void loadPreview(slideNumber)}
+                            >
+                              Try slide {slideNumber} preview again
+                            </Button>
+                          </div>
+                        ) : addedState?.status === "unavailable" ? (
+                          <p role="status" className="text-sm">
+                            This added slide preview is unavailable. The
+                            explanation is still available in the text
+                            comparison above.
+                          </p>
+                        ) : (
+                          <p role="status" className="text-sm">
+                            Loading added description slide {slideNumber}…
+                          </p>
+                        )}
+                      </details>
+                    );
+                  })}
               </details>
+            )}
+            {isLongDescription && (
+              <p className="text-sm text-muted-foreground">
+                The image’s description and its added explanation slides are
+                kept or restored together. After downloading, you can edit the
+                explanation on those slides in PowerPoint.
+              </p>
             )}
 
             {draft !== null ? (
@@ -572,12 +697,16 @@ function ReviewChoices({
                 >
                   Restore original
                 </Button>
-                {selected.editableDescription && (
+                {selected.editableDescription && !isLongDescription && (
                   <Button
                     variant="outline"
                     disabled={exporting}
                     onClick={() =>
-                      setDraft(descriptionEdits[selected.id] ?? selected.after)
+                      setDraft(
+                        descriptionEdits[selected.id] ??
+                          selected.descriptionAfter ??
+                          selected.after
+                      )
                     }
                   >
                     Edit wording

@@ -263,7 +263,7 @@ describe("DocumentWorkspace conversion selection", () => {
     await click(button("lecture.pptx"));
     await click(button("Review changes", document.body));
     await click(button("Restore original", document.body));
-    await click(button("Check and download chosen version", document.body));
+    await click(button("Check and download PowerPoint", document.body));
     expect(row("lecture.pptx").textContent).toContain("Needs a fix");
     expect(document.body.textContent).toContain(
       "Restoring this change leaves the slide without an identified title."
