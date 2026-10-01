@@ -163,9 +163,7 @@ describe("PowerPoint revision choices", () => {
       3
     );
     expect(host.querySelectorAll("article img")).toHaveLength(2);
-    expect(host.textContent).toContain(
-      "They do not update as you change your choices"
-    );
+    expect(host.textContent).toContain("With all suggested changes");
     await act(async () => {
       (disclosure as HTMLDetailsElement).open = false;
       disclosure.dispatchEvent(new Event("toggle"));
@@ -173,6 +171,81 @@ describe("PowerPoint revision choices", () => {
       disclosure.dispatchEvent(new Event("toggle"));
     });
     expect(getPowerPointReviewPreview).toHaveBeenCalledOnce();
+  });
+
+  it("shows one original slide for descriptions and keeps comparisons for changes that may affect rendering", async () => {
+    const data = fixture();
+    data.previewSlideNumbers = [3, 5];
+    vi.mocked(getPowerPointReviewPreview).mockImplementation(
+      async (_documentId, _jobId, _revisionToken, slideNumber) => ({
+        slideNumber,
+        before: `data:image/png;base64,original-${slideNumber}`,
+        after: `data:image/png;base64,updated-${slideNumber}`,
+      })
+    );
+    await mount(data);
+    const selectChange = async (label: string) => {
+      const navigationButton = Array.from(
+        host.querySelectorAll("nav button")
+      ).find((item) => item.textContent?.includes(label))!;
+      await click(navigationButton as HTMLElement);
+      await act(async () => {
+        const disclosure = host.querySelector(
+          "article details"
+        ) as HTMLDetailsElement;
+        disclosure.open = true;
+        disclosure.dispatchEvent(new Event("toggle"));
+      });
+    };
+
+    await selectChange("Grading diagram description");
+    expect(host.querySelector("article")?.textContent).toContain(
+      "Original description"
+    );
+    expect(host.querySelector("article")?.textContent).toContain(
+      "Suggested description"
+    );
+    expect(host.textContent).not.toContain("Your chosen version");
+    expect(host.querySelector("article summary")?.textContent).toContain(
+      "View slide for context"
+    );
+    expect(host.querySelectorAll("article img")).toHaveLength(1);
+    expect(host.querySelector("article img")?.getAttribute("src")).toBe(
+      "data:image/png;base64,original-5"
+    );
+    await click(button("Restore original"));
+    expect(host.querySelector("article")?.textContent).toContain(
+      "Original will be used"
+    );
+    expect(host.querySelector("article")?.textContent).toContain(
+      "This suggestion is excluded"
+    );
+    expect(host.querySelector("article")?.textContent).toContain(
+      data.changes[2].after
+    );
+    expect(host.querySelectorAll("article img")).toHaveLength(1);
+
+    await selectChange("French pronunciation");
+    expect(host.querySelectorAll("article img")).toHaveLength(2);
+    expect(host.querySelector("article img")?.getAttribute("src")).toBe(
+      "data:image/png;base64,original-3"
+    );
+    expect(host.querySelector("article summary")?.textContent).toContain(
+      "Compare slide appearance"
+    );
+    expect(host.querySelector("article")?.textContent).toContain(
+      "Suggested pronunciation setting"
+    );
+    expect(host.querySelector("article")?.textContent).toContain(
+      "do not show your current selections"
+    );
+
+    await selectChange("Title before objectives");
+    expect(host.querySelectorAll("article img")).toHaveLength(2);
+    expect(host.querySelectorAll("article img")[1].getAttribute("src")).toBe(
+      "data:image/png;base64,updated-3"
+    );
+    expect(getPowerPointReviewPreview).toHaveBeenCalledTimes(2);
   });
 
   it("keeps review controls available after a failed preview and allows a safe retry", async () => {
@@ -199,7 +272,7 @@ describe("PowerPoint revision choices", () => {
     await click(button("Try preview again"));
     expect(getPowerPointReviewPreview).toHaveBeenCalledTimes(2);
     expect(host.textContent).toContain("This slide preview is unavailable");
-    expect(button("Check and download chosen version").disabled).toBe(false);
+    expect(button("Check and download PowerPoint").disabled).toBe(false);
   });
   it("starts with assumptions, distinguishes included from reviewed and keeps routine repairs collapsed", async () => {
     await mount();
@@ -220,12 +293,12 @@ describe("PowerPoint revision choices", () => {
     await click(button("Restore original"));
     expect(host.textContent).toContain("2 of 3 changes included · 1 reviewed");
     expect(host.querySelector("article")?.textContent).toContain(
-      "Original restored"
+      "Original will be used"
     );
     expect(host.querySelector("article")?.textContent).toContain(
       "may bring back a problem"
     );
-    await click(button("Check and download chosen version"));
+    await click(button("Check and download PowerPoint"));
     expect(lastSelection()).toMatchObject({
       documentId: "doc-1",
       jobId: "job-1",
@@ -242,7 +315,7 @@ describe("PowerPoint revision choices", () => {
     await mount();
     await click(button("Restore original"));
     await click(button("Keep change"));
-    await click(button("Check and download chosen version"));
+    await click(button("Check and download PowerPoint"));
     expect(lastSelection().includedChangeIds).toEqual([
       "language",
       "order",
@@ -259,8 +332,11 @@ describe("PowerPoint revision choices", () => {
       item.textContent?.includes("Grading diagram description")
     )!;
     await click(descriptionButton as HTMLElement);
+    expect(host.querySelector("article")?.textContent).toContain(
+      "Suggested description"
+    );
     await click(button("Edit wording"));
-    expect(button("Check and download chosen version").disabled).toBe(true);
+    expect(button("Check and download PowerPoint").disabled).toBe(true);
     const textarea = host.querySelector("textarea")!;
     await act(async () => {
       Object.getOwnPropertyDescriptor(
@@ -270,12 +346,24 @@ describe("PowerPoint revision choices", () => {
       textarea.dispatchEvent(new Event("input", { bubbles: true }));
     });
     await click(button("Use this wording"));
-    await click(button("Check and download chosen version"));
+    expect(host.querySelector("article")?.textContent).toContain(
+      "Your edited description"
+    );
+    expect(host.querySelector("article")?.textContent).not.toContain(
+      "Suggested description"
+    );
+    await click(button("Check and download PowerPoint"));
     expect(lastSelection().descriptionEdits).toEqual({
       description: "Homework counts for 15 percent of the grade.",
     });
     await click(button("Restore original"));
-    await click(button("Check and download chosen version"));
+    expect(host.querySelector("article")?.textContent).toContain(
+      "Your edited description"
+    );
+    expect(host.querySelector("article")?.textContent).toContain(
+      "Original will be used"
+    );
+    await click(button("Check and download PowerPoint"));
     expect(lastSelection().descriptionEdits).toEqual({});
     expect(lastSelection().revisionToken).toBe("b".repeat(64));
   });
@@ -287,7 +375,7 @@ describe("PowerPoint revision choices", () => {
     await mount(data);
     expect(host.textContent).toContain("1 of 3 changes included · 2 reviewed");
     expect(host.querySelector("article")?.textContent).toContain(
-      "Proposed change · excluded"
+      "This suggestion is excluded"
     );
   });
 
@@ -299,7 +387,7 @@ describe("PowerPoint revision choices", () => {
       })
     );
     await mount();
-    const exportButton = button("Check and download chosen version");
+    const exportButton = button("Check and download PowerPoint");
     await act(async () => {
       exportButton.click();
       exportButton.click();
@@ -339,7 +427,7 @@ describe("PowerPoint revision choices", () => {
     } as Response);
     await mount();
     await click(button("Restore original"));
-    await click(button("Check and download chosen version"));
+    await click(button("Check and download PowerPoint"));
     expect(host.textContent).toContain("Your choices are still here");
     expect(host.textContent).not.toContain("sensitive provider body");
     expect(host.textContent).toContain("2 of 3 changes included");
@@ -409,7 +497,7 @@ describe("PowerPoint revision choices", () => {
       "The original output has an unresolved problem."
     );
     await click(button("Review changes", document.body));
-    await click(button("Check and download chosen version", document.body));
+    await click(button("Check and download PowerPoint", document.body));
     expect(document.body.textContent).not.toContain(
       "The original output has an unresolved problem."
     );

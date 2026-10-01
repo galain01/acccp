@@ -28,6 +28,66 @@ type PreviewState =
   | { status: "loading" | "error" | "unavailable" }
   | { status: "ready"; preview: PowerPointReviewPreview };
 
+const changeCopy: Record<
+  PptxRevisionChange["type"],
+  { original: string; suggested: string; help: string; contextOnly: boolean }
+> = {
+  title: {
+    original: "Original title setting",
+    suggested: "Suggested title setting",
+    help: "Identifying a slide’s title helps students using software that reads aloud recognize its topic and navigate the presentation.",
+    contextOnly: false,
+  },
+  description: {
+    original: "Original description",
+    suggested: "Suggested description",
+    help: "A description is text that reading software uses to explain this item. Changing the description does not change how the slide looks.",
+    contextOnly: true,
+  },
+  "table-header": {
+    original: "Original table header setting",
+    suggested: "Suggested table header setting",
+    help: "Table headers are the labels that explain each row or column. Identifying them helps reading software connect those labels with the table’s values.",
+    contextOnly: false,
+  },
+  "table-caption": {
+    original: "Original table structure",
+    suggested: "Suggested table structure",
+    help: "A table’s caption explains its overall topic; column labels explain the values below them. Separating these gives students a clearer way to understand the table.",
+    contextOnly: false,
+  },
+  "reading-order": {
+    original: "Original reading order",
+    suggested: "Suggested reading order",
+    help: "Reading order is the sequence students hear when software reads the slide aloud. Changing that sequence can also affect which item appears in front when items overlap.",
+    contextOnly: false,
+  },
+  language: {
+    original: "Original pronunciation setting",
+    suggested: "Suggested pronunciation setting",
+    help: "This setting tells reading software which language to use for pronunciation. The visible words stay the same; check the preview for any layout changes.",
+    contextOnly: false,
+  },
+  "link-text": {
+    original: "Original link wording",
+    suggested: "Suggested link wording",
+    help: "Clear link wording tells students where a link leads. The suggested wording keeps the same destination.",
+    contextOnly: false,
+  },
+  "text-style": {
+    original: "Original text appearance",
+    suggested: "Suggested text appearance",
+    help: "Text size and color affect how easily students can read a slide. Check that the suggested appearance is clear and still fits the surrounding content.",
+    contextOnly: false,
+  },
+  position: {
+    original: "Original placement",
+    suggested: "Suggested placement",
+    help: "Moving or resizing an item can improve spacing or keep content on the slide. Check that important content remains visible and its relationship to nearby items is clear.",
+    contextOnly: false,
+  },
+};
+
 export default function PowerPointChangeReview(
   props: PowerPointChangeReviewProps
 ): React.JSX.Element {
@@ -104,6 +164,7 @@ function ReviewChoices({
   const mounted = useRef(false);
   const inputId = useId();
   const selected = review.changes.find((change) => change.id === selectedId);
+  const selectedCopy = selected ? changeCopy[selected.type] : undefined;
   const suppliedPreview = review.previews?.find(
     (item) => item.slideNumber === selected?.slideNumber
   );
@@ -209,7 +270,7 @@ function ReviewChoices({
             ? "This conversion changed while you were reviewing it. Close the result and open it again to load the current changes."
             : response.status === 404 || response.status === 410
               ? "This online copy is no longer available. Online documents expire after 14 days; re-upload your original to process it again."
-              : "Your chosen version could not be prepared. Your choices are still here; please try again."
+              : "The PowerPoint with your selections could not be prepared. Your choices are still here; please try again."
         );
         return;
       }
@@ -221,8 +282,8 @@ function ReviewChoices({
       const count = result.findings.length;
       setExportMessage(
         count
-          ? `Your chosen version was checked and saved. The download has started. ${count} ${count === 1 ? "item still needs" : "items still need"} attention; see the updated items below.`
-          : "Your chosen version was checked and saved. The download has started. The checks reported no remaining items."
+          ? `Your PowerPoint was checked and saved with your selections. The download has started. ${count} ${count === 1 ? "item still needs" : "items still need"} attention; see the updated items below.`
+          : "Your PowerPoint was checked and saved with your selections. The download has started. The checks reported no remaining items."
       );
       const anchor = window.document.createElement("a");
       anchor.href = result.url;
@@ -253,7 +314,9 @@ function ReviewChoices({
           Slide {change.slideNumber} · {change.label}
         </span>
         <span className="block text-xs text-muted-foreground">
-          {included.has(change.id) ? "Included" : "Original restored"}
+          {included.has(change.id)
+            ? "Included in download"
+            : "Original will be used"}
           {reviewed.has(change.id) ? " · Reviewed" : " · Not reviewed"}
         </span>
       </button>
@@ -265,9 +328,10 @@ function ReviewChoices({
       <div>
         <h2 className="font-semibold">Review changes</h2>
         <p className="mt-1 text-sm text-muted-foreground">
-          Start with decisions about what you intended to teach. Routine repairs
-          are already included and can be inspected below. Keep or restore each
-          change, then check and download your chosen version.
+          All suggested changes are included by default. Start with assumptions
+          about your teaching intent; routine repairs are grouped below. A
+          change is marked Reviewed after you keep it, restore the original, or
+          use your own wording.
         </p>
         <p className="mt-2 text-sm" role="status">
           {included.size} of {review.changes.length} changes included ·{" "}
@@ -314,13 +378,18 @@ function ReviewChoices({
                 <Badge
                   variant={included.has(selected.id) ? "secondary" : "outline"}
                 >
-                  {included.has(selected.id) ? "Included" : "Original restored"}
+                  {included.has(selected.id)
+                    ? "Included in download"
+                    : "Original will be used"}
                 </Badge>
                 <Badge variant="outline">
                   {reviewed.has(selected.id) ? "Reviewed" : "Not reviewed"}
                 </Badge>
               </div>
             </div>
+            <p className="text-sm text-muted-foreground">
+              {selectedCopy?.help}
+            </p>
             {selected.assumption && (
               <div className="rounded-lg bg-primary/5 p-3 text-sm">
                 <h4 className="font-medium">Does this match your intention?</h4>
@@ -334,7 +403,9 @@ function ReviewChoices({
                 aria-label="Before this change"
                 className="min-w-0 rounded-lg bg-muted p-3"
               >
-                <h4 className="text-sm font-medium">Original</h4>
+                <h4 className="text-sm font-medium">
+                  {selectedCopy?.original}
+                </h4>
                 <p className="mt-2 text-sm break-words whitespace-pre-wrap">
                   {selected.before || "No value was set."}
                 </p>
@@ -344,17 +415,24 @@ function ReviewChoices({
                 className="min-w-0 rounded-lg border border-primary/30 bg-primary/5 p-3"
               >
                 <h4 className="text-sm font-medium">
-                  {included.has(selected.id)
-                    ? "Your chosen version"
-                    : "Proposed change · excluded"}
+                  {selected.type === "description" &&
+                  descriptionEdits[selected.id] !== undefined
+                    ? "Your edited description"
+                    : selectedCopy?.suggested}
                 </h4>
                 <p className="mt-2 text-sm break-words whitespace-pre-wrap">
                   {descriptionEdits[selected.id] ?? selected.after}
                 </p>
+                {!included.has(selected.id) && (
+                  <p className="mt-2 text-sm font-medium">
+                    This suggestion is excluded. The original will be used in
+                    your download.
+                  </p>
+                )}
               </section>
             </div>
             <div className="text-sm">
-              <h4 className="font-medium">Why this changed</h4>
+              <h4 className="font-medium">Why this change is suggested</h4>
               <p className="mt-1 break-words whitespace-pre-wrap">
                 {selected.reason}
               </p>
@@ -379,12 +457,14 @@ function ReviewChoices({
                 }}
               >
                 <summary className="min-h-11 cursor-pointer py-3 text-sm font-medium">
-                  Compare slide appearance
+                  {selectedCopy?.contextOnly
+                    ? "View slide for context"
+                    : "Compare slide appearance"}
                 </summary>
                 <p className="mb-2 text-xs text-muted-foreground">
-                  These previews show the original and the proposed repairs.
-                  They do not update as you change your choices. Descriptions
-                  and language settings are shown in the text comparison above.
+                  {selectedCopy?.contextOnly
+                    ? "Use this original slide to check whether the description above explains the important information. The description changes what reading software can read aloud; it does not change the slide’s appearance."
+                    : "These reference images show the original slide and the slide with all suggested changes. They stay the same when you keep or restore a change or edit a description, so they do not show your current selections."}
                 </p>
                 {!preview &&
                   (!previewState || previewState.status === "loading") && (
@@ -413,21 +493,26 @@ function ReviewChoices({
                   </p>
                 )}
                 {preview && (
-                  <div className="grid gap-3 sm:grid-cols-2">
-                    {(["before", "after"] as const).map((side) => (
+                  <div
+                    className={`grid gap-3 ${selectedCopy?.contextOnly ? "" : "sm:grid-cols-2"}`}
+                  >
+                    {(selectedCopy?.contextOnly
+                      ? (["before"] as const)
+                      : (["before", "after"] as const)
+                    ).map((side) => (
                       <figure key={side}>
                         <Image
                           src={preview[side]}
                           width={960}
                           height={540}
                           unoptimized
-                          alt={`Slide ${selected.slideNumber}: ${side === "before" ? "original appearance" : "appearance with proposed repairs"}`}
+                          alt={`Slide ${selected.slideNumber}: ${side === "before" ? "original appearance" : "appearance with all suggested changes"}`}
                           className="h-auto w-full rounded border"
                         />
                         <figcaption className="mt-1 text-xs">
                           {side === "before"
                             ? "Original slide"
-                            : "Proposed repairs"}
+                            : "With all suggested changes"}
                         </figcaption>
                       </figure>
                     ))}
@@ -468,8 +553,8 @@ function ReviewChoices({
                   </Button>
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  Your wording will be checked with the chosen version before
-                  download.
+                  Your wording will be included and checked before you download
+                  the PowerPoint.
                 </p>
               </div>
             ) : (
@@ -502,8 +587,8 @@ function ReviewChoices({
             )}
             {!included.has(selected.id) && (
               <p role="status" className="text-sm text-muted-foreground">
-                The original value will be used. Restoring it may bring back a
-                problem; the chosen version will be checked before download.
+                Restoring the original may bring back a problem. The PowerPoint
+                will be checked with your selections before download.
               </p>
             )}
           </article>
@@ -522,8 +607,8 @@ function ReviewChoices({
           onClick={exportChoices}
         >
           {exporting
-            ? "Checking your chosen version…"
-            : "Check and download chosen version"}
+            ? "Checking your PowerPoint…"
+            : "Check and download PowerPoint"}
         </Button>
         <p className="text-xs text-muted-foreground">
           {dirty ? "Your choices have not been saved yet. " : ""}
