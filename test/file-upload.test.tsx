@@ -5,7 +5,10 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import FileUpload from "@/components/ui/file-upload";
-import { MAX_FILE_SIZE_BYTES } from "@/lib/document-input";
+import {
+  MAX_FILE_SIZE_BYTES,
+  MAX_PPTX_FILE_SIZE_BYTES,
+} from "@/lib/document-input";
 
 let host: HTMLDivElement;
 let root: Root;
@@ -45,15 +48,27 @@ describe("output-specific file selection", () => {
       )
     );
     const valid = new File(["synthetic"], "lecture.PPTX");
+    const largeValid = new File(
+      [new Uint8Array(MAX_PPTX_FILE_SIZE_BYTES)],
+      "large-valid.pptx"
+    );
     await choose([
       valid,
+      largeValid,
       new File(["synthetic"], "old.ppt"),
       new File(["synthetic"], "macro.pptm"),
       new File(["synthetic"], "article.pdf"),
       new File([], "empty.pptx"),
-      new File([new Uint8Array(MAX_FILE_SIZE_BYTES + 1)], "large.pptx"),
+      new File(
+        [new Uint8Array(MAX_PPTX_FILE_SIZE_BYTES + 1)],
+        "too-large.pptx"
+      ),
     ]);
-    expect(onFilesSelected).toHaveBeenCalledExactlyOnceWith([valid]);
+    expect(onFilesSelected).toHaveBeenCalledExactlyOnceWith([
+      valid,
+      largeValid,
+    ]);
+    expect(host.textContent).toContain("25 MB");
     expect(host.querySelector("input")?.accept).toContain(".pptx");
     expect(host.querySelector("input")?.accept).not.toContain(".pdf");
     expect(host.querySelector('[role="status"]')?.textContent).toContain(
@@ -69,7 +84,13 @@ describe("output-specific file selection", () => {
     );
     const pdf = new File(["synthetic"], "article.pdf");
     const word = new File(["synthetic"], "notes.docx");
-    await choose([pdf, word, new File(["synthetic"], "slides.pptx")]);
+    await choose([
+      pdf,
+      word,
+      new File(["synthetic"], "slides.pptx"),
+      new File([new Uint8Array(MAX_FILE_SIZE_BYTES + 1)], "large.pdf"),
+      new File([new Uint8Array(MAX_FILE_SIZE_BYTES + 1)], "large.docx"),
+    ]);
     expect(onFilesSelected).toHaveBeenCalledExactlyOnceWith([pdf, word]);
     expect(host.querySelector("input")?.accept).toContain(".pdf,.docx");
     expect(host.querySelector('[role="status"]')?.textContent).toContain(

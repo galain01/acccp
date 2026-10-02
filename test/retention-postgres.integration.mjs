@@ -270,6 +270,12 @@ beforeAll(async () => {
       "utf8"
     )
   );
+  await pg.exec(
+    await readFile(
+      new URL("../drizzle/0014_direct_powerpoint_upload.sql", import.meta.url),
+      "utf8"
+    )
+  );
 });
 
 afterAll(async () => {
@@ -301,6 +307,56 @@ beforeEach(async () => {
 });
 
 describe("retention against in-memory PostgreSQL", () => {
+  it("keeps a deleted direct-upload receipt and object until the bearer and in-flight window settle", async () => {
+    const doc = await seedDocument(1, true);
+    await pg.query(
+      "UPDATE documents SET upload_expires_at=clock_timestamp()+interval '2 hours' WHERE id=$1",
+      [doc.id]
+    );
+    await expect(
+      withRetainedDocument(doc.id, async () => "private")
+    ).rejects.toBeInstanceOf(DocumentUnavailableError);
+    expect(await purgeDocumentIfEligible(doc.id)).toBe("retained");
+    expect(fixture.remove).not.toHaveBeenCalled();
+    await pg.query(
+      "UPDATE documents SET upload_expires_at=clock_timestamp()-interval '30 minutes' WHERE id=$1",
+      [doc.id]
+    );
+    expect(await purgeDocumentIfEligible(doc.id)).toBe("retained");
+    await pg.query(
+      "UPDATE documents SET upload_expires_at=clock_timestamp()-interval '61 minutes' WHERE id=$1",
+      [doc.id]
+    );
+    expect(await purgeDocumentIfEligible(doc.id)).toBe("purged");
+    expect((await linkedCounts(doc.id, doc.jobId)).documents).toBe(0);
+  });
+
+  it("expires abandoned uploads early while completed uploads keep the original 14-day retention", async () => {
+    const pending = await seedDocument(4),
+      completed = await seedDocument(4);
+    await pg.query(
+      "UPDATE documents SET upload_expires_at=clock_timestamp()-interval '61 minutes' WHERE id=ANY($1::uuid[])",
+      [[pending.id, completed.id]]
+    );
+    await pg.query(
+      "UPDATE documents SET upload_completed_at=clock_timestamp()-interval '2 hours' WHERE id=$1",
+      [completed.id]
+    );
+    await expect(
+      withRetainedDocument(pending.id, async () => "private")
+    ).rejects.toBeInstanceOf(DocumentUnavailableError);
+    expect(await withRetainedDocument(completed.id, async () => "kept")).toBe(
+      "kept"
+    );
+    expect(await purgeDocumentIfEligible(pending.id)).toBe("purged");
+    expect(await purgeDocumentIfEligible(completed.id)).toBe("retained");
+    await pg.query(
+      "UPDATE documents SET created_at=clock_timestamp()-interval '337 hours' WHERE id=$1",
+      [completed.id]
+    );
+    expect(await purgeDocumentIfEligible(completed.id)).toBe("purged");
+  });
+
   it("defaults historical jobs to Canvas and supports both old and target-aware upserts during rollout", async () => {
     const document = await seedDocument(1);
     const legacy = await pg.query(

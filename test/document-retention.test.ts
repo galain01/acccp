@@ -36,6 +36,7 @@ import {
   purgeDocumentIfEligible,
   purgeExpiredDocuments,
   retainedDocumentCondition,
+  eligibleDocumentCondition,
   withRetainedDocument,
 } from "@/lib/document-retention";
 import {
@@ -132,7 +133,23 @@ describe("retained document lock", () => {
     expect(compiled).toContain('"documents"."created_at" > clock_timestamp()');
     expect(compiled).toContain("interval '336 hours'");
     expect(compiled).not.toContain("updated_at");
-    expect(compiled).not.toContain("expires_at");
+    expect(compiled).toContain('"documents"."upload_completed_at" is not null');
+    expect(compiled).toContain(
+      '"documents"."upload_expires_at" > clock_timestamp()'
+    );
+    expect(compiled).not.toContain('"conversion_jobs"');
+  });
+
+  it("keeps cleanup receipts through upload expiry and an in-flight allowance, including deleted documents", () => {
+    const compiled = query(eligibleDocumentCondition()).sql;
+    expect(compiled).toContain('"documents"."upload_expires_at" is null');
+    expect(compiled).toContain(
+      '"documents"."upload_expires_at" <= clock_timestamp()'
+    );
+    expect(compiled).toContain("interval '1 hour'");
+    expect(compiled).toContain('"documents"."upload_completed_at" is null');
+    expect(compiled).toContain('"documents"."deleted_at" is not null');
+    expect(compiled).toContain(" and ");
   });
 
   it("locks first, checks eligibility afterwards, then rechecks before commit", async () => {

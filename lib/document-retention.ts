@@ -45,14 +45,33 @@ const databaseCutoff = () => sql`clock_timestamp() - interval '336 hours'`;
 export function retainedDocumentCondition(): SQL {
   return and(
     isNull(documents.deletedAt),
-    gt(documents.createdAt, databaseCutoff())
+    gt(documents.createdAt, databaseCutoff()),
+    or(
+      isNull(documents.uploadExpiresAt),
+      isNotNull(documents.uploadCompletedAt),
+      gt(documents.uploadExpiresAt, sql`clock_timestamp()`)
+    )
   )!;
 }
 
-function eligibleDocumentCondition(): SQL {
-  return or(
-    isNotNull(documents.deletedAt),
-    lte(documents.createdAt, databaseCutoff())
+export function eligibleDocumentCondition(): SQL {
+  // Keep the object and its receipt while a issued upload URL can still create
+  // it. The extra hour is a conservative allowance for an upload in flight;
+  // it is not a provider guarantee about arbitrarily stalled requests.
+  const uploadSettled = or(
+    isNull(documents.uploadExpiresAt),
+    lte(documents.uploadExpiresAt, sql`clock_timestamp() - interval '1 hour'`)
+  );
+  return and(
+    uploadSettled,
+    or(
+      isNotNull(documents.deletedAt),
+      lte(documents.createdAt, databaseCutoff()),
+      and(
+        isNotNull(documents.uploadExpiresAt),
+        isNull(documents.uploadCompletedAt)
+      )
+    )
   )!;
 }
 

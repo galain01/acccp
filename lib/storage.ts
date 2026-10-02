@@ -65,9 +65,19 @@ export function outputReviewKey(
 export async function uploadObject(
   key: string,
   body: Buffer | string,
-  contentType: string
+  contentType: string,
+  options?: { signal?: AbortSignal }
 ): Promise<void> {
-  const { error } = await storage.upload(key, body, {
+  const requestStorage = options?.signal
+    ? createClient(supabaseUrl!, serviceRoleKey!, {
+        auth: { persistSession: false, autoRefreshToken: false },
+        global: {
+          fetch: (input, init) =>
+            fetch(input, { ...init, signal: options.signal }),
+        },
+      }).storage.from(DOCUMENTS_BUCKET)
+    : storage;
+  const { error } = await requestStorage.upload(key, body, {
     contentType,
     upsert: true, // Re-converting overwrites the previous output.
   });
@@ -82,13 +92,108 @@ export async function downloadObject(key: string): Promise<Buffer> {
   return Buffer.from(await data.arrayBuffer());
 }
 
+/** The key is server-derived. The bearer permits one new object, never upsert. */
+export async function createSignedUploadUrl(key: string): Promise<{
+  uploadUrl: string;
+  expiresAt: string;
+}> {
+  const scoped = createClient(supabaseUrl!, serviceRoleKey!, {
+    auth: { persistSession: false, autoRefreshToken: false },
+    global: {
+      fetch: (input, init) =>
+        fetch(input, { ...init, signal: AbortSignal.timeout(30_000) }),
+    },
+  }).storage.from(DOCUMENTS_BUCKET);
+  const { data, error } = await scoped.createSignedUploadUrl(key, {
+    upsert: false,
+  });
+  if (error || !data)
+    throw new Error("Could not prepare a presentation upload.");
+  try {
+    const url = new URL(data.signedUrl);
+    const expectedOrigin = new URL(supabaseUrl!).origin;
+    const payload = JSON.parse(
+      Buffer.from(data.token.split(".")[1], "base64url").toString("utf8")
+    );
+    if (
+      url.origin !== expectedOrigin ||
+      !Number.isSafeInteger(payload.exp) ||
+      payload.exp * 1000 <= Date.now()
+    )
+      throw new Error();
+    return {
+      uploadUrl: url.toString(),
+      expiresAt: new Date(payload.exp * 1000).toISOString(),
+    };
+  } catch {
+    throw new Error("Could not prepare a presentation upload.");
+  }
+}
+
+export class StorageObjectSizeError extends Error {
+  constructor() {
+    super("The stored presentation exceeds its size limit.");
+  }
+}
+
+/** Bound actual bytes while reading, before buffering an untrusted direct upload. */
+export async function downloadObjectBounded(
+  key: string,
+  maxBytes: number
+): Promise<Buffer> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1)
+    throw new Error("Invalid storage read limit.");
+  const signal = AbortSignal.timeout(60_000);
+  const url = await createSignedUrl(key, 60, undefined, { signal });
+  const response = await fetch(url, {
+    redirect: "error",
+    credentials: "omit",
+    cache: "no-store",
+    signal,
+  });
+  if (!response.ok || !response.body)
+    throw new Error("Could not read the uploaded presentation.");
+  if (Number(response.headers.get("content-length")) > maxBytes) {
+    await response.body.cancel();
+    throw new StorageObjectSizeError();
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      size += chunk.value.byteLength;
+      if (size > maxBytes) {
+        await reader.cancel();
+        throw new StorageObjectSizeError();
+      }
+      chunks.push(chunk.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks, size);
+}
+
 /** The bucket is private, so downloads need a short-lived signed url. */
 export async function createSignedUrl(
   key: string,
   expiresInSeconds = 60 * 5,
-  downloadFilename?: string
+  downloadFilename?: string,
+  options?: { signal?: AbortSignal }
 ): Promise<string> {
-  const { data, error } = await storage.createSignedUrl(
+  const requestStorage = options?.signal
+    ? createClient(supabaseUrl!, serviceRoleKey!, {
+        auth: { persistSession: false, autoRefreshToken: false },
+        global: {
+          fetch: (input, init) =>
+            fetch(input, { ...init, signal: options.signal }),
+        },
+      }).storage.from(DOCUMENTS_BUCKET)
+    : storage;
+  const { data, error } = await requestStorage.createSignedUrl(
     key,
     expiresInSeconds,
     downloadFilename ? { download: downloadFilename } : undefined

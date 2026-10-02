@@ -1,4 +1,5 @@
 import "server-only";
+import { createStoredPowerPointRenderer } from "./powerpoint-render-storage";
 import { createHash, randomUUID } from "node:crypto";
 import { and, desc, eq, inArray } from "drizzle-orm";
 import type { AccessibilityError } from "./accessibility-findings";
@@ -369,7 +370,14 @@ export async function exportOwnedPowerPointReview(
     const checked = await recheckPowerPointRevision(
       prepared.original,
       selected.buffer,
-      selected.changes
+      selected.changes,
+      {
+        renderPowerPoint: createStoredPowerPointRenderer(
+          input.documentId,
+          prepared.sessionId,
+          input.jobId
+        ),
+      }
     );
     // Do not retry an ambiguous commit after deletion removed the job receipt.
     await recordPowerPointReviewCalls({

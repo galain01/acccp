@@ -251,6 +251,15 @@ export const documents = pgTable(
     // You can use { mode: "bigint" } if numbers are exceeding js number limitations
     fileSizeBytes: bigint("file_size_bytes", { mode: "number" }).notNull(),
     checksumSha256: text("checksum_sha256"),
+    // A signed direct-upload capability may outlive a user's deletion request.
+    uploadExpiresAt: timestamp("upload_expires_at", {
+      withTimezone: true,
+      mode: "string",
+    }),
+    uploadCompletedAt: timestamp("upload_completed_at", {
+      withTimezone: true,
+      mode: "string",
+    }),
     pageCount: integer("page_count"),
     replacedByDocumentId: uuid("replaced_by_document_id"),
     createdAt: timestamp("created_at", { withTimezone: true, mode: "string" })

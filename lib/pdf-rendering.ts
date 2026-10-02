@@ -1,7 +1,10 @@
 // Node-only, memory-only renderer. Uploaded bytes never become arguments or files.
 import { spawn } from "node:child_process";
 import { join } from "node:path";
-import { MAX_FILE_SIZE_BYTES } from "./document-input";
+import {
+  MAX_FILE_SIZE_BYTES,
+  MAX_PPTX_PREVIEW_PDF_SIZE_BYTES,
+} from "./document-input";
 import {
   createJobDiagnostic,
   describeJobDiagnostic,
@@ -198,7 +201,6 @@ function acquireRenderer(
   });
 }
 
-const MAX_STDIN_BYTES = Math.ceil(MAX_FILE_SIZE_BYTES / 3) * 4 + 64;
 const MAX_STDOUT_BYTES =
   Math.ceil(PDF_RENDERING_LIMITS.maxTotalPngBytes / 3) * 4 +
   PDF_RENDERING_LIMITS.maxTotalTextChars * 6 +
@@ -368,7 +370,11 @@ function parseResult(value: unknown): RenderedPdf {
  */
 export async function renderPdfPages(
   buffer: Buffer,
-  options: { timeoutMs?: number } = {}
+  options: {
+    timeoutMs?: number;
+    /** Server-selected origin; never accept this option from upload metadata. */
+    inputKind?: "uploaded-pdf" | "powerpoint-preview";
+  } = {}
 ): Promise<RenderedPdf> {
   const started = performance.now();
   const elapsed = () => Math.max(0, Math.round(performance.now() - started));
@@ -388,8 +394,19 @@ export async function renderPdfPages(
   // budgets preserve the existing 30-second queue and 90-second active limits.
   const requestDeadline = timeout === undefined ? undefined : started + timeout;
   if (
+    options.inputKind !== undefined &&
+    options.inputKind !== "uploaded-pdf" &&
+    options.inputKind !== "powerpoint-preview"
+  )
+    throw new RangeError("Unknown PDF rendering input kind.");
+  const isPowerPointPreview = options.inputKind === "powerpoint-preview";
+  const maxInputBytes = isPowerPointPreview
+    ? MAX_PPTX_PREVIEW_PDF_SIZE_BYTES
+    : MAX_FILE_SIZE_BYTES;
+  const maxStdinBytes = Math.ceil(maxInputBytes / 3) * 4 + 64;
+  if (
     !Buffer.isBuffer(buffer) ||
-    buffer.length > MAX_FILE_SIZE_BYTES ||
+    buffer.length > maxInputBytes ||
     buffer.subarray(0, 5).toString("ascii") !== "%PDF-"
   ) {
     throw renderingError("pdf_invalid", undefined, elapsed());
@@ -401,7 +418,7 @@ export async function renderPdfPages(
       throw renderingError("pdf_timeout", undefined, elapsed());
     // Queued requests retain only their original bytes, not another base64 copy.
     const request = JSON.stringify({ pdf: buffer.toString("base64") });
-    if (Buffer.byteLength(request) > MAX_STDIN_BYTES)
+    if (Buffer.byteLength(request) > maxStdinBytes)
       throw renderingError("pdf_invalid", undefined, elapsed());
     const root = process.cwd();
     const childPath = join(root, "lib", "pdf-rendering-child.mjs");
@@ -430,6 +447,7 @@ export async function renderPdfPages(
             `--allow-fs-read=${join(root, "node_modules", "pdfjs-dist")}`,
             `--allow-fs-read=${join(root, "node_modules", "@napi-rs")}`,
             childPath,
+            ...(isPowerPointPreview ? ["--powerpoint-preview"] : []),
           ],
           { env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] }
         );

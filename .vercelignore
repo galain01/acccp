@@ -1,0 +1,35 @@
+# Secrets and local model/document experiments must never enter deployments.
+.env*
+**/.env*
+.benchmark
+**/.benchmark
+*.pem
+**/*.pem
+*.key
+**/*.key
+
+# Dependencies and generated build/test output are recreated by the hosted build.
+node_modules
+**/node_modules
+.next
+**/.next
+.vercel
+**/.vercel
+coverage
+**/coverage
+build
+out
+*.tsbuildinfo
+**/*.tsbuildinfo
+next-env.d.ts
+
+# Local tooling state, logs, and editor files are not application source.
+.git
+.claude
+.idea
+.vscode
+.DS_Store
+*.log
+*.log.*
+**/*.log
+**/*.log.*

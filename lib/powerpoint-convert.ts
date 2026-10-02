@@ -1,6 +1,7 @@
 import "server-only";
 import { createCanvas, loadImage } from "@napi-rs/canvas";
 import { performance } from "node:perf_hooks";
+import { validateDocumentInput } from "./document-input";
 import {
   applyPptxRepairs,
   checkPptxAccessibility,
@@ -73,6 +74,11 @@ export interface PowerPointReviewPreview {
   slideNumber: number;
   before?: string;
   after: string;
+}
+
+export interface PowerPointConversionOptions {
+  /** Persists large previews outside the renderer request when supplied by the app. */
+  renderPowerPoint?: (buffer: Buffer, timeoutMs: number) => Promise<Buffer>;
 }
 
 class PowerPointPlanError extends Error {
@@ -359,7 +365,7 @@ interface SlideEvidence {
   images: RenderedPdf;
 }
 
-function workflowClock() {
+function workflowClock(options: PowerPointConversionOptions) {
   const deadline = performance.now() + 260_000;
   const remaining = () => Math.max(1, deadline - performance.now() - 5000);
   const needTime = (minimum: number) => {
@@ -370,13 +376,14 @@ function workflowClock() {
     slideCount: number
   ): Promise<SlideEvidence> => {
     needTime(6000);
-    const pdf = await renderPowerPointToPdf(
+    const pdf = await (options.renderPowerPoint ?? renderPowerPointToPdf)(
       pptx,
       Math.min(60_000, remaining())
     );
     needTime(6000);
     const images = await renderPdfPages(pdf, {
       timeoutMs: Math.min(90_000, remaining()),
+      inputKind: "powerpoint-preview",
     });
     if (
       images.pageCount !== slideCount ||
@@ -714,10 +721,11 @@ function failure(
 
 export async function convertPowerPoint(
   buffer: Buffer,
-  filename: string
+  filename: string,
+  options: PowerPointConversionOptions = {}
 ): Promise<PowerPointConversionResult | ConversionError> {
   const calls: ModelCallUsage[] = [];
-  const clock = workflowClock();
+  const clock = workflowClock(options);
   let stage: DiagnosticStage = "pptx_prepare";
   try {
     if (!filename.toLowerCase().endsWith(".pptx"))
@@ -725,6 +733,8 @@ export async function convertPowerPoint(
         "pptx_invalid",
         "Upload a .pptx presentation."
       );
+    const inputError = validateDocumentInput(buffer, filename);
+    if (inputError) throw new PptxPackageError("pptx_invalid", inputError);
     const source = await inspectPptx(buffer);
     const mechanicalPlan = buildPptxMechanicalPlan(source);
     const mechanical = hasOperations(mechanicalPlan)
@@ -883,12 +893,15 @@ export async function convertPowerPoint(
 export async function recheckPowerPointRevision(
   sourceBuffer: Buffer,
   candidate: Buffer,
-  changes: PptxChange[] = []
+  changes: PptxChange[] = [],
+  options: PowerPointConversionOptions = {}
 ): Promise<PowerPointConversionResult | ConversionError> {
   const calls: ModelCallUsage[] = [];
-  const clock = workflowClock();
+  const clock = workflowClock(options);
   let stage: DiagnosticStage = "pptx_prepare";
   try {
+    const inputError = validateDocumentInput(sourceBuffer, "source.pptx");
+    if (inputError) throw new PptxPackageError("pptx_invalid", inputError);
     const source = await inspectPptx(sourceBuffer);
     const inspection = await inspectPptx(candidate);
     const appendedSlides = changes.flatMap((change) =>

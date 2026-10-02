@@ -2,6 +2,12 @@ import { describe, expect, it } from "vitest";
 import { ZipFile } from "yazl";
 import { fromBufferPromise } from "yauzl";
 import { DOMParser } from "@xmldom/xmldom";
+import { randomFillSync } from "node:crypto";
+import { createCanvas } from "@napi-rs/canvas";
+import {
+  MAX_PPTX_FILE_SIZE_BYTES,
+  MAX_PPTX_OUTPUT_SIZE_BYTES,
+} from "../lib/document-input";
 import { pptxElementHash } from "../lib/pptx-table-caption";
 import {
   buildPptxMechanicalPlan,
@@ -688,6 +694,53 @@ async function unzip(buffer: Buffer): Promise<Map<string, Buffer>> {
 }
 
 describe("PowerPoint package remediation", () => {
+  it("repairs a presentation with a large valid embedded image and preserves its media and notes", async () => {
+    const canvas = createCanvas(3000, 2000);
+    const context = canvas.getContext("2d");
+    const pixels = context.createImageData(canvas.width, canvas.height);
+    randomFillSync(pixels.data);
+    for (let index = 3; index < pixels.data.length; index += 4)
+      pixels.data[index] = 255;
+    context.putImageData(pixels, 0, 0);
+    const media = canvas.toBuffer("image/png");
+    // This also exercises the increased per-part allowance for one large photo.
+    expect(media.length).toBeGreaterThan(16 * 1024 * 1024);
+    const parts = entries();
+    parts[6][1] = media;
+    const source = await zip(parts);
+    expect(source.length).toBeGreaterThan(4 * 1024 * 1024);
+    expect(source.length).toBeLessThan(MAX_PPTX_FILE_SIZE_BYTES);
+    const result = await applyPptxRepairs(source, {
+      slides: [
+        {
+          slideNumber: 1,
+          descriptions: [{ objectId: "3", text: "A colorful image." }],
+        },
+      ],
+    });
+    expect(result.buffer.length).toBeGreaterThan(4 * 1024 * 1024);
+    expect(result.buffer.length).toBeLessThanOrEqual(
+      MAX_PPTX_OUTPUT_SIZE_BYTES
+    );
+    const reopened = await inspectPptx(result.buffer);
+    expect(reopened.slides[0].objects[1].description).toBe("A colorful image.");
+    const outputParts = await unzip(result.buffer);
+    for (const [name, original] of parts)
+      if (name !== "ppt/slides/slide1.xml")
+        expect(outputParts.get(name)?.equals(Buffer.from(original))).toBe(true);
+  }, 30_000);
+
+  it("bounds uploaded sources and generated output inspection independently", async () => {
+    await expect(
+      applyPptxRepairs(Buffer.alloc(MAX_PPTX_FILE_SIZE_BYTES + 1), {
+        slides: [],
+      })
+    ).rejects.toHaveProperty("code", "pptx_size_limit");
+    await expect(
+      inspectPptx(Buffer.alloc(MAX_PPTX_OUTPUT_SIZE_BYTES + 1))
+    ).rejects.toHaveProperty("code", "pptx_size_limit");
+  });
+
   it("reports structural defects before a plan and clears them after verified repairs", async () => {
     const original = await zip(
       entries(slide(text(2, "Course overview") + image(3) + table(4)))
@@ -1420,7 +1473,7 @@ describe("PowerPoint package remediation", () => {
         "http://purl.oclc.org/ooxml/presentationml/main"
       );
     if (scenario === "inflation")
-      parts.push(["ppt/media/bomb.bin", Buffer.alloc(17 * 1024 * 1024)]);
+      parts.push(["ppt/media/bomb.bin", Buffer.alloc(32 * 1024 * 1024 + 1)]);
     if (scenario === "depth")
       parts[4][1] = "<a>".repeat(101) + "</a>".repeat(101);
     if (scenario === "missing relationship target")

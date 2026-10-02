@@ -20,6 +20,11 @@ vi.mock("@/lib/actions/powerpoint-review", () => ({
   getPowerPointReviewPreview: vi.fn().mockResolvedValue(null),
 }));
 
+vi.mock("@/lib/document-upload-client", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/document-upload-client")>()),
+  uploadPowerPointDocument: vi.fn(),
+}));
+
 // Only replace the browser file picker. Selection, status changes, buttons,
 // and request construction remain the actual workspace and document table.
 vi.mock("@/components/ui/file-upload", () => ({
@@ -45,9 +50,14 @@ vi.mock("@/components/ui/file-upload", () => ({
 import DocumentWorkspace from "@/components/ui/document-workspace";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import {
+  deleteDocument,
   getDocumentHtml,
   getDocumentOutputDownload,
 } from "@/lib/actions/documents";
+import {
+  DocumentUploadError,
+  uploadPowerPointDocument,
+} from "@/lib/document-upload-client";
 import { getPowerPointReview } from "@/lib/actions/powerpoint-review";
 
 const SESSION_ID = "synthetic-session";
@@ -183,6 +193,14 @@ function requests(): FormData[] {
 }
 
 beforeEach(() => {
+  vi.mocked(deleteDocument).mockResolvedValue(undefined);
+  vi.mocked(uploadPowerPointDocument)
+    .mockReset()
+    .mockImplementation(async ({ file, onReserved }) => {
+      const id = `uploaded-${file.name}`;
+      onReserved(id);
+      return id;
+    });
   vi.mocked(getPowerPointReview).mockResolvedValue(null);
   vi.mocked(getDocumentHtml).mockResolvedValue("<h2>Saved result</h2>");
   vi.mocked(getDocumentOutputDownload).mockResolvedValue({
@@ -212,6 +230,178 @@ afterEach(async () => {
 });
 
 describe("DocumentWorkspace conversion selection", () => {
+  it("shows Uploading then Processing and retries a completed PowerPoint upload without sending its file again", async () => {
+    let finishUpload!: (documentId: string) => void;
+    vi.mocked(uploadPowerPointDocument).mockImplementationOnce(
+      ({ onReserved }) => {
+        onReserved("ready-source");
+        return new Promise((resolve) => {
+          finishUpload = resolve;
+        });
+      }
+    );
+    const conversion = deferredResponse();
+    fetchMock.mockReturnValueOnce(conversion.promise);
+    await mount();
+    await selectOutput("accessible_pptx");
+    await upload("retry.pptx");
+    await click(button("Convert"));
+    expect(row("retry.pptx").textContent).toContain("Uploading");
+    expect(fetchMock).not.toHaveBeenCalled();
+    await act(async () => finishUpload("ready-source"));
+    expect(row("retry.pptx").textContent).toContain("Processing");
+    expect(requests()[0].get("documentId")).toBe("ready-source");
+    expect(requests()[0].has("file")).toBe(false);
+    await act(async () =>
+      conversion.resolve({
+        ok: false,
+        json: async () => ({ error: "Conversion failed." }),
+      } as Response)
+    );
+    await click(button("Convert"));
+    expect(vi.mocked(uploadPowerPointDocument)).toHaveBeenCalledOnce();
+    expect(requests().map((form) => form.get("documentId"))).toEqual([
+      "ready-source",
+      "ready-source",
+    ]);
+    expect(deleteDocument).not.toHaveBeenCalled();
+  });
+
+  it("deletes an incomplete upload reservation and retries with a fresh reservation", async () => {
+    vi.mocked(uploadPowerPointDocument).mockImplementationOnce(
+      async ({ onReserved }) => {
+        onReserved("failed-upload");
+        throw new DocumentUploadError();
+      }
+    );
+    await mount();
+    await selectOutput("accessible_pptx");
+    await upload("retry.pptx");
+    await click(button("Convert"));
+    expect(deleteDocument).toHaveBeenCalledExactlyOnceWith("failed-upload");
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(row("retry.pptx").textContent).toContain("Error");
+    await click(button("Convert"));
+    expect(uploadPowerPointDocument).toHaveBeenCalledTimes(2);
+    expect(requests()[0].get("documentId")).toBe("uploaded-retry.pptx");
+    expect(row("retry.pptx").textContent).toContain("Ready to review");
+  });
+
+  it("cleans a reservation arriving after its row was deleted and does not resurrect the row", async () => {
+    let finishReservation!: () => void;
+    vi.mocked(uploadPowerPointDocument).mockImplementationOnce(
+      ({ onReserved, signal }) =>
+        new Promise((_resolve, reject) => {
+          finishReservation = () => {
+            onReserved("late-reservation");
+            expect(signal.aborted).toBe(true);
+            reject(new DOMException("Aborted", "AbortError"));
+          };
+        })
+    );
+    await mount();
+    await selectOutput("accessible_pptx");
+    await upload("removed.pptx");
+    await click(button("Convert"));
+    await click(button("Remove removed.pptx"));
+    await act(async () => finishReservation());
+    expect(deleteDocument).toHaveBeenCalledExactlyOnceWith("late-reservation");
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(host.querySelectorAll("tbody tr")).toHaveLength(0);
+  });
+
+  it("aborts a pending storage upload on deletion and cleans its known reservation only once", async () => {
+    let uploadSignal!: AbortSignal;
+    vi.mocked(uploadPowerPointDocument).mockImplementationOnce(
+      ({ onReserved, signal }) => {
+        uploadSignal = signal;
+        onReserved("pending-storage");
+        return new Promise((_resolve, reject) =>
+          signal.addEventListener(
+            "abort",
+            () => reject(new DOMException("Aborted", "AbortError")),
+            { once: true }
+          )
+        );
+      }
+    );
+    await mount();
+    await selectOutput("accessible_pptx");
+    await upload("removed.pptx");
+    await click(button("Convert"));
+    await click(button("Remove removed.pptx"));
+    expect(uploadSignal.aborted).toBe(true);
+    expect(deleteDocument).toHaveBeenCalledExactlyOnceWith("pending-storage");
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(host.querySelectorAll("tbody tr")).toHaveLength(0);
+  });
+
+  it("processes a batch sequentially and skips a queued row deleted before its turn", async () => {
+    const first = deferredResponse();
+    const third = deferredResponse();
+    fetchMock
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(third.promise);
+    await mount([
+      savedDocument("first", "idle"),
+      savedDocument("second", "idle"),
+      savedDocument("third", "idle"),
+    ]);
+    await click(button("Convert"));
+    expect(requests()).toHaveLength(1);
+    expect(row("first.pdf").textContent).toContain("Processing");
+    expect(row("second.pdf").textContent).toContain("Queued");
+    await click(button("Remove second.pdf"));
+    await act(async () => first.resolve(conversionResponse("first")));
+    expect(requests().map((form) => form.get("documentId"))).toEqual([
+      "first",
+      "third",
+    ]);
+    await act(async () => third.resolve(conversionResponse("third")));
+    expect(row("third.pdf").textContent).toContain("Success");
+    expect(deleteDocument).toHaveBeenCalledWith("second");
+  });
+
+  it("retains a completed upload on navigation and never starts the next queued file", async () => {
+    const pending = deferredResponse();
+    fetchMock.mockReturnValueOnce(pending.promise);
+    await mount();
+    await selectOutput("accessible_pptx");
+    await upload("first.pptx");
+    await upload("second.pptx");
+    await click(button("Convert"));
+    expect(requests()[0].get("documentId")).toBe("uploaded-first.pptx");
+    const signal = fetchMock.mock.calls[0][1]?.signal;
+    await act(async () => root.render(null));
+    expect(signal?.aborted).toBe(true);
+    await act(async () =>
+      pending.resolve(conversionResponse("uploaded-first.pptx"))
+    );
+    expect(uploadPowerPointDocument).toHaveBeenCalledOnce();
+    expect(requests()).toHaveLength(1);
+    expect(deleteDocument).not.toHaveBeenCalled();
+  });
+
+  it("keeps a successful upload whose acknowledgement arrives after navigation", async () => {
+    let finishUpload!: (documentId: string) => void;
+    vi.mocked(uploadPowerPointDocument).mockImplementationOnce(
+      ({ onReserved }) => {
+        onReserved("completed-late");
+        return new Promise((resolve) => {
+          finishUpload = resolve;
+        });
+      }
+    );
+    await mount();
+    await selectOutput("accessible_pptx");
+    await upload("late.pptx");
+    await click(button("Convert"));
+    await act(async () => root.render(null));
+    await act(async () => finishUpload("completed-late"));
+    expect(deleteDocument).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("updates the saved row and reopened result with findings for the chosen PowerPoint version", async () => {
     vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
     vi.mocked(getPowerPointReview).mockResolvedValue({
@@ -293,13 +483,14 @@ describe("DocumentWorkspace conversion selection", () => {
     await click(button("Convert"));
     expect(
       requests().map((form) => [
-        (form.get("file") as File).name,
+        (form.get("file") as File)?.name ?? form.get("documentId"),
         form.get("outputTarget"),
       ])
     ).toEqual([
       ["article.pdf", "canvas_html"],
-      ["slides.pptx", "accessible_pptx"],
+      ["uploaded-slides.pptx", "accessible_pptx"],
     ]);
+    expect(requests()[1].has("file")).toBe(false);
     expect(button("Convert").disabled).toBe(true);
     await click(button("Re-convert", row("done.pptx")));
     expect(requests()[2].get("outputTarget")).toBe("accessible_pptx");

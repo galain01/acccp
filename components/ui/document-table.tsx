@@ -41,7 +41,8 @@ interface DocumentTableProps {
 function statusBadge(
   status: ConversionStatus,
   isPowerPoint = false,
-  hasAccessibilityErrors = false
+  hasAccessibilityErrors = false,
+  uploading = false
 ): React.JSX.Element {
   switch (status) {
     case "idle":
@@ -49,7 +50,11 @@ function statusBadge(
     case "queued":
       return <Badge variant="secondary">Queued</Badge>;
     case "processing":
-      return <Badge variant="processing">Processing</Badge>;
+      return (
+        <Badge variant="processing">
+          {uploading ? "Uploading" : "Processing"}
+        </Badge>
+      );
     case "success":
       if (isPowerPoint) {
         return (
@@ -229,7 +234,8 @@ export default function DocumentTable({
                       {statusBadge(
                         doc.status,
                         doc.outputTarget === "accessible_pptx",
-                        doc.errors?.some((issue) => issue.severity === "error")
+                        doc.errors?.some((issue) => issue.severity === "error"),
+                        doc.processingPhase === "uploading"
                       )}
                       {issueBadges(doc)}
                     </TableCell>

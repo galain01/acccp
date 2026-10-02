@@ -1,5 +1,9 @@
 import "server-only";
-import { isPdfBuffer, MAX_FILE_SIZE_BYTES } from "./document-input";
+import {
+  isPdfBuffer,
+  MAX_PPTX_OUTPUT_SIZE_BYTES,
+  MAX_PPTX_PREVIEW_PDF_SIZE_BYTES,
+} from "./document-input";
 import { createJobDiagnostic, describeJobDiagnostic } from "./job-diagnostics";
 
 /** Only controlled messages escape this boundary. Worker bodies are never read as text. */
@@ -20,14 +24,65 @@ export class PowerPointRenderingError extends Error {
   }
 }
 
+export interface PowerPointRenderingOptions {
+  /** A short-lived read URL for an already stored, validated PPTX. */
+  downloadUrl?: string;
+}
+
+function validatedDownloadUrl(value: string): string {
+  try {
+    const configuredOrigin = process.env.SUPABASE_URL ?? "";
+    const project = new URL(configuredOrigin);
+    const url = new URL(value);
+    const local =
+      !process.env.VERCEL &&
+      process.env.NODE_ENV !== "production" &&
+      (project.hostname === "localhost" ||
+        project.hostname === "[::1]" ||
+        /^127(?:\.\d{1,3}){3}$/.test(project.hostname));
+    if (
+      project.username ||
+      project.password ||
+      project.pathname !== "/" ||
+      project.search ||
+      project.hash ||
+      (configuredOrigin !== project.origin &&
+        configuredOrigin !== `${project.origin}/`) ||
+      (!local &&
+        (project.protocol !== "https:" ||
+          project.port ||
+          !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.supabase\.co$/.test(
+            project.hostname
+          ))) ||
+      (local && !["http:", "https:"].includes(project.protocol)) ||
+      url.origin !== project.origin ||
+      url.username ||
+      url.password ||
+      url.hash ||
+      value !== url.href ||
+      !/^\/storage\/v1\/object\/sign\/documents\/[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*\.pptx$/.test(
+        url.pathname
+      ) ||
+      !/^\?token=[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+&download=source\.pptx$/.test(
+        url.search
+      )
+    )
+      throw new PowerPointRenderingError();
+    return url.href;
+  } catch {
+    throw new PowerPointRenderingError();
+  }
+}
+
 /** PDF is a temporary visual reference; the repaired output remains the original OOXML package. */
 export async function renderPowerPointToPdf(
   buffer: Buffer,
-  timeoutMs = 60_000
+  timeoutMs = 60_000,
+  options: PowerPointRenderingOptions = {}
 ): Promise<Buffer> {
   if (!Number.isFinite(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000)
     throw new PowerPointRenderingError();
-  if (!buffer.length || buffer.length > MAX_FILE_SIZE_BYTES)
+  if (!buffer.length || buffer.length > MAX_PPTX_OUTPUT_SIZE_BYTES)
     throw new PowerPointRenderingError();
   let endpoint: URL;
   try {
@@ -66,13 +121,20 @@ export async function renderPowerPointToPdf(
   }
   endpoint.pathname = `${endpoint.pathname.replace(/\/+$/, "")}/forms/libreoffice/convert`;
   const form = new FormData();
-  form.append(
-    "files",
-    new Blob([new Uint8Array(buffer)], {
-      type: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    }),
-    "source.pptx"
-  );
+  if (options.downloadUrl !== undefined) {
+    form.append(
+      "downloadFrom",
+      JSON.stringify([{ url: validatedDownloadUrl(options.downloadUrl) }])
+    );
+  } else {
+    form.append(
+      "files",
+      new Blob([new Uint8Array(buffer)], {
+        type: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      }),
+      "source.pptx"
+    );
+  }
   form.append("exportHiddenSlides", "true");
   form.append("exportNotesPages", "false");
   form.append("exportNotes", "false");
@@ -96,7 +158,8 @@ export async function renderPowerPointToPdf(
     if (
       !response.ok ||
       !response.body ||
-      Number(response.headers.get("content-length") || 0) > MAX_FILE_SIZE_BYTES
+      Number(response.headers.get("content-length") || 0) >
+        MAX_PPTX_PREVIEW_PDF_SIZE_BYTES
     ) {
       void response.body?.cancel().catch(() => {});
       throw new PowerPointRenderingError();
@@ -119,7 +182,7 @@ export async function renderPowerPointToPdf(
         if (controller.signal.aborted) throw new PowerPointRenderingError();
         if (done) break;
         size += value.length;
-        if (size > MAX_FILE_SIZE_BYTES) {
+        if (size > MAX_PPTX_PREVIEW_PDF_SIZE_BYTES) {
           cancel();
           throw new PowerPointRenderingError();
         }
@@ -131,6 +194,9 @@ export async function renderPowerPointToPdf(
     }
     const pdf = Buffer.concat(chunks, size);
     if (!isPdfBuffer(pdf)) throw new PowerPointRenderingError();
+    console.info(
+      `[powerpoint] renderer transport=${options.downloadUrl === undefined ? "inline" : "stored"} pdf_bytes=${pdf.length}`
+    );
     return pdf;
   } catch {
     throw new PowerPointRenderingError();

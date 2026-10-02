@@ -4,7 +4,7 @@ import { useRef, useState, type DragEvent } from "react";
 import { Upload } from "lucide-react";
 import { cn } from "@/lib/utils";
 import DocumentProcessingNotice from "./document-processing-notice";
-import { MAX_FILE_SIZE_BYTES } from "@/lib/document-input";
+import { maxFileSizeForFilename } from "@/lib/document-input";
 import {
   DEFAULT_OUTPUT_TARGET,
   isSupportedOutputForFilename,
@@ -34,14 +34,14 @@ export default function FileUpload({
       (file) =>
         isSupportedOutputForFilename(file.name, outputTarget) &&
         file.size > 0 &&
-        file.size <= MAX_FILE_SIZE_BYTES
+        file.size <= maxFileSizeForFilename(file.name)
     );
     const rejected = fileList.length - accepted.length;
 
     if (rejected > 0) {
       setRejectHint(
         isPowerPoint
-          ? "Upload a PowerPoint (.pptx) file up to 4 MB. Empty files and older .ppt files are not supported."
+          ? "Upload a PowerPoint (.pptx) file up to 25 MB. Empty files and older .ppt files are not supported."
           : "Upload a PDF or Word (.docx) file up to 4 MB. Empty files are not supported."
       );
       setTimeout(() => setRejectHint(null), 3000);
@@ -99,7 +99,7 @@ export default function FileUpload({
         </p>
         <p className="text-xs text-muted-foreground">
           {isPowerPoint
-            ? "PowerPoint (.pptx) files up to 4 MB. Download the updated presentation after processing."
+            ? "PowerPoint (.pptx) files up to 25 MB and 60 slides. Complex presentations may still exceed processing limits."
             : "Word (.docx) and PDF files up to 4 MB and 60 PDF pages. Word files are converted automatically."}
         </p>
         <input

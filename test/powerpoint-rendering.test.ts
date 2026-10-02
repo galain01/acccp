@@ -2,7 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("server-only", () => ({}));
 
-import { MAX_FILE_SIZE_BYTES } from "@/lib/document-input";
+import {
+  MAX_PPTX_FILE_SIZE_BYTES,
+  MAX_PPTX_OUTPUT_SIZE_BYTES,
+  MAX_PPTX_PREVIEW_PDF_SIZE_BYTES,
+} from "@/lib/document-input";
 import {
   PowerPointRenderingError,
   renderPowerPointToPdf,
@@ -10,6 +14,9 @@ import {
 
 const pptx = Buffer.from("PK\x03\x04private presentation package bytes");
 const pdf = Buffer.from("%PDF-1.7\nslide preview\n%%EOF");
+const signedPath =
+  "/storage/v1/object/sign/documents/session/document/job/render-id.pptx?token=header.payload.signature&download=source.pptx";
+const signedUrl = `https://project.supabase.co${signedPath}`;
 const fetchMock = vi.fn<typeof fetch>();
 const controlledError = {
   name: "PowerPointRenderingError",
@@ -17,12 +24,14 @@ const controlledError = {
 };
 
 beforeEach(() => {
+  vi.spyOn(console, "info").mockImplementation(() => {});
   vi.stubGlobal("fetch", fetchMock);
   vi.stubEnv("GOTENBERG_URL", "https://renderer.example.test");
   vi.stubEnv("GOTENBERG_USERNAME", "test-user");
   vi.stubEnv("GOTENBERG_PASSWORD", "test-password");
   vi.stubEnv("NODE_ENV", "production");
   vi.stubEnv("VERCEL", "1");
+  vi.stubEnv("SUPABASE_URL", "https://project.supabase.co");
   fetchMock.mockReset().mockResolvedValue(new Response(pdf));
 });
 
@@ -69,6 +78,9 @@ describe("PowerPoint renderer request privacy", () => {
       "application/vnd.openxmlformats-officedocument.presentationml.presentation"
     );
     expect(Buffer.from(await file.arrayBuffer())).toEqual(pptx);
+    expect(console.info).toHaveBeenCalledWith(
+      `[powerpoint] renderer transport=inline pdf_bytes=${pdf.length}`
+    );
   });
 
   it("preserves a configured reverse-proxy base path", async () => {
@@ -77,6 +89,101 @@ describe("PowerPoint renderer request privacy", () => {
     expect(String(fetchMock.mock.calls[0][0])).toBe(
       "https://renderer.example.test/worker/forms/libreoffice/convert"
     );
+  });
+
+  it.each([MAX_PPTX_FILE_SIZE_BYTES, MAX_PPTX_OUTPUT_SIZE_BYTES])(
+    "renders a source or generated PPTX at its %s-byte boundary",
+    async (size) => {
+      const source = Buffer.alloc(size);
+      pptx.copy(source);
+      expect(await renderPowerPointToPdf(source)).toEqual(pdf);
+      const form = fetchMock.mock.calls[0][1]?.body as FormData;
+      expect((form.get("files") as File).size).toBe(size);
+    }
+  );
+
+  it("sends only a signed storage URL for a large already stored presentation", async () => {
+    const source = Buffer.alloc(MAX_PPTX_FILE_SIZE_BYTES);
+    pptx.copy(source);
+    expect(
+      await renderPowerPointToPdf(source, 60_000, { downloadUrl: signedUrl })
+    ).toEqual(pdf);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const form = fetchMock.mock.calls[0][1]?.body as FormData;
+    expect(form.has("files")).toBe(false);
+    expect(JSON.parse(form.get("downloadFrom") as string)).toEqual([
+      { url: signedUrl },
+    ]);
+    expect(form.get("exportHiddenSlides")).toBe("true");
+    expect(form.get("exportNotesPages")).toBe("false");
+    expect(console.info).toHaveBeenCalledWith(
+      `[powerpoint] renderer transport=stored pdf_bytes=${pdf.length}`
+    );
+  });
+
+  it.each([
+    "",
+    "not-a-url",
+    signedUrl.replace("https:", "http:"),
+    signedUrl.replace("project.supabase.co", "other.supabase.co"),
+    signedUrl.replace("project.supabase.co", "project.supabase.co.evil.test"),
+    signedUrl.replace(
+      "project.supabase.co",
+      "user:password@project.supabase.co"
+    ),
+    signedUrl.replace("project.supabase.co", "project.supabase.co@127.0.0.1"),
+    signedUrl.replace("project.supabase.co", "127.0.0.1"),
+    signedUrl.replace("/sign/documents/", "/public/documents/"),
+    signedUrl.replace("/sign/documents/", "/sign/other-bucket/"),
+    signedUrl.replace("/job/", "/job/../"),
+    signedUrl.replace("/job/", "/job%2F"),
+    signedUrl.replace("render-id.pptx", "render-id.pdf"),
+    signedUrl.replace("token=header.payload.signature", "token="),
+    signedUrl.replace("download=source.pptx", "download=private-title.pptx"),
+    `${signedUrl}&token=another.token.value`,
+    `${signedUrl}&redirect=https://evil.test`,
+    `${signedUrl}#private`,
+  ])(
+    "rejects untrusted download URL %s before calling the worker",
+    async (downloadUrl) => {
+      const error = await renderPowerPointToPdf(pptx, 60_000, {
+        downloadUrl,
+      }).catch((error) => error);
+      expect(error).toMatchObject(controlledError);
+      expect(String(error)).not.toContain(downloadUrl || "header.payload");
+      expect(fetchMock).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([
+    "",
+    "https://project.supabase.co.evil.test",
+    "https://user:password@project.supabase.co",
+    "https://project.supabase.co/subpath",
+    "https://project.supabase.co?secret=value",
+    "https://project.supabase.co:443",
+    "http://127.0.0.1:54321",
+    "https://192.168.0.1",
+  ])("rejects unsupported deployed storage origin %s", async (origin) => {
+    vi.stubEnv("SUPABASE_URL", origin);
+    await expect(
+      renderPowerPointToPdf(pptx, 60_000, { downloadUrl: signedUrl })
+    ).rejects.toMatchObject(controlledError);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("allows the configured loopback storage emulator only in local development", async () => {
+    vi.stubEnv("NODE_ENV", "development");
+    vi.stubEnv("VERCEL", "");
+    vi.stubEnv("SUPABASE_URL", "http://127.0.0.1:54321");
+    const downloadUrl = `http://127.0.0.1:54321${signedPath}`;
+    await expect(
+      renderPowerPointToPdf(pptx, 60_000, { downloadUrl })
+    ).resolves.toEqual(pdf);
+    vi.stubEnv("VERCEL", "1");
+    await expect(
+      renderPowerPointToPdf(pptx, 60_000, { downloadUrl })
+    ).rejects.toMatchObject(controlledError);
   });
 
   it.each([
@@ -229,7 +336,9 @@ describe("PowerPoint renderer response privacy and bounds", () => {
     const cancel = vi.fn();
     fetchMock.mockResolvedValue(
       new Response(new ReadableStream({ cancel }), {
-        headers: { "Content-Length": String(MAX_FILE_SIZE_BYTES + 1) },
+        headers: {
+          "Content-Length": String(MAX_PPTX_PREVIEW_PDF_SIZE_BYTES + 1),
+        },
       })
     );
     await expect(renderPowerPointToPdf(pptx)).rejects.toMatchObject(
@@ -244,7 +353,7 @@ describe("PowerPoint renderer response privacy and bounds", () => {
       const cancel = vi.fn();
       const stream = new ReadableStream<Uint8Array>({
         start(controller) {
-          controller.enqueue(new Uint8Array(MAX_FILE_SIZE_BYTES));
+          controller.enqueue(new Uint8Array(MAX_PPTX_PREVIEW_PDF_SIZE_BYTES));
           controller.enqueue(new Uint8Array(1));
         },
         cancel,
@@ -263,11 +372,11 @@ describe("PowerPoint renderer response privacy and bounds", () => {
   );
 
   it("accepts a PDF exactly at the limit", async () => {
-    const bytes = Buffer.alloc(MAX_FILE_SIZE_BYTES);
+    const bytes = Buffer.alloc(MAX_PPTX_PREVIEW_PDF_SIZE_BYTES);
     pdf.copy(bytes);
     fetchMock.mockResolvedValue(new Response(bytes));
     const output = await renderPowerPointToPdf(pptx);
-    expect(output.length).toBe(MAX_FILE_SIZE_BYTES);
+    expect(output.length).toBe(MAX_PPTX_PREVIEW_PDF_SIZE_BYTES);
     expect(output.equals(bytes)).toBe(true);
   });
 
@@ -393,7 +502,7 @@ describe("PowerPoint renderer time budgets", () => {
     expect(fetchMock.mock.calls[0][1]?.signal?.aborted).toBe(false);
   });
 
-  it.each([Buffer.alloc(0), Buffer.alloc(MAX_FILE_SIZE_BYTES + 1)])(
+  it.each([Buffer.alloc(0), Buffer.alloc(MAX_PPTX_OUTPUT_SIZE_BYTES + 1)])(
     "rejects invalid input length before uploading",
     async (bytes) => {
       await expect(renderPowerPointToPdf(bytes)).rejects.toMatchObject(

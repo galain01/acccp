@@ -52,6 +52,7 @@ import {
 } from "../lib/powerpoint-convert";
 import { createCanvas } from "@napi-rs/canvas";
 import { LiteLLMError } from "../lib/litellm";
+import { MAX_PPTX_FILE_SIZE_BYTES } from "../lib/document-input";
 
 const inspection: PptxInspection = {
   slideCount: 1,
@@ -85,7 +86,7 @@ const inspection: PptxInspection = {
     },
   ],
 };
-const input = Buffer.from("original-pptx");
+const input = Buffer.from("PK\x03\x04original-pptx");
 const output = Buffer.from("repaired-pptx");
 const plan = { slides: [{ slideNumber: 1 }], findings: [] };
 const audit = { reviewedSlides: [1], findingReviews: [], findings: [] };
@@ -158,6 +159,56 @@ beforeEach(() => {
 });
 
 describe("PowerPoint repair orchestration", () => {
+  it("uses the injected renderer for both original and repaired presentations", async () => {
+    const renderPowerPoint = vi
+      .fn()
+      .mockResolvedValue(Buffer.from("%PDF-test"));
+    const result = await convertPowerPoint(input, "test.pptx", {
+      renderPowerPoint,
+    });
+    expect(result).not.toHaveProperty("error");
+    expect(renderPowerPoint.mock.calls.map((call) => call[0])).toEqual([
+      input,
+      output,
+    ]);
+    expect(
+      renderPowerPoint.mock.calls.every(
+        (call) => call[1] > 0 && call[1] <= 60_000
+      )
+    ).toBe(true);
+    expect(mocks.render).not.toHaveBeenCalled();
+  });
+
+  it("uses the injected renderer when rechecking a selected revision", async () => {
+    mocks.call.mockReset().mockResolvedValue(resultCall(audit));
+    const renderPowerPoint = vi
+      .fn()
+      .mockResolvedValue(Buffer.from("%PDF-test"));
+    const result = await recheckPowerPointRevision(input, output, [], {
+      renderPowerPoint,
+    });
+    expect(result).not.toHaveProperty("error");
+    expect(renderPowerPoint.mock.calls.map((call) => call[0])).toEqual([
+      input,
+      output,
+    ]);
+    expect(mocks.render).not.toHaveBeenCalled();
+  });
+
+  it("rejects over-25 MiB sources before package inspection, rendering or model calls", async () => {
+    const oversized = Buffer.alloc(MAX_PPTX_FILE_SIZE_BYTES + 1);
+    input.copy(oversized);
+    expect(await convertPowerPoint(oversized, "large.pptx")).toHaveProperty(
+      "error"
+    );
+    expect(await recheckPowerPointRevision(oversized, output)).toHaveProperty(
+      "error"
+    );
+    expect(mocks.inspect).not.toHaveBeenCalled();
+    expect(mocks.render).not.toHaveBeenCalled();
+    expect(mocks.call).not.toHaveBeenCalled();
+  });
+
   it("returns native PPTX, keeps all billable calls, and uses independent PPTX prompts", async () => {
     const result = await convertPowerPoint(input, "test.pptx");
     expect(result).not.toHaveProperty("error");
@@ -177,6 +228,11 @@ describe("PowerPoint repair orchestration", () => {
       "Canvas HTML compatibility"
     );
     expect(mocks.render.mock.calls.map((c) => c[0])).toEqual([input, output]);
+    expect(
+      mocks.pages.mock.calls.every(
+        (call) => call[1].inputKind === "powerpoint-preview"
+      )
+    ).toBe(true);
     expect(mocks.call.mock.calls[1][1]).toContainEqual(
       expect.objectContaining({
         type: "text",

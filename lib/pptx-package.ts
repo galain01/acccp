@@ -11,6 +11,10 @@ import {
 import { SaxesParser } from "saxes";
 import { fromBufferPromise } from "yauzl";
 import { ZipFile } from "yazl";
+import {
+  MAX_PPTX_FILE_SIZE_BYTES,
+  MAX_PPTX_OUTPUT_SIZE_BYTES,
+} from "./document-input";
 import { appendPptxDescriptionSlides } from "./pptx-description-slides";
 import {
   buildTableCaptionPatch,
@@ -44,11 +48,13 @@ const MAIN_TYPE =
 const SLIDE_TYPE =
   "application/vnd.openxmlformats-officedocument.presentationml.slide+xml";
 const LIMITS = {
-  input: 4 * 1024 * 1024,
-  output: 4 * 1024 * 1024,
+  input: MAX_PPTX_FILE_SIZE_BYTES,
+  output: MAX_PPTX_OUTPUT_SIZE_BYTES,
   entries: 2000,
-  inflated: 64 * 1024 * 1024,
-  part: 16 * 1024 * 1024,
+  // Media can fill most of a 25 MiB package; keep expansion and XML bounded
+  // independently instead of scaling every parser limit with upload size.
+  inflated: 96 * 1024 * 1024,
+  part: 32 * 1024 * 1024,
   xml: 2 * 1024 * 1024,
   totalXml: 20 * 1024 * 1024,
   nodes: 50_000,
@@ -251,7 +257,7 @@ async function readParts(
   if (buffer.length === 0 || buffer.length > maxBytes)
     throw new PptxPackageError(
       "pptx_size_limit",
-      "PowerPoint files must be nonempty and no larger than 4 MB."
+      `PowerPoint files must be nonempty and no larger than ${maxBytes / 1024 / 1024} MB.`
     );
   if (buffer.length < 4 || buffer.readUInt32LE(0) !== 0x04034b50)
     return fail(
@@ -1451,7 +1457,9 @@ async function loadPackage(
 }
 
 export async function inspectPptx(buffer: Buffer): Promise<PptxInspection> {
-  return (await loadPackage(buffer)).inspection;
+  // Inspection also reopens generated exports. Source admission and repair
+  // remain bounded by the smaller upload limit.
+  return (await loadPackage(buffer, LIMITS.output)).inspection;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

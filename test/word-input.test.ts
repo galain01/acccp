@@ -6,6 +6,8 @@ import {
   PPTX_MIME_TYPE,
   isSupportedDocumentFilename,
   MAX_FILE_SIZE_BYTES,
+  MAX_PPTX_FILE_SIZE_BYTES,
+  maxFileSizeForFilename,
   validateDocumentInput,
 } from "@/lib/document-input";
 import {
@@ -79,11 +81,25 @@ describe("PowerPoint uploads and output destinations", () => {
       expect(isSupportedDocumentFilename(name)).toBe(false);
     }
     expect(validateDocumentInput(pdf, "lecture.pptx")).toMatch(/PowerPoint/);
-    const oversized = new Uint8Array(MAX_FILE_SIZE_BYTES + 1);
+    const oversized = new Uint8Array(MAX_PPTX_FILE_SIZE_BYTES + 1);
     oversized.set(zipEnvelope);
     expect(validateDocumentInput(oversized, "lecture.pptx")).toMatch(
       /too large/
     );
+  });
+
+  it("allows 25 MiB PowerPoint sources while keeping PDF and Word at 4 MiB", () => {
+    expect(maxFileSizeForFilename("lecture.PPTX")).toBe(25 * 1024 * 1024);
+    expect(maxFileSizeForFilename("lecture.docx")).toBe(4 * 1024 * 1024);
+    expect(maxFileSizeForFilename("lecture.pdf")).toBe(4 * 1024 * 1024);
+    const allowed = new Uint8Array(MAX_PPTX_FILE_SIZE_BYTES);
+    allowed.set(zipEnvelope);
+    expect(validateDocumentInput(allowed, "lecture.PPTX")).toBeNull();
+    const largeWord = allowed.subarray(0, MAX_FILE_SIZE_BYTES + 1);
+    expect(validateDocumentInput(largeWord, "lecture.docx")).toMatch(/4 MB/);
+    const largePdf = new Uint8Array(MAX_FILE_SIZE_BYTES + 1);
+    largePdf.set(pdf);
+    expect(validateDocumentInput(largePdf, "lecture.pdf")).toMatch(/4 MB/);
   });
 
   it("exposes only implemented input and output combinations", () => {
