@@ -29,7 +29,7 @@ For a PowerPoint larger than 4 MiB, `lib/powerpoint-render-storage.ts` creates a
 
 The application attempts to delete the temporary copy immediately after rendering, including on failure. Its receipt remains discoverable by document purge if deletion fails. This path also renders large selected exports. Smaller presentations retain the multipart renderer path.
 
-The generated PDF still travels back from the renderer to the application, where its header and streamed size are checked against 16 MiB. **A hosted renderer response larger than 4.5 MB has not yet been verified.** That transport must be tested on the intended deployment before release; a successful local conversion does not establish that the hosted response path accepts it.
+The generated PDF still travels back from the renderer to the application, where its header and streamed size are checked against 16 MiB. On **2026-10-02**, a hosted production test with a synthetic 9.6 MB PowerPoint completed direct upload, conversion, and a checked export. Sanitized renderer logs recorded PDF responses of **7,207,949 and 7,208,109 bytes**, both above 4.5 MiB, using the stored-file transport. Metadata confirmed that all four temporary render copies from this test had been deleted. A separate **23,471,347-byte (22.4 MiB)** presentation also completed direct upload, conversion, and download on production. These measurements verify the tested sizes; the configured 16 MiB PDF ceiling was not exercised.
 
 ## Retention and abandoned uploads
 
