@@ -577,7 +577,7 @@ describe("Error handling", () => {
     );
 
     await expect(callLiteLLM("system", "user", CONFIG)).rejects.toThrow(
-      "LiteLLM error 500: HTML conversion stopped. The AI service is temporarily unavailable. Try again later."
+      "LiteLLM error 500: Document conversion stopped. The AI service is temporarily unavailable. Try again later."
     );
   });
 

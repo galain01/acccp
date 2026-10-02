@@ -212,7 +212,8 @@ function providerDiagnosticHeaders(response: Response): Partial<JobDiagnostic> {
 export async function callLiteLLM(
   systemPrompt: string,
   userMessage: LiteLLMUserMessage,
-  config: LiteLLMConfig
+  config: LiteLLMConfig,
+  signal?: AbortSignal
 ): Promise<LiteLLMCallResult> {
   const startedAt = performance.now();
   const diagnosticFor = (code: DiagnosticCode, received?: Response) =>
@@ -228,6 +229,7 @@ export async function callLiteLLM(
   try {
     response = await fetch(`${config.baseUrl}/chat/completions`, {
       method: "POST",
+      ...(signal ? { signal } : {}),
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${config.apiKey}`,

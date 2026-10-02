@@ -11,6 +11,11 @@ vi.mock("@/lib/actions/documents", () => ({
   getDocumentHtml: vi.fn().mockResolvedValue("<h2>Saved result</h2>"),
 }));
 
+vi.mock("@/lib/actions/powerpoint-review", () => ({
+  getPowerPointReview: vi.fn().mockResolvedValue(null),
+  getPowerPointReviewPreview: vi.fn().mockResolvedValue(null),
+}));
+
 import ConversionResultDialog from "@/components/ui/conversion-result-dialog";
 import { getDocumentHtml } from "@/lib/actions/documents";
 

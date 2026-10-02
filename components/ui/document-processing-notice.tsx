@@ -3,15 +3,38 @@
 import { useId } from "react";
 import { Info } from "lucide-react";
 import { cn } from "@/lib/utils";
+import type { OutputTarget } from "@/lib/output-formats";
 
 export default function DocumentProcessingNotice({
   compact = false,
   className,
+  outputTarget = "canvas_html",
 }: {
   compact?: boolean;
   className?: string;
+  outputTarget?: OutputTarget;
 }): React.JSX.Element {
   const headingId = useId();
+
+  if (outputTarget === "accessible_pptx") {
+    return (
+      <aside
+        aria-labelledby={headingId}
+        className={cn("rounded-xl border bg-muted/50 p-4 text-sm", className)}
+      >
+        <h2 id={headingId} className="mb-2 flex items-center gap-2 font-medium">
+          <Info className="size-4 shrink-0" aria-hidden="true" />
+          Review the updated presentation
+        </h2>
+        <p className="leading-relaxed">
+          The tool makes supported accessibility improvements and lists items
+          that still need your attention by slide. Open the result in
+          PowerPoint, run its Accessibility Checker, and compare it with your
+          original before sharing it with students.
+        </p>
+      </aside>
+    );
+  }
 
   return (
     <aside

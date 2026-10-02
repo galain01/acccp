@@ -2,10 +2,19 @@ import { describe, expect, it } from "vitest";
 import {
   DOCX_MIME_TYPE,
   isDocxFilename,
+  isPptxFilename,
+  PPTX_MIME_TYPE,
   isSupportedDocumentFilename,
   MAX_FILE_SIZE_BYTES,
+  MAX_PPTX_FILE_SIZE_BYTES,
+  maxFileSizeForFilename,
   validateDocumentInput,
 } from "@/lib/document-input";
+import {
+  getOutputTargetForFilename,
+  isSupportedOutputForFilename,
+  outputFilename,
+} from "@/lib/output-formats";
 
 const zipEnvelope = new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0]);
 const pdf = new TextEncoder().encode("%PDF-1.7\n%%EOF");
@@ -57,6 +66,59 @@ describe("Word upload envelope validation", () => {
     expect(validateDocumentInput(allowed, "course.docx")).toBeNull();
     expect(validateDocumentInput(oversized, "course.docx")).toMatch(
       /too large/i
+    );
+  });
+});
+
+describe("PowerPoint uploads and output destinations", () => {
+  it("accepts PPTX case-insensitively without accepting older or macro-enabled presentations", () => {
+    expect(isPptxFilename("lecture.PPTX")).toBe(true);
+    expect(validateDocumentInput(zipEnvelope, "lecture.pptx")).toBeNull();
+    expect(PPTX_MIME_TYPE).toBe(
+      "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    );
+    for (const name of ["lecture.ppt", "lecture.pptm", "lecture.pptx.exe"]) {
+      expect(isSupportedDocumentFilename(name)).toBe(false);
+    }
+    expect(validateDocumentInput(pdf, "lecture.pptx")).toMatch(/PowerPoint/);
+    const oversized = new Uint8Array(MAX_PPTX_FILE_SIZE_BYTES + 1);
+    oversized.set(zipEnvelope);
+    expect(validateDocumentInput(oversized, "lecture.pptx")).toMatch(
+      /too large/
+    );
+  });
+
+  it("allows 25 MiB PowerPoint sources while keeping PDF and Word at 4 MiB", () => {
+    expect(maxFileSizeForFilename("lecture.PPTX")).toBe(25 * 1024 * 1024);
+    expect(maxFileSizeForFilename("lecture.docx")).toBe(4 * 1024 * 1024);
+    expect(maxFileSizeForFilename("lecture.pdf")).toBe(4 * 1024 * 1024);
+    const allowed = new Uint8Array(MAX_PPTX_FILE_SIZE_BYTES);
+    allowed.set(zipEnvelope);
+    expect(validateDocumentInput(allowed, "lecture.PPTX")).toBeNull();
+    const largeWord = allowed.subarray(0, MAX_FILE_SIZE_BYTES + 1);
+    expect(validateDocumentInput(largeWord, "lecture.docx")).toMatch(/4 MB/);
+    const largePdf = new Uint8Array(MAX_FILE_SIZE_BYTES + 1);
+    largePdf.set(pdf);
+    expect(validateDocumentInput(largePdf, "lecture.pdf")).toMatch(/4 MB/);
+  });
+
+  it("exposes only implemented input and output combinations", () => {
+    expect(getOutputTargetForFilename("lecture.pptx")).toBe("accessible_pptx");
+    expect(getOutputTargetForFilename("lecture.pdf")).toBe("canvas_html");
+    expect(
+      isSupportedOutputForFilename("lecture.pptx", "accessible_pptx")
+    ).toBe(true);
+    expect(isSupportedOutputForFilename("lecture.pptx", "canvas_html")).toBe(
+      false
+    );
+    expect(isSupportedOutputForFilename("lecture.docx", "canvas_html")).toBe(
+      true
+    );
+    expect(isSupportedOutputForFilename("lecture.pdf", "accessible_pptx")).toBe(
+      false
+    );
+    expect(outputFilename("Lecture.PPTX", "accessible_pptx")).toBe(
+      "Lecture-accessible.pptx"
     );
   });
 });

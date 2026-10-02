@@ -26,6 +26,26 @@ if [ "${#worker_port}" -gt 5 ] || [ "$worker_port" -lt 1 ] || [ "$worker_port" -
   exit 1
 fi
 
+# Only hosted Supabase signed document reads can become download sources.
+# Use a deny rule instead of an allow-list: Gotenberg allow-list matches bypass
+# private-IP validation. With no allow-list, DNS checks and pinning apply to
+# this URL and every redirect hop. Local/external workers keep downloads off.
+download_disabled=true
+download_denied='.*'
+supabase_origin="${SUPABASE_URL:-}"
+supabase_origin="${supabase_origin%/}"
+supabase_ref="${supabase_origin#https://}"
+supabase_ref="${supabase_ref%.supabase.co}"
+case "$supabase_ref" in
+  ''|*[!a-z0-9-]*|-*|*-) ;;
+  *)
+    if [ "$supabase_origin" = "https://$supabase_ref.supabase.co" ]; then
+      download_disabled=false
+      download_denied="^(?!https://$supabase_ref[.]supabase[.]co/storage/v1/object/sign/documents/[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*[.]pptx[?]token=[A-Za-z0-9_-]+[.][A-Za-z0-9_-]+[.][A-Za-z0-9_-]+&download=source[.]pptx$).*"
+    fi
+    ;;
+esac
+
 exec /usr/bin/env -i \
   PATH=/opt/java/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
   HOME=/home/gotenberg \
@@ -48,9 +68,13 @@ exec /usr/bin/env -i \
   API_ENABLE_BASIC_AUTH=true \
   GOTENBERG_API_BASIC_AUTH_USERNAME="$GOTENBERG_USERNAME" \
   GOTENBERG_API_BASIC_AUTH_PASSWORD="$GOTENBERG_PASSWORD" \
-  API_BODY_LIMIT=5MB \
+  API_BODY_LIMIT=32MB \
   API_TIMEOUT=60s \
-  API_DISABLE_DOWNLOAD_FROM=true \
+  API_DISABLE_DOWNLOAD_FROM="$download_disabled" \
+  API_DOWNLOAD_FROM_DENY_LIST="$download_denied" \
+  API_DOWNLOAD_FROM_DENY_PRIVATE_IPS=true \
+  API_DOWNLOAD_FROM_ENABLE_ENVIRONMENT_PROXY=false \
+  API_DOWNLOAD_FROM_MAX_RETRY=0 \
   API_ENABLE_DEBUG_ROUTE=false \
   LIBREOFFICE_AUTO_START=true \
   LIBREOFFICE_START_TIMEOUT=30s \

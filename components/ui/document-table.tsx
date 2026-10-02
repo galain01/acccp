@@ -2,9 +2,13 @@
 
 import { Lock, LockOpen, X } from "lucide-react";
 import { useState } from "react";
-import { isSupportedDocumentFilename } from "@/lib/document-input";
+import {
+  DEFAULT_OUTPUT_TARGET,
+  isSupportedOutputForFilename,
+} from "@/lib/output-formats";
 import { formatBytes, formatUploadTime } from "@/lib/format";
 import type { ConversionStatus, UploadedDocument } from "@/lib/types/document";
+import type { PowerPointReviewExport } from "@/lib/powerpoint-review-contract";
 import { Badge } from "./badge";
 import { Button } from "./button";
 import {
@@ -31,17 +35,34 @@ interface DocumentTableProps {
   onDeleteDocument: (docId: string) => void | Promise<void>;
   onReconvert: (docId: string) => void;
   isProcessing: boolean;
+  onReviewExport?: (documentId: string, result: PowerPointReviewExport) => void;
 }
 
-function statusBadge(status: ConversionStatus): React.JSX.Element {
+function statusBadge(
+  status: ConversionStatus,
+  isPowerPoint = false,
+  hasAccessibilityErrors = false,
+  uploading = false
+): React.JSX.Element {
   switch (status) {
     case "idle":
       return <Badge variant="outline">Ready</Badge>;
     case "queued":
       return <Badge variant="secondary">Queued</Badge>;
     case "processing":
-      return <Badge variant="processing">Processing</Badge>;
+      return (
+        <Badge variant="processing">
+          {uploading ? "Uploading" : "Processing"}
+        </Badge>
+      );
     case "success":
+      if (isPowerPoint) {
+        return (
+          <Badge variant={hasAccessibilityErrors ? "destructive" : "secondary"}>
+            {hasAccessibilityErrors ? "Needs a fix" : "Ready to review"}
+          </Badge>
+        );
+      }
       return (
         <Badge className="bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">
           Success
@@ -77,14 +98,17 @@ export default function DocumentTable({
   onDeleteDocument,
   onReconvert,
   isProcessing,
+  onReviewExport,
 }: DocumentTableProps): React.JSX.Element {
   const [selectedDocument, setSelectedDocument] =
     useState<UploadedDocument | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [resultViewId, setResultViewId] = useState(0);
 
   const openResult = (doc: UploadedDocument) => {
     if (doc.status !== "success" && doc.status !== "error") return;
     setSelectedDocument(doc);
+    setResultViewId((value) => value + 1);
     setDialogOpen(true);
   };
 
@@ -105,8 +129,8 @@ export default function DocumentTable({
         </CardHeader>
         <CardContent>
           <p className="text-sm text-muted-foreground">
-            Drag Word or PDF files onto the upload area above or click to
-            browse, then click{" "}
+            Choose an output format, then drag the matching files onto the
+            upload area above or click to browse, then click{" "}
             <strong className="font-medium text-foreground">Convert</strong> to
             start the conversion process.
           </p>
@@ -138,6 +162,7 @@ export default function DocumentTable({
                   <span className="sr-only">Conversion lock</span>
                 </TableHead>
                 <TableHead>Document name</TableHead>
+                <TableHead>Output format</TableHead>
                 <TableHead>Conversion status</TableHead>
                 <TableHead>File size</TableHead>
                 <TableHead>Upload time</TableHead>
@@ -150,7 +175,10 @@ export default function DocumentTable({
                   doc.status === "success" || doc.status === "error";
                 const canReconvert =
                   doc.status === "success" &&
-                  isSupportedDocumentFilename(doc.name);
+                  isSupportedOutputForFilename(
+                    doc.name,
+                    doc.outputTarget ?? DEFAULT_OUTPUT_TARGET
+                  );
 
                 return (
                   <TableRow key={doc.id}>
@@ -198,7 +226,17 @@ export default function DocumentTable({
                       )}
                     </TableCell>
                     <TableCell>
-                      {statusBadge(doc.status)}
+                      {doc.outputTarget === "accessible_pptx"
+                        ? "PowerPoint (.pptx)"
+                        : "Canvas HTML"}
+                    </TableCell>
+                    <TableCell>
+                      {statusBadge(
+                        doc.status,
+                        doc.outputTarget === "accessible_pptx",
+                        doc.errors?.some((issue) => issue.severity === "error"),
+                        doc.processingPhase === "uploading"
+                      )}
                       {issueBadges(doc)}
                     </TableCell>
                     <TableCell>{formatBytes(doc.size)}</TableCell>
@@ -257,12 +295,21 @@ export default function DocumentTable({
         </CardContent>
       </Card>
 
-      {/* Keyed so the fetched html resets when a different document is opened. */}
+      {/* Keyed to the conversion so a different result cannot reuse review choices. */}
       <ConversionResultDialog
-        key={selectedDocument?.id}
+        key={`${selectedDocument?.id}:${selectedDocument?.jobId ?? ""}:${resultViewId}`}
         document={selectedDocument}
         open={dialogOpen}
         onOpenChange={setDialogOpen}
+        onReviewExport={(result) => {
+          if (!selectedDocument) return;
+          setSelectedDocument({
+            ...selectedDocument,
+            errors: result.findings,
+            changes: result.changes,
+          });
+          onReviewExport?.(selectedDocument.id, result);
+        }}
       />
     </>
   );

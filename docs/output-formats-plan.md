@@ -1,7 +1,9 @@
 # Plan for selectable conversion outputs
 
-Status: proposed architecture, September 23, 2026. Canvas HTML is the only
-implemented output. This plan does not add a selector or change live behavior.
+Status: architecture updated September 24, 2026. Canvas HTML is deployed.
+The PowerPoint development branch implements a distinct PPTX-to-PPTX path and
+a selector for its supported source/output pairs; deployment and real-deck
+validation remain release steps. See [PowerPoint implementation](powerpoint-accessibility.md).
 
 ## Product goal
 
@@ -28,9 +30,9 @@ because Canvas was the first supported destination.
    adding an extra model call solely for architectural symmetry. Source review
    comments and HTML snippets are current Canvas mechanisms, not universal
    requirements for future outputs.
-4. Keep the UI focused on the working Canvas output until another destination is
-   tested. Do not add a nonfunctional accessible-PDF option or undertake a database
-   migration solely for future flexibility.
+4. Expose destinations only when their end-to-end implementation is tested. The
+   PowerPoint branch adds a real second path: PPTX input to repaired PPTX output.
+   Keep accessible PDF and standalone HTML out of the selector until implemented.
 
 ## Shared source preparation, separate output paths
 
@@ -42,6 +44,10 @@ not a complete editable reconstruction of the source document.
 - Canvas HTML: generate a Canvas-compatible fragment, normalize it, and audit
   fidelity/accessibility plus Canvas behavior. Image placeholders continue to
   require insertion under the current workflow.
+- PowerPoint: inspect and conservatively patch the original editable PPTX package.
+  Temporary PDF/images support interpretation and before/after comparison; they
+  do not replace the source package. Use dedicated PowerPoint repair/audit rules
+  and return remaining findings by slide/object.
 - Standalone HTML, future: generate a complete document with suitable title,
   language and heading structure, and package actual image assets. Audit the
   standalone output and its resources.
@@ -76,13 +82,18 @@ and [W3C PDF heading techniques](https://www.w3.org/WAI/WCAG22/Techniques/pdf/PD
 
 ## Data changes when a second output is ready
 
-Today `conversion_jobs` is unique per document, storage uses a fixed output.html
-key, the output artifact enum has html_output, and retrieval/results/UI assume
-HTML. Before enabling a selector:
+The PowerPoint branch adds output target/profile fields, PPTX source/output and
+review artifacts, target-aware upserts, job-specific PPTX keys, owned MIME-aware
+downloads and a destination-aware result UI. Legacy Canvas output.html keys stay
+valid. Both the original document-only unique constraint and the new composite
+constraint remain so old servers' upserts work during rollout; the supported
+inputs each have one destination. Before allowing two outputs of one source:
 
 - Give each source-to-destination conversion its own result identity, status,
   findings and output files. Creating a PDF result must not replace the source's
   Canvas result. Re-conversion should clearly identify which result is replaced.
+  Remove the legacy document-only uniqueness in a later migration after all
+  callers support the composite key; revise UI row identity for multiple outputs.
 - Add typed output artifacts and MIME-aware downloads; keep remediation output
   PDFs separate from source PDFs. Use destination/job-specific storage keys.
 - Record destination and profile version alongside model/prompt provenance.

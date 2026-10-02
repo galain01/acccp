@@ -22,6 +22,12 @@ vi.mock("@/lib/storage", () => ({
   sourcePdfKey: (session: string, id: string) => `${session}/${id}/source.pdf`,
   htmlOutputKey: (session: string, id: string) =>
     `${session}/${id}/output.html`,
+  sourcePptxKey: (session: string, id: string) =>
+    `${session}/${id}/source.pptx`,
+  pptxOutputKey: (session: string, id: string, job: string) =>
+    `${session}/${id}/${job}/output.pptx`,
+  outputReviewKey: (session: string, id: string, job: string) =>
+    `${session}/${id}/${job}/review.json`,
 }));
 
 import {
@@ -30,6 +36,7 @@ import {
   purgeDocumentIfEligible,
   purgeExpiredDocuments,
   retainedDocumentCondition,
+  eligibleDocumentCondition,
   withRetainedDocument,
 } from "@/lib/document-retention";
 import {
@@ -46,6 +53,7 @@ function chain(value: unknown = []) {
     from: vi.fn(),
     where: vi.fn(),
     innerJoin: vi.fn(),
+    leftJoin: vi.fn(),
     orderBy: vi.fn(),
     limit: vi.fn(),
     for: vi.fn(),
@@ -56,6 +64,7 @@ function chain(value: unknown = []) {
     "from",
     "where",
     "innerJoin",
+    "leftJoin",
     "orderBy",
     "limit",
     "for",
@@ -73,7 +82,7 @@ const document = {
   createdAt: "2026-09-01T00:00:00Z",
   deletedAt: null,
 };
-const keys = ["source.docx", "source.pdf", "output.html"].map(
+const keys = ["source.docx", "source.pdf", "source.pptx", "output.html"].map(
   (file) => `${document.sessionId}/${document.id}/${file}`
 );
 const queued = (...values: unknown[]) => {
@@ -124,7 +133,23 @@ describe("retained document lock", () => {
     expect(compiled).toContain('"documents"."created_at" > clock_timestamp()');
     expect(compiled).toContain("interval '336 hours'");
     expect(compiled).not.toContain("updated_at");
-    expect(compiled).not.toContain("expires_at");
+    expect(compiled).toContain('"documents"."upload_completed_at" is not null');
+    expect(compiled).toContain(
+      '"documents"."upload_expires_at" > clock_timestamp()'
+    );
+    expect(compiled).not.toContain('"conversion_jobs"');
+  });
+
+  it("keeps cleanup receipts through upload expiry and an in-flight allowance, including deleted documents", () => {
+    const compiled = query(eligibleDocumentCondition()).sql;
+    expect(compiled).toContain('"documents"."upload_expires_at" is null');
+    expect(compiled).toContain(
+      '"documents"."upload_expires_at" <= clock_timestamp()'
+    );
+    expect(compiled).toContain("interval '1 hour'");
+    expect(compiled).toContain('"documents"."upload_completed_at" is null');
+    expect(compiled).toContain('"documents"."deleted_at" is not null');
+    expect(compiled).toContain(" and ");
   });
 
   it("locks first, checks eligibility afterwards, then rechecks before commit", async () => {
@@ -221,7 +246,7 @@ describe("document purge", () => {
       [...keys, "legacy/a.html", "legacy/expired.txt"],
       { signal: expect.any(AbortSignal) }
     );
-    expect(artifactQuery.from).toHaveBeenCalledWith(artifacts);
+    expect(artifactQuery.from).toHaveBeenCalledWith(conversionJobs);
     expect(query(artifactQuery.where.mock.calls[0][0]).sql).not.toContain(
       "artifact_status"
     );
@@ -242,6 +267,28 @@ describe("document purge", () => {
     expect(writes[3].order).toBeLessThan(
       mocks.db.delete.mock.invocationCallOrder[0]
     );
+  });
+
+  it("removes job-specific PowerPoint output and review even without artifact metadata", async () => {
+    queued(
+      [document],
+      [{ id: document.id }],
+      [
+        { jobId: "job-pptx", storageKey: null },
+        { jobId: "job-legacy", storageKey: "legacy/output.pptx" },
+      ]
+    );
+    expect(await purgeDocumentIfEligible(document.id)).toBe("purged");
+    const root = `${document.sessionId}/${document.id}`;
+    expect(mocks.remove.mock.calls[0][0]).toEqual([
+      ...keys,
+      `${root}/job-pptx/output.pptx`,
+      `${root}/job-pptx/review.json`,
+      `${root}/job-legacy/output.pptx`,
+      `${root}/job-legacy/review.json`,
+      "legacy/output.pptx",
+    ]);
+    expect(archiveQueries()).toHaveLength(4);
   });
 
   it("still cleans orphaned sources when a document has no conversion job", async () => {
@@ -423,7 +470,7 @@ describe("document purge", () => {
     queued([document], [{ id: document.id }], legacy);
     expect(await purgeDocumentIfEligible(document.id)).toBe("purged");
     expect(mocks.remove.mock.calls.map(([batch]) => batch.length)).toEqual([
-      100, 100, 8,
+      100, 100, 9,
     ]);
     expect(mocks.remove.mock.calls.flatMap(([batch]) => batch)).toEqual([
       ...keys,

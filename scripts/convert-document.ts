@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { convertPdf } from "../lib/convert";
 import { isDocxFilename, validateDocumentInput } from "../lib/document-input";
+import { isSupportedOutputForFilename } from "../lib/output-formats";
 import { renderWordToPdf, WordToPdfError } from "../lib/word-to-pdf";
 import {
   WORD_RENDERING_REVIEW_MESSAGE,
@@ -19,6 +20,13 @@ async function main() {
   }
   const source = await readFile(input);
   const filename = path.basename(input);
+  if (!isSupportedOutputForFilename(filename, "canvas_html")) {
+    console.error(
+      "This command converts Word/PDF to Canvas HTML. Use scripts/convert-powerpoint.ts for PowerPoint output."
+    );
+    process.exitCode = 1;
+    return;
+  }
   const inputError = validateDocumentInput(source, filename);
   if (inputError) {
     console.error(inputError);

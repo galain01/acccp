@@ -74,6 +74,85 @@ afterEach(() => {
 });
 
 describe("bounded PDF renderer queue", () => {
+  it("counts queue time against an explicit rendering budget and waits for child close", async () => {
+    vi.useFakeTimers();
+    const first = renderPdfPages(request("first"));
+    const second = renderPdfPages(request("second"), {
+      timeoutMs: 10_000,
+    }).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(4_000);
+    closeSuccessfully(children[0]);
+    await first;
+    expect(children).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(5_999);
+    expect(children[1].kill).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(children[1].kill).toHaveBeenCalledWith("SIGKILL");
+    const third = renderPdfPages(request("third"));
+    expect(children).toHaveLength(2);
+    children[1].emit("close", null);
+    expect(await second).toMatchObject({
+      diagnostic: { code: "pdf_timeout", elapsedMs: 10_000 },
+    });
+    expect(children).toHaveLength(3);
+    closeSuccessfully(children[2]);
+    await third;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("expires a short caller budget in the queue without launching a child", async () => {
+    vi.useFakeTimers();
+    const first = renderPdfPages(request("first"));
+    const input = request("expired");
+    const encode = vi.spyOn(input, "toString");
+    const second = renderPdfPages(input, { timeoutMs: 500 }).catch(
+      (error: unknown) => error
+    );
+    await vi.advanceTimersByTimeAsync(500);
+    expect(await second).toMatchObject({
+      diagnostic: { code: "pdf_timeout", elapsedMs: 500 },
+    });
+    expect(encode).not.toHaveBeenCalled();
+    expect(children).toHaveLength(1);
+    expect(children[0].kill).not.toHaveBeenCalled();
+    closeSuccessfully(children[0]);
+    await first;
+    const replacement = renderPdfPages(request("replacement"), {
+      timeoutMs: 1000,
+    });
+    expect(children).toHaveLength(2);
+    closeSuccessfully(children[1]);
+    await replacement;
+  });
+
+  it("releases an admitted slot when its budget expires during request preparation", async () => {
+    vi.useFakeTimers();
+    const input = request("slow-to-encode");
+    const original = input.toString.bind(input);
+    vi.spyOn(input, "toString").mockImplementation((encoding, start, end) => {
+      vi.advanceTimersByTime(100);
+      return original(encoding, start, end);
+    });
+    await expect(
+      renderPdfPages(input, { timeoutMs: 50 })
+    ).rejects.toMatchObject({ diagnostic: { code: "pdf_timeout" } });
+    expect(children).toHaveLength(0);
+    const replacement = renderPdfPages(request("replacement"));
+    expect(children).toHaveLength(1);
+    closeSuccessfully(children[0]);
+    await replacement;
+  });
+
+  it.each([0, -1, NaN, Infinity, 120_001])(
+    "rejects invalid caller budget %s before admission",
+    async (timeoutMs) => {
+      await expect(
+        renderPdfPages(request("invalid"), { timeoutMs })
+      ).rejects.toBeInstanceOf(RangeError);
+      expect(children).toHaveLength(0);
+    }
+  );
+
   it("runs one child at a time in FIFO order and delays base64 allocation until admission", async () => {
     const secondInput = request("second");
     const secondEncode = vi.spyOn(secondInput, "toString");
@@ -160,7 +239,9 @@ describe("bounded PDF renderer queue", () => {
     expect(children).toHaveLength(2);
     await vi.advanceTimersByTimeAsync(30_000);
     expect(children[1].kill).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(PDF_RENDERING_LIMITS.timeoutMs - 30_000 - 1);
+    await vi.advanceTimersByTimeAsync(
+      PDF_RENDERING_LIMITS.timeoutMs - 30_000 - 1
+    );
     expect(children[1].kill).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
     expect(children[1].kill).toHaveBeenCalledWith("SIGKILL");

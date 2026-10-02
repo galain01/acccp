@@ -1,5 +1,6 @@
 /** Data-only, bounded diagnostics. No provider messages or arbitrary metadata. */
 export const DIAGNOSTIC_STAGES = [
+  "pptx_prepare",
   "word_to_pdf",
   "pdf_render",
   "conversion",
@@ -10,6 +11,10 @@ export const DIAGNOSTIC_STAGES = [
 export type DiagnosticStage = (typeof DIAGNOSTIC_STAGES)[number];
 
 export const DIAGNOSTIC_CODES = [
+  "pptx_invalid",
+  "pptx_render_failed",
+  "pptx_visual_change",
+  "pptx_invalid_plan",
   "unknown_error",
   "provider_configuration",
   "provider_auth",
@@ -154,9 +159,10 @@ export function readJobDiagnostic(input: unknown): JobDiagnostic | null {
 }
 
 const STAGE_LABELS: Record<DiagnosticStage, string> = {
+  pptx_prepare: "PowerPoint preparation",
   word_to_pdf: "Word-to-PDF conversion",
   pdf_render: "PDF page preparation",
-  conversion: "HTML conversion",
+  conversion: "Document conversion",
   audit: "Accessibility check",
   save_output: "Saving results",
   unknown: "Document processing",
@@ -166,6 +172,14 @@ export function diagnosticStageLabel(stage: DiagnosticStage): string {
 }
 
 const EXPLANATIONS: Record<DiagnosticCode, string> = {
+  pptx_invalid:
+    "The app could not safely read this presentation. Use an unprotected .pptx file under 4 MB, with at most 60 slides. Macro-enabled and digitally signed files are not supported.",
+  pptx_render_failed:
+    "The app could not prepare all PowerPoint slides for visual checking. Try a smaller presentation or contact the administrator if this continues.",
+  pptx_visual_change:
+    "The proposed repairs changed the slide appearance during verification. No repaired presentation was saved. Try reviewing this deck in PowerPoint.",
+  pptx_invalid_plan:
+    "The AI service did not return a complete, usable PowerPoint repair plan. Try again or contact the administrator.",
   unknown_error:
     "The app could not finish this step. Try again; if the problem continues, contact the app administrator.",
   provider_configuration:

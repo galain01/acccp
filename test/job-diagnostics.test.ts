@@ -54,7 +54,7 @@ describe("safe saved job diagnostics", () => {
     const diagnostic = createJobDiagnostic({ stage: "conversion", code });
     expect(readJobDiagnostic(diagnostic)).toEqual(diagnostic);
     expect(describeJobDiagnostic(diagnostic)).toMatch(
-      /^HTML conversion stopped\. .+/
+      /^Document conversion stopped\. .+/
     );
   });
 

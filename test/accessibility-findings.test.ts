@@ -18,6 +18,17 @@ const finding: AccessibilityError = {
 };
 
 describe("validated source locations", () => {
+  it("retains only the supported slide marker and still bounds slide numbers", () => {
+    expect(
+      readFindingLocation({ sourceKind: "slide", sourcePages: [2] }, 3)
+    ).toMatchObject({ sourceKind: "slide", sourcePages: [2] });
+    expect(
+      readFindingLocation({ sourceKind: "slide", sourcePages: [4] }, 3)
+    ).toMatchObject({ sourceKind: "slide", sourcePages: null });
+    expect(
+      readFindingLocation({ sourceKind: "arbitrary", sourcePages: [2] }, 3)
+    ).not.toHaveProperty("sourceKind");
+  });
   it("sorts physical pages and retains a separate printed label and nearby text", () => {
     expect(
       readFindingLocation(

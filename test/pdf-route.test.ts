@@ -14,10 +14,12 @@ vi.mock("server-only", () => ({}));
 const mocks = vi.hoisted(() => ({
   auth: vi.fn(),
   convert: vi.fn(),
+  convertPowerPoint: vi.fn(),
   renderWord: vi.fn(),
   countPages: vi.fn(),
   upload: vi.fn(),
   download: vi.fn(),
+  finalizeUpload: vi.fn(),
   remove: vi.fn(),
   withRetainedDocument: vi.fn(),
   purgeDocumentIfEligible: vi.fn(),
@@ -31,7 +33,21 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@/lib/auth", () => ({ verifyRoleOrUnauthorized: mocks.auth }));
+vi.mock("@/lib/document-upload", () => ({
+  readAndFinalizePowerPointUpload: mocks.finalizeUpload,
+  DocumentUploadError: class extends Error {
+    constructor(
+      message: string,
+      readonly status: number
+    ) {
+      super(message);
+    }
+  },
+}));
 vi.mock("@/lib/convert", () => ({ convertPdf: mocks.convert }));
+vi.mock("@/lib/powerpoint-convert", () => ({
+  convertPowerPoint: mocks.convertPowerPoint,
+}));
 vi.mock("@/lib/pdf-page-count", () => ({ countPdfPages: mocks.countPages }));
 vi.mock("@/lib/word-to-pdf", async () => ({
   ...(await vi.importActual<typeof import("@/lib/word-to-pdf")>(
@@ -60,9 +76,16 @@ vi.mock("@/lib/storage", () => ({
     `${sessionId}/${documentId}/source.pdf`,
   htmlOutputKey: (sessionId: string, documentId: string) =>
     `${sessionId}/${documentId}/output.html`,
+  sourcePptxKey: (sessionId: string, documentId: string) =>
+    `${sessionId}/${documentId}/source.pptx`,
+  pptxOutputKey: (sessionId: string, documentId: string, jobId: string) =>
+    `${sessionId}/${documentId}/${jobId}/output.pptx`,
+  outputReviewKey: (sessionId: string, documentId: string, jobId: string) =>
+    `${sessionId}/${documentId}/${jobId}/review.json`,
 }));
 
 import { POST } from "@/app/api/convert/route";
+import { DocumentUploadError } from "@/lib/document-upload";
 import { DocumentUnavailableError } from "@/lib/document-retention";
 import { WordToPdfError } from "@/lib/word-to-pdf";
 import { WORD_RENDERING_REVIEW_MESSAGE } from "@/lib/word-rendering-review";
@@ -75,7 +98,11 @@ import {
   modelCalls,
   validationFindings,
 } from "@/lib/db/schema";
-import { DOCX_MIME_TYPE, MAX_FILE_SIZE_BYTES } from "@/lib/document-input";
+import {
+  DOCX_MIME_TYPE,
+  PPTX_MIME_TYPE,
+  MAX_FILE_SIZE_BYTES,
+} from "@/lib/document-input";
 
 const PDF = "%PDF-1.7\nsynthetic test content\n%%EOF";
 // Route validation checks the ZIP envelope; the mocked worker owns parsing.
@@ -98,6 +125,7 @@ function chain(value: unknown = []) {
     values: vi.fn(),
     set: vi.fn(),
     onConflictDoUpdate: vi.fn(),
+    onConflictDoNothing: vi.fn(),
     returning: vi.fn().mockResolvedValue(value),
     then: Promise.resolve(value).then.bind(Promise.resolve(value)),
   };
@@ -107,6 +135,7 @@ function chain(value: unknown = []) {
     builder.values,
     builder.set,
     builder.onConflictDoUpdate,
+    builder.onConflictDoNothing,
   ]) {
     method.mockReturnValue(builder);
   }
@@ -118,10 +147,13 @@ function request(
     name?: string;
     contents?: string;
     documentId?: string;
+    outputTarget?: string;
   } = {}
 ) {
   const form = new FormData();
   form.set("sessionId", "session-1");
+  if (options.outputTarget !== undefined)
+    form.set("outputTarget", options.outputTarget);
   if (options.documentId) {
     form.set("documentId", options.documentId);
   } else {
@@ -178,7 +210,11 @@ describe("document conversion route", () => {
       );
     mocks.purgeDocumentIfEligible.mockResolvedValue("purged");
     mocks.auth.mockResolvedValue({ session: { user: { id: "user-1" } } });
-    mocks.db.select.mockReturnValue(chain([{ id: "session-1" }]));
+    mocks.db.select.mockImplementation((fields) =>
+      fields?.attemptNumber
+        ? chain([{ attemptNumber: 2 }])
+        : chain([{ id: "session-1" }])
+    );
     mocks.db.insert.mockImplementation((table: unknown) => {
       const result =
         table === documents
@@ -199,6 +235,22 @@ describe("document conversion route", () => {
     mocks.upload.mockResolvedValue(undefined);
     mocks.remove.mockResolvedValue(undefined);
     mocks.download.mockResolvedValue(Buffer.from(PDF));
+    mocks.finalizeUpload
+      .mockReset()
+      .mockImplementation(
+        async ({
+          sessionId,
+          documentId,
+        }: {
+          sessionId: string;
+          documentId: string;
+        }) => ({
+          buffer: await mocks.download(
+            `${sessionId}/${documentId}/source.pptx`
+          ),
+          filename: "slides.pptx",
+        })
+      );
     mocks.renderWord.mockResolvedValue(Buffer.from(PDF));
     mocks.countPages.mockResolvedValue(8);
     mocks.convert.mockResolvedValue({
@@ -209,8 +261,267 @@ describe("document conversion route", () => {
       extractionWarnings: [],
       calls: [usage],
     });
+    mocks.convertPowerPoint.mockResolvedValue({
+      pptx: Buffer.from("PK\x03\x04remediated presentation"),
+      errors: [],
+      changes: ["Slide 2: added a title for navigation."],
+      model: usage.model,
+      tokensUsed: 150,
+      extractionWarnings: [],
+      calls: [usage],
+      pageCount: 6,
+    });
     vi.spyOn(console, "log").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  it("stores native PowerPoint output, its review and all usage on a separate target", async () => {
+    const response = await POST(
+      request({
+        name: "slides.PPTX",
+        contents: DOCX,
+        outputTarget: "accessible_pptx",
+      })
+    );
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toMatchObject({
+      documentId: "doc-1",
+      jobId: "job-1",
+      outputTarget: "accessible_pptx",
+      changes: ["Slide 2: added a title for navigation."],
+    });
+    expect(body).not.toHaveProperty("html");
+    expect(body).not.toHaveProperty("pptx");
+    expect(mocks.convertPowerPoint).toHaveBeenCalledWith(
+      Buffer.from(DOCX),
+      "slides.PPTX",
+      expect.objectContaining({ renderPowerPoint: expect.any(Function) })
+    );
+    expect(mocks.convert).not.toHaveBeenCalled();
+    expect(mocks.renderWord).not.toHaveBeenCalled();
+    expect(mocks.countPages).not.toHaveBeenCalled();
+    expect(mocks.upload.mock.calls.map(([key]) => key)).toEqual([
+      "session-1/doc-1/source.pptx",
+      "session-1/doc-1/job-1/output.pptx",
+      "session-1/doc-1/job-1/review.json",
+    ]);
+    expect(mocks.upload.mock.calls[0][2]).toBe(PPTX_MIME_TYPE);
+    expect(mocks.upload.mock.calls[1][2]).toBe(PPTX_MIME_TYPE);
+    expect(artifactValues().map((value) => value.artifactType)).toEqual([
+      "source_pptx",
+      "pptx_output",
+      "review_metadata",
+    ]);
+    expect(inserted.get(conversionJobs)?.values).toHaveBeenCalledWith(
+      expect.objectContaining({
+        outputTarget: "accessible_pptx",
+        profileVersion: "powerpoint-v1",
+        expiresAt: "2026-09-15T00:00:00.000Z",
+      })
+    );
+    expect(
+      inserted.get(conversionJobs)?.onConflictDoUpdate.mock.calls[0][0].target
+    ).toEqual([conversionJobs.documentId, conversionJobs.outputTarget]);
+    expect(updated.set).toHaveBeenLastCalledWith(
+      expect.objectContaining({ pageCount: 6, status: "completed" })
+    );
+    expect(inserted.get(modelCalls)?.values).toHaveBeenCalledWith([
+      expect.objectContaining({ ...usage, jobId: "job-1", costUsd: "0.001" }),
+    ]);
+    expect(
+      inserted.get(jobEvents)?.values.mock.calls[0][0].metadata.changes
+    ).toEqual(body.changes);
+  });
+
+  it.each([
+    ["course.pdf", PDF, "accessible_pptx"],
+    ["course.docx", DOCX, "accessible_pptx"],
+    ["course.pptx", DOCX, "canvas_html"],
+  ])(
+    "rejects mismatched source %s and target %s before storing content",
+    async (name, contents, outputTarget) => {
+      expect(
+        (await POST(request({ name, contents, outputTarget }))).status
+      ).toBe(415);
+      expect(mocks.db.insert).not.toHaveBeenCalled();
+      expect(mocks.convertPowerPoint).not.toHaveBeenCalled();
+      expect(mocks.convert).not.toHaveBeenCalled();
+    }
+  );
+
+  it("rejects unsupported targets and does not silently infer a new destination", async () => {
+    expect(
+      (await POST(request({ outputTarget: "accessible_pdf" }))).status
+    ).toBe(400);
+    expect(
+      (await POST(request({ name: "slides.pptx", contents: DOCX }))).status
+    ).toBe(415);
+    expect(mocks.convertPowerPoint).not.toHaveBeenCalled();
+  });
+
+  it("reconverts the owned original PowerPoint without overwriting it", async () => {
+    ownedDocument("slides.pptx");
+    mocks.download.mockResolvedValueOnce(Buffer.from(DOCX));
+    const response = await POST(
+      request({ documentId: "doc-1", outputTarget: "accessible_pptx" })
+    );
+    expect(response.status).toBe(200);
+    expect(mocks.download).toHaveBeenCalledWith("session-1/doc-1/source.pptx");
+    expect(inserted.has(documents)).toBe(false);
+    expect(mocks.upload.mock.calls.map(([key]) => key)).toEqual([
+      "session-1/doc-1/job-1/output.pptx",
+      "session-1/doc-1/job-1/review.json",
+    ]);
+  });
+
+  it("preserves old reviewed-output storage keys as retired discovery rows before reconversion upserts", async () => {
+    ownedDocument("slides.pptx");
+    mocks.download.mockResolvedValueOnce(Buffer.from(DOCX));
+    const retired = chain();
+    mocks.db.update.mockImplementation((table) =>
+      table === artifacts ? retired : updated
+    );
+    const response = await POST(
+      request({ documentId: "doc-1", outputTarget: "accessible_pptx" })
+    );
+    expect(response.status).toBe(200);
+    // Changing only status keeps review-UUID.pptx/.json paths discoverable for purge.
+    expect(retired.set).toHaveBeenCalledWith({ artifactStatus: "expired" });
+    const predicate = new PgDialect().sqlToQuery(
+      retired.where.mock.calls[0][0] as SQL
+    );
+    expect(predicate.params).toEqual(
+      expect.arrayContaining([
+        "job-1",
+        "pptx_output",
+        "review_metadata",
+        "available",
+      ])
+    );
+    const firstArtifactInsertIndex = mocks.db.insert.mock.calls.findIndex(
+      ([table]) => table === artifacts
+    );
+    expect(retired.set.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.db.insert.mock.invocationCallOrder[firstArtifactInsertIndex]
+    );
+    expect(
+      mocks.db.delete.mock.calls.some(([table]) => table === artifacts)
+    ).toBe(false);
+  });
+
+  it("converts a 25 MB PowerPoint by owned storage reference without re-uploading it", async () => {
+    ownedDocument("slides.pptx");
+    const large = Buffer.alloc(25 * 1024 * 1024);
+    large.write("PK\x03\x04");
+    mocks.finalizeUpload.mockResolvedValueOnce({
+      buffer: large,
+      filename: "slides.pptx",
+    });
+    const response = await POST(
+      request({ documentId: "doc-1", outputTarget: "accessible_pptx" })
+    );
+    expect(response.status).toBe(200);
+    expect(mocks.finalizeUpload).toHaveBeenCalledWith({
+      userId: "user-1",
+      sessionId: "session-1",
+      documentId: "doc-1",
+    });
+    expect(mocks.convertPowerPoint).toHaveBeenCalledTimes(1);
+    expect(mocks.convertPowerPoint.mock.calls[0][0]).toBe(large);
+    expect(mocks.convertPowerPoint.mock.calls[0][1]).toBe("slides.pptx");
+    expect(inserted.has(documents)).toBe(false);
+    expect(mocks.upload.mock.calls.map(([key]) => key)).not.toContain(
+      "session-1/doc-1/source.pptx"
+    );
+  });
+
+  it("does not call the model for incomplete or mismatched direct uploads", async () => {
+    ownedDocument("slides.pptx");
+    mocks.finalizeUpload.mockRejectedValueOnce(
+      new DocumentUploadError(
+        "The upload did not finish. Upload the presentation again.",
+        409
+      )
+    );
+    const response = await POST(
+      request({ documentId: "doc-1", outputTarget: "accessible_pptx" })
+    );
+    expect(response.status).toBe(409);
+    expect(mocks.convertPowerPoint).not.toHaveBeenCalled();
+    expect(mocks.db.insert).not.toHaveBeenCalled();
+  });
+
+  it("rejects a duplicate start while the same presentation is processing", async () => {
+    ownedDocument("slides.pptx");
+    mocks.download.mockResolvedValueOnce(Buffer.from(DOCX));
+    mocks.db.select.mockReturnValueOnce(chain([{ status: "processing" }]));
+    const response = await POST(
+      request({ documentId: "doc-1", outputTarget: "accessible_pptx" })
+    );
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ documentId: "doc-1" });
+    expect(mocks.convertPowerPoint).not.toHaveBeenCalled();
+    expect(mocks.db.insert).not.toHaveBeenCalled();
+  });
+
+  it("keeps large files out of the legacy multipart endpoint", async () => {
+    const response = await POST(
+      request({
+        name: "slides.pptx",
+        contents: "PK\x03\x04" + "a".repeat(MAX_FILE_SIZE_BYTES),
+        outputTarget: "accessible_pptx",
+      })
+    );
+    expect(response.status).toBe(413);
+    expect(mocks.convertPowerPoint).not.toHaveBeenCalled();
+    expect(mocks.db.insert).not.toHaveBeenCalled();
+  });
+
+  it("rejects mismatched stored sources before downloading them", async () => {
+    ownedDocument("slides.pptx");
+    expect(
+      (
+        await POST(
+          request({ documentId: "doc-1", outputTarget: "canvas_html" })
+        )
+      ).status
+    ).toBe(415);
+    expect(mocks.download).not.toHaveBeenCalled();
+    expect(mocks.db.insert).not.toHaveBeenCalled();
+  });
+
+  it("retains usage and controlled diagnostics when a PowerPoint job fails", async () => {
+    mocks.convertPowerPoint.mockResolvedValueOnce({
+      error: "Failed",
+      stage: "conversion",
+      diagnostic: createJobDiagnostic({
+        stage: "pptx_prepare",
+        code: "pptx_visual_change",
+      }),
+      calls: [usage],
+    });
+    const response = await POST(
+      request({
+        name: "slides.pptx",
+        contents: DOCX,
+        outputTarget: "accessible_pptx",
+      })
+    );
+    expect(response.status).toBe(500);
+    expect(await response.json()).toMatchObject({
+      documentId: "doc-1",
+      jobId: "job-1",
+      outputTarget: "accessible_pptx",
+    });
+    expect(artifactValues()).toEqual([]);
+    expect(mocks.upload.mock.calls.map(([key]) => key)).toEqual([
+      "session-1/doc-1/source.pptx",
+    ]);
+    expect(inserted.get(modelCalls)?.values).toHaveBeenCalledWith([
+      expect.objectContaining({ jobId: "job-1", costUsd: "0.001" }),
+    ]);
+    expect(inserted.get(dailyFailureMetrics)).toBeDefined();
   });
 
   it("stores the PDF, accessible HTML, findings, and billed model usage", async () => {
@@ -287,7 +598,7 @@ describe("document conversion route", () => {
       }),
     ]);
     expect(inserted.get(modelCalls)?.values).toHaveBeenCalledWith([
-      { jobId: "job-1", ...usage, costUsd: "0.001" },
+      { id: expect.any(String), jobId: "job-1", ...usage, costUsd: "0.001" },
     ]);
   });
 
@@ -639,7 +950,7 @@ describe("document conversion route", () => {
       })
     );
     expect(inserted.get(modelCalls)?.values).toHaveBeenCalledWith([
-      { jobId: "job-1", ...usage, costUsd: "0.001" },
+      { id: expect.any(String), jobId: "job-1", ...usage, costUsd: "0.001" },
     ]);
   });
 
@@ -703,7 +1014,7 @@ describe("document conversion route", () => {
       })
     );
     expect(inserted.get(modelCalls)?.values).toHaveBeenCalledWith([
-      { jobId: "job-1", ...usage, costUsd: "0.001" },
+      { id: expect.any(String), jobId: "job-1", ...usage, costUsd: "0.001" },
     ]);
     expect(mocks.db.delete).not.toHaveBeenCalled();
     expect(mocks.upload.mock.calls.map(([key]) => key)).toEqual([
@@ -740,7 +1051,7 @@ describe("document conversion route", () => {
         })
       );
       expect(inserted.get(modelCalls)?.values).toHaveBeenCalledWith([
-        { jobId: "job-1", ...usage, costUsd: "0.001" },
+        { id: expect.any(String), jobId: "job-1", ...usage, costUsd: "0.001" },
       ]);
       expect(inserted.get(jobEvents)?.values).toHaveBeenCalledWith(
         expect.objectContaining({ eventType: "output_storage_failed" })
@@ -901,6 +1212,118 @@ describe("document conversion route", () => {
     expect(mocks.db.insert).not.toHaveBeenCalled();
   });
 
+  it.each(["pdf", "docx", "pptx"])(
+    "does not publish an older successful %s attempt over a newer conversion",
+    async (extension) => {
+      ownedDocument(`course.${extension}`);
+      if (extension !== "pdf")
+        mocks.download.mockResolvedValueOnce(Buffer.from(DOCX));
+      const result = {
+        ...(extension === "pptx"
+          ? { pptx: Buffer.from(DOCX), changes: [], pageCount: 1 }
+          : { html: "<h2>Older result</h2>" }),
+        errors: [],
+        model: usage.model,
+        tokensUsed: 150,
+        extractionWarnings: [],
+        calls: [usage],
+      };
+      const converter =
+        extension === "pptx" ? mocks.convertPowerPoint : mocks.convert;
+      converter.mockImplementationOnce(async () => {
+        mocks.db.select.mockReturnValueOnce(chain([{ attemptNumber: 3 }]));
+        return result;
+      });
+      const response = await POST(
+        request({
+          documentId: "doc-1",
+          outputTarget:
+            extension === "pptx" ? "accessible_pptx" : "canvas_html",
+        })
+      );
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({
+        documentId: "doc-1",
+        jobId: "job-1",
+      });
+      expect(mocks.upload).not.toHaveBeenCalled();
+      expect(mocks.db.update).not.toHaveBeenCalled();
+      expect(mocks.db.delete).not.toHaveBeenCalled();
+      expect(artifactValues()).toEqual([]);
+      expect(inserted.get(jobEvents)).toBeUndefined();
+      expect(inserted.get(dailyFailureMetrics)).toBeUndefined();
+      expect(inserted.get(modelCalls)?.values).toHaveBeenCalledWith([
+        expect.objectContaining({
+          jobId: "job-1",
+          promptTokens: 100,
+          costUsd: "0.001",
+        }),
+      ]);
+      expect(
+        inserted.get(modelCalls)?.onConflictDoNothing
+      ).toHaveBeenCalledWith({ target: modelCalls.id });
+    }
+  );
+
+  it("does not mark a newer PowerPoint attempt failed when an older model call returns an error", async () => {
+    ownedDocument("course.pptx");
+    mocks.download.mockResolvedValueOnce(Buffer.from(DOCX));
+    mocks.convertPowerPoint.mockImplementationOnce(async () => {
+      mocks.db.select.mockReturnValueOnce(chain([{ attemptNumber: 3 }]));
+      return { error: "Old failure", calls: [usage] };
+    });
+    const response = await POST(
+      request({ documentId: "doc-1", outputTarget: "accessible_pptx" })
+    );
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      documentId: "doc-1",
+      jobId: "job-1",
+    });
+    expect(mocks.db.update).not.toHaveBeenCalled();
+    expect(mocks.upload).not.toHaveBeenCalled();
+    expect(inserted.get(jobEvents)).toBeUndefined();
+    expect(inserted.get(dailyFailureMetrics)).toBeUndefined();
+    expect(inserted.get(modelCalls)?.values).toHaveBeenCalledTimes(1);
+  });
+
+  it("checks the attempt again before reporting a storage failure after a new attempt starts", async () => {
+    ownedDocument();
+    mocks.upload.mockImplementationOnce(async () => {
+      mocks.db.select.mockReturnValueOnce(chain([{ attemptNumber: 3 }]));
+      throw new Error("private storage failure");
+    });
+    const response = await POST(request({ documentId: "doc-1" }));
+    expect(response.status).toBe(409);
+    expect(mocks.db.update).not.toHaveBeenCalled();
+    expect(mocks.db.delete).not.toHaveBeenCalled();
+    expect(inserted.get(jobEvents)).toBeUndefined();
+    expect(inserted.get(modelCalls)?.values).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the same billable-call receipt if an ambiguous publication falls through to failure accounting", async () => {
+    ownedDocument();
+    updated.where.mockRejectedValueOnce(
+      new Error("ambiguous transaction result")
+    );
+    const response = await POST(request({ documentId: "doc-1" }));
+    expect(response.status).toBe(500);
+    const accounting = mocks.db.insert.mock.results
+      .filter((_, index) => mocks.db.insert.mock.calls[index][0] === modelCalls)
+      .map((result) => result.value);
+    expect(accounting).toHaveLength(2);
+    expect(accounting[0].values.mock.calls[0][0]).toEqual(
+      accounting[1].values.mock.calls[0][0]
+    );
+    expect(accounting[0].values.mock.calls[0][0][0].id).toMatch(
+      /^[a-f0-9-]{36}$/
+    );
+    for (const builder of accounting)
+      expect(builder.onConflictDoNothing).toHaveBeenCalledWith({
+        target: modelCalls.id,
+      });
+  });
+
   it("retains billable model usage and marks the job failed after conversion fails", async () => {
     mocks.convert.mockResolvedValueOnce({
       error: "Conversion failed",
@@ -917,7 +1340,7 @@ describe("document conversion route", () => {
       })
     );
     expect(inserted.get(modelCalls)?.values).toHaveBeenCalledWith([
-      { jobId: "job-1", ...usage, costUsd: "0.001" },
+      { id: expect.any(String), jobId: "job-1", ...usage, costUsd: "0.001" },
     ]);
     expect(mocks.upload).toHaveBeenCalledTimes(1);
   });
@@ -974,7 +1397,7 @@ describe("document conversion route", () => {
     expect(savedAndLogged).not.toContain("secret-key");
     expect(savedAndLogged).not.toContain("private provider error");
     expect(inserted.get(modelCalls)?.values).toHaveBeenCalledWith([
-      { jobId: "job-1", ...usage, costUsd: "0.001" },
+      { id: expect.any(String), jobId: "job-1", ...usage, costUsd: "0.001" },
     ]);
   });
 

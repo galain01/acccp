@@ -39,6 +39,11 @@ vi.mock("@/lib/storage", () => ({
   sourceDocxKey: (session, document) => `${session}/${document}/source.docx`,
   sourcePdfKey: (session, document) => `${session}/${document}/source.pdf`,
   htmlOutputKey: (session, document) => `${session}/${document}/output.html`,
+  sourcePptxKey: (session, document) => `${session}/${document}/source.pptx`,
+  pptxOutputKey: (session, document, job) =>
+    `${session}/${document}/${job}/output.pptx`,
+  outputReviewKey: (session, document, job) =>
+    `${session}/${document}/${job}/review.json`,
 }));
 
 import {
@@ -53,6 +58,7 @@ import * as schema from "@/lib/db/schema";
 import { recordFailureCount } from "@/lib/failure-metrics";
 import { getFailureSummary } from "@/lib/actions/failure-metrics";
 import { createJobDiagnostic } from "@/lib/job-diagnostics";
+import { recordPowerPointReviewCalls } from "@/lib/powerpoint-review-costs";
 import {
   getCostSummary,
   getJobStatusSummary,
@@ -258,6 +264,18 @@ beforeAll(async () => {
       "utf8"
     )
   );
+  await pg.exec(
+    await readFile(
+      new URL("../drizzle/0013_powerpoint_outputs.sql", import.meta.url),
+      "utf8"
+    )
+  );
+  await pg.exec(
+    await readFile(
+      new URL("../drizzle/0014_direct_powerpoint_upload.sql", import.meta.url),
+      "utf8"
+    )
+  );
 });
 
 afterAll(async () => {
@@ -289,6 +307,128 @@ beforeEach(async () => {
 });
 
 describe("retention against in-memory PostgreSQL", () => {
+  it("keeps a deleted direct-upload receipt and object until the bearer and in-flight window settle", async () => {
+    const doc = await seedDocument(1, true);
+    await pg.query(
+      "UPDATE documents SET upload_expires_at=clock_timestamp()+interval '2 hours' WHERE id=$1",
+      [doc.id]
+    );
+    await expect(
+      withRetainedDocument(doc.id, async () => "private")
+    ).rejects.toBeInstanceOf(DocumentUnavailableError);
+    expect(await purgeDocumentIfEligible(doc.id)).toBe("retained");
+    expect(fixture.remove).not.toHaveBeenCalled();
+    await pg.query(
+      "UPDATE documents SET upload_expires_at=clock_timestamp()-interval '30 minutes' WHERE id=$1",
+      [doc.id]
+    );
+    expect(await purgeDocumentIfEligible(doc.id)).toBe("retained");
+    await pg.query(
+      "UPDATE documents SET upload_expires_at=clock_timestamp()-interval '61 minutes' WHERE id=$1",
+      [doc.id]
+    );
+    expect(await purgeDocumentIfEligible(doc.id)).toBe("purged");
+    expect((await linkedCounts(doc.id, doc.jobId)).documents).toBe(0);
+  });
+
+  it("expires abandoned uploads early while completed uploads keep the original 14-day retention", async () => {
+    const pending = await seedDocument(4),
+      completed = await seedDocument(4);
+    await pg.query(
+      "UPDATE documents SET upload_expires_at=clock_timestamp()-interval '61 minutes' WHERE id=ANY($1::uuid[])",
+      [[pending.id, completed.id]]
+    );
+    await pg.query(
+      "UPDATE documents SET upload_completed_at=clock_timestamp()-interval '2 hours' WHERE id=$1",
+      [completed.id]
+    );
+    await expect(
+      withRetainedDocument(pending.id, async () => "private")
+    ).rejects.toBeInstanceOf(DocumentUnavailableError);
+    expect(await withRetainedDocument(completed.id, async () => "kept")).toBe(
+      "kept"
+    );
+    expect(await purgeDocumentIfEligible(pending.id)).toBe("purged");
+    expect(await purgeDocumentIfEligible(completed.id)).toBe("retained");
+    await pg.query(
+      "UPDATE documents SET created_at=clock_timestamp()-interval '337 hours' WHERE id=$1",
+      [completed.id]
+    );
+    expect(await purgeDocumentIfEligible(completed.id)).toBe("purged");
+  });
+
+  it("defaults historical jobs to Canvas and supports both old and target-aware upserts during rollout", async () => {
+    const document = await seedDocument(1);
+    const legacy = await pg.query(
+      "SELECT output_target,profile_version FROM conversion_jobs WHERE id=$1",
+      [document.jobId]
+    );
+    expect(legacy.rows[0]).toEqual({
+      output_target: "canvas_html",
+      profile_version: "canvas-html-v1",
+    });
+    await pg.query(
+      "INSERT INTO conversion_jobs (document_id,requested_by_user_id) VALUES ($1,$2) ON CONFLICT(document_id) DO UPDATE SET attempt_count=1",
+      [document.id, ownerId]
+    );
+    await pg.query(
+      "INSERT INTO conversion_jobs (document_id,requested_by_user_id,output_target) VALUES ($1,$2,'canvas_html') ON CONFLICT(document_id,output_target) DO UPDATE SET attempt_count=2",
+      [document.id, ownerId]
+    );
+    await expect(
+      pg.query(
+        "INSERT INTO conversion_jobs (document_id,requested_by_user_id,output_target) VALUES ($1,$2,'accessible_pptx')",
+        [document.id, ownerId]
+      )
+    ).rejects.toThrow();
+    await expect(
+      pg.query(
+        "INSERT INTO conversion_jobs (document_id,requested_by_user_id,output_target) VALUES ($1,$2,'accessible_pdf')",
+        [document.id, ownerId]
+      )
+    ).rejects.toThrow();
+    const jobs = await pg.query(
+      "SELECT count(*)::int as total,max(attempt_count)::int as attempts FROM conversion_jobs WHERE document_id=$1",
+      [document.id]
+    );
+    expect(jobs.rows[0]).toEqual({ total: 1, attempts: 2 });
+  });
+
+  it("purges PowerPoint originals and orphaned job outputs while retaining every target's usage", async () => {
+    const document = await seedDocument(360);
+    const canvasDocument = await seedDocument(360);
+    const pptxJob = document.jobId;
+    await pg.query(
+      "UPDATE conversion_jobs SET output_target='accessible_pptx',profile_version='powerpoint-v1' WHERE id=$1",
+      [pptxJob]
+    );
+    await pg.query(
+      "INSERT INTO model_calls (job_id,stage,model,prompt_tokens,completion_tokens,cost_usd) VALUES ($1,'convert','synthetic-pptx',25,10,0.002)",
+      [pptxJob]
+    );
+    const base = `${sessionId}/${document.id}`;
+    for (const key of [
+      `${base}/source.pptx`,
+      `${base}/${pptxJob}/output.pptx`,
+      `${base}/${pptxJob}/review.json`,
+    ])
+      blobs.set(key, "synthetic private deck");
+    const before = await combinedMetrics();
+    expect(await purgeDocumentIfEligible(document.id)).toBe("purged");
+    expect(await purgeDocumentIfEligible(canvasDocument.id)).toBe("purged");
+    expect(blobs.size).toBe(0);
+    expect(await combinedMetrics()).toEqual(before);
+    const jobs = await pg.query(
+      "SELECT sum(job_count)::int as total FROM retained_job_metrics"
+    );
+    expect(jobs.rows[0].total).toBe(2);
+    const orphaned = await pg.query(
+      "SELECT count(*)::int as total FROM conversion_jobs WHERE document_id=$1",
+      [document.id]
+    );
+    expect(orphaned.rows[0].total).toBe(0);
+  });
+
   it("preserves latest-attempt pages, all-attempt tokens and exact duration frequencies by original job cohort", async () => {
     const measured = await seedDocument(360);
     const sameDuration = await seedDocument(360);
@@ -970,14 +1110,12 @@ describe("anonymous failure history", () => {
     const failedAt = new Date().toISOString();
     const day = failedAt.slice(0, 10);
     await withRetainedDocument(document.id, async (tx) => {
-      await tx
-        .insert(schema.jobEvents)
-        .values({
-          jobId: document.jobId,
-          eventType: "conversion_failed",
-          message: "Controlled explanation",
-          metadata: { diagnostic },
-        });
+      await tx.insert(schema.jobEvents).values({
+        jobId: document.jobId,
+        eventType: "conversion_failed",
+        message: "Controlled explanation",
+        metadata: { diagnostic },
+      });
       await recordFailureCount(tx, diagnostic, failedAt);
       await recordFailureCount(
         tx,
@@ -1015,14 +1153,12 @@ describe("anonymous failure history", () => {
     const document = await seedDocument(1);
     await expect(
       withRetainedDocument(document.id, async (tx) => {
-        await tx
-          .insert(schema.jobEvents)
-          .values({
-            jobId: document.jobId,
-            eventType: "conversion_failed",
-            message: "Controlled explanation",
-            metadata: { diagnostic },
-          });
+        await tx.insert(schema.jobEvents).values({
+          jobId: document.jobId,
+          eventType: "conversion_failed",
+          message: "Controlled explanation",
+          metadata: { diagnostic },
+        });
         await recordFailureCount(tx, diagnostic, new Date().toISOString());
         throw new Error("Synthetic failure before commit");
       })
@@ -1070,5 +1206,149 @@ describe("anonymous failure history", () => {
           [stage, code, count]
         )
       ).rejects.toThrow();
+  });
+});
+
+describe("PowerPoint review usage when a document is deleted", () => {
+  const calls = [
+    {
+      stage: "validate",
+      model: "review-model",
+      promptTokens: 100,
+      completionTokens: 20,
+      costUsd: 0.1,
+      costSource: "gateway",
+    },
+    {
+      stage: "validate",
+      model: "review-model",
+      promptTokens: 50,
+      completionTokens: 10,
+      costUsd: 0.2,
+      costSource: "model-info",
+    },
+    {
+      stage: "validate",
+      model: "review-model",
+      promptTokens: 25,
+      completionTokens: 5,
+      costUsd: null,
+    },
+  ];
+
+  it("records completed calls on a tombstoned expired document without extending availability, then purge archives them once", async () => {
+    const document = await seedDocument(337, true);
+    const input = {
+      documentId: document.id,
+      jobId: document.jobId,
+      exportId: randomUUID(),
+      calls,
+    };
+    await recordPowerPointReviewCalls(input);
+    await recordPowerPointReviewCalls(input);
+    expect(
+      (
+        await pg.query(
+          "SELECT count(*)::int AS n FROM model_calls WHERE model='review-model'"
+        )
+      ).rows[0].n
+    ).toBe(3);
+    await expect(
+      withRetainedDocument(document.id, async () => null)
+    ).rejects.toBeInstanceOf(DocumentUnavailableError);
+    expect(await purgeDocumentIfEligible(document.id)).toBe("purged");
+    const totals = (
+      await pg.query(
+        "SELECT call_count::int,prompt_tokens::int,completion_tokens::int,cost_usd::text,priced_call_count::int,estimated_call_count::int,unpriced_call_count::int FROM retained_model_metrics WHERE model='review-model'"
+      )
+    ).rows;
+    expect(totals).toEqual([
+      {
+        call_count: 3,
+        prompt_tokens: 175,
+        completion_tokens: 35,
+        cost_usd: "0.3",
+        priced_call_count: 2,
+        estimated_call_count: 1,
+        unpriced_call_count: 1,
+      },
+    ]);
+    expect(
+      (await pg.query("SELECT * FROM model_calls WHERE model='review-model'"))
+        .rows
+    ).toEqual([]);
+  });
+
+  it("keeps only anonymous daily/model totals when purge finished before the audit", async () => {
+    const document = await seedDocument(337, true);
+    expect(await purgeDocumentIfEligible(document.id)).toBe("purged");
+    const before = await linkedCounts(document.id, document.jobId);
+    const jobStats = await archivedJobStats();
+    await recordPowerPointReviewCalls({
+      documentId: document.id,
+      jobId: document.jobId,
+      exportId: randomUUID(),
+      calls,
+    });
+    expect(await linkedCounts(document.id, document.jobId)).toEqual(before);
+    expect(await archivedJobStats()).toEqual(jobStats);
+    const totals = (
+      await pg.query(
+        "SELECT * FROM retained_model_metrics WHERE model='review-model'"
+      )
+    ).rows;
+    expect(totals).toHaveLength(1);
+    expect(Number(totals[0].cost_usd)).toBe(0.3);
+    expect(Number(totals[0].call_count)).toBe(3);
+    expect(Number(totals[0].priced_call_count)).toBe(2);
+    expect(Number(totals[0].estimated_call_count)).toBe(1);
+    expect(Number(totals[0].unpriced_call_count)).toBe(1);
+    expect(JSON.stringify(totals)).not.toContain(document.id);
+    expect(JSON.stringify(totals)).not.toContain(document.jobId);
+  });
+
+  it("rolls the entire anonymous usage batch back on a database failure", async () => {
+    await expect(
+      recordPowerPointReviewCalls({
+        documentId: randomUUID(),
+        jobId: randomUUID(),
+        exportId: randomUUID(),
+        calls: [calls[0], { ...calls[1], promptTokens: -500 }],
+      })
+    ).rejects.toThrow();
+    expect(
+      (
+        await pg.query(
+          "SELECT * FROM retained_model_metrics WHERE model='review-model'"
+        )
+      ).rows
+    ).toEqual([]);
+  });
+
+  it("purges retired reviewed files alongside replacement canonical outputs", async () => {
+    const document = await seedDocument(337, true);
+    const keys = [
+      `${sessionId}/${document.id}/${document.jobId}/review-old.pptx`,
+      `${sessionId}/${document.id}/${document.jobId}/review-old.json`,
+      `${sessionId}/${document.id}/${document.jobId}/output.pptx`,
+      `${sessionId}/${document.id}/${document.jobId}/review.json`,
+    ];
+    for (let index = 0; index < keys.length; index++) {
+      blobs.set(keys[index], "retained private review content");
+      await pg.query(
+        "INSERT INTO artifacts (job_id,artifact_type,artifact_status,filename,mime_type,storage_key) VALUES ($1,$2,$3,'output','application/test',$4)",
+        [
+          document.jobId,
+          index % 2 ? "review_metadata" : "pptx_output",
+          index < 2 ? "expired" : "available",
+          keys[index],
+        ]
+      );
+    }
+    expect(await purgeDocumentIfEligible(document.id)).toBe("purged");
+    for (const key of keys) expect(blobs.has(key)).toBe(false);
+    expect(fixture.remove.mock.calls.flatMap(([removed]) => removed)).toEqual(
+      expect.arrayContaining(keys)
+    );
   });
 });

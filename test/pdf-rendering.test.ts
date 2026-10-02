@@ -13,6 +13,10 @@ import {
 } from "pdf-lib";
 import { createCanvas, loadImage } from "@napi-rs/canvas";
 import {
+  MAX_FILE_SIZE_BYTES,
+  MAX_PPTX_PREVIEW_PDF_SIZE_BYTES,
+} from "../lib/document-input";
+import {
   PDF_RENDERING_LIMITS,
   PdfRenderingError,
   renderPdfPages,
@@ -123,6 +127,31 @@ afterEach(() => {
 });
 
 describe("PDF visual rendering in the real child process", () => {
+  it("renders larger PowerPoint previews only through the trusted parent mode", async () => {
+    const pdf = await PDFDocument.create();
+    pdf.addPage([100, 100]);
+    // A valid raw PDF stream crosses the upload boundary without increasing
+    // page/image complexity. The real child must accept the larger stdin.
+    pdf.context.register(
+      pdf.context.stream(new Uint8Array(MAX_PPTX_PREVIEW_PDF_SIZE_BYTES - 1024))
+    );
+    const saved = Buffer.from(await pdf.save());
+    expect(saved.length).toBeLessThanOrEqual(MAX_PPTX_PREVIEW_PDF_SIZE_BYTES);
+    const preview = Buffer.alloc(MAX_PPTX_PREVIEW_PDF_SIZE_BYTES, 0x20);
+    saved.copy(preview);
+    await expect(renderPdfPages(preview)).rejects.toMatchObject({
+      diagnostic: { code: "pdf_invalid" },
+    });
+    expect(childProcess.spawn).not.toHaveBeenCalled();
+    const result = await renderPdfPages(preview, {
+      inputKind: "powerpoint-preview",
+    });
+    expect(result.pageCount).toBe(1);
+    expect(vi.mocked(childProcess.spawn).mock.calls[0][1]).toContain(
+      "--powerpoint-preview"
+    );
+  }, 15_000);
+
   it("renders every page in order with visible vector pixels and matching text", async () => {
     const result = await renderPdfPages(await makePdf(3));
     expect(result.pageCount).toBe(3);
@@ -676,7 +705,12 @@ describe("renderer process boundaries", () => {
       renderPdfPages(Buffer.from("not a PDF"))
     ).rejects.toMatchObject({ diagnostic: { code: "pdf_invalid" } });
     await expect(
-      renderPdfPages(Buffer.alloc(4 * 1024 * 1024 + 1))
+      renderPdfPages(Buffer.alloc(MAX_FILE_SIZE_BYTES + 1))
+    ).rejects.toMatchObject({ diagnostic: { code: "pdf_invalid" } });
+    const oversizedPreview = Buffer.alloc(MAX_PPTX_PREVIEW_PDF_SIZE_BYTES + 1);
+    oversizedPreview.write("%PDF-");
+    await expect(
+      renderPdfPages(oversizedPreview, { inputKind: "powerpoint-preview" })
     ).rejects.toMatchObject({ diagnostic: { code: "pdf_invalid" } });
     expect(spawn).not.toHaveBeenCalled();
   });
@@ -688,6 +722,7 @@ describe("renderer process boundaries", () => {
     expect(args?.join(" ")).not.toContain("synthetic-secret");
     expect(args).toContain("--permission");
     expect(args).toContain("--allow-addons");
+    expect(args).not.toContain("--powerpoint-preview");
     expect(
       Object.keys(options?.env ?? {}).every(
         (key) => key === "SystemRoot" || key === "NODE_ENV"

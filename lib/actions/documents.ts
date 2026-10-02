@@ -1,6 +1,6 @@
 "use server";
 
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 
 import {
   readFindingLocation,
@@ -22,8 +22,15 @@ import {
   sessions,
   validationFindings,
 } from "@/lib/db/schema";
-import { isDocumentExpired } from "@/lib/retention";
-import { downloadObject } from "@/lib/storage";
+import { isDocumentExpired, retentionExpiresAt } from "@/lib/retention";
+import { createSignedUrl, downloadObject } from "@/lib/storage";
+import {
+  getOutputTargetForFilename,
+  isOutputTarget,
+  outputFilename,
+  readOutputChanges,
+  type OutputTarget,
+} from "@/lib/output-formats";
 import type { UploadedDocument } from "@/lib/types/document";
 
 // RLS is enabled but has no policies, so ownership is enforced here: every
@@ -47,6 +54,8 @@ export async function listDocuments(
       jobId: conversionJobs.id,
       status: conversionJobs.status,
       errorMessage: conversionJobs.errorMessage,
+      outputTarget: conversionJobs.outputTarget,
+      changes: sql<unknown>`(select metadata -> 'changes' from job_events where job_events.job_id = ${conversionJobs.id} and event_type in ('conversion_completed', 'powerpoint_review_finished') and metadata ? 'changes' order by created_at desc, id desc limit 1)`,
     })
     .from(documents)
     .innerJoin(sessions, eq(sessions.id, documents.sessionId))
@@ -136,6 +145,9 @@ export async function listDocuments(
     .map((row) => ({
       id: row.id,
       documentId: row.id,
+      jobId: row.jobId ?? undefined,
+      outputTarget: row.outputTarget ?? getOutputTargetForFilename(row.name),
+      changes: readOutputChanges(row.changes),
       name: row.name,
       size: row.size,
       uploadedAt: new Date(row.uploadedAt),
@@ -169,6 +181,7 @@ export async function getDocumentHtml(
             eq(documents.id, documentId),
             eq(sessions.ownerUserId, userId),
             eq(artifacts.artifactType, "html_output"),
+            eq(conversionJobs.outputTarget, "canvas_html"),
             eq(artifacts.artifactStatus, "available"),
             retainedDocumentCondition()
           )
@@ -184,6 +197,57 @@ export async function getDocumentHtml(
   } catch (error) {
     if (error instanceof DocumentUnavailableError) return null;
     throw error;
+  }
+}
+
+/** Return a short-lived, attachment download for the owned, unexpired output. */
+export async function getDocumentOutputDownload(
+  documentId: string,
+  outputTarget: OutputTarget
+): Promise<{ url: string; filename: string } | null> {
+  const userId = await requireUserId();
+  if (!isOutputTarget(outputTarget)) return null;
+  try {
+    return await withRetainedDocument(documentId, async (tx, document) => {
+      const [row] = await tx
+        .select({
+          storageKey: artifacts.storageKey,
+          filename: documents.originalFilename,
+        })
+        .from(artifacts)
+        .innerJoin(conversionJobs, eq(conversionJobs.id, artifacts.jobId))
+        .innerJoin(documents, eq(documents.id, conversionJobs.documentId))
+        .innerJoin(sessions, eq(sessions.id, documents.sessionId))
+        .where(
+          and(
+            eq(documents.id, documentId),
+            eq(sessions.ownerUserId, userId),
+            eq(conversionJobs.outputTarget, outputTarget),
+            eq(
+              artifacts.artifactType,
+              outputTarget === "accessible_pptx" ? "pptx_output" : "html_output"
+            ),
+            eq(artifacts.artifactStatus, "available"),
+            retainedDocumentCondition()
+          )
+        );
+      if (!row) return null;
+      // Do not grant a signed URL beyond the document's original expiry.
+      // Reserve a second for signing/clock rounding and recheck afterward.
+      const expiresAt = Date.parse(retentionExpiresAt(document.createdAt));
+      const ttl = Math.min(60, Math.floor((expiresAt - Date.now()) / 1000) - 1);
+      if (ttl < 1) return null;
+      const filename = outputFilename(row.filename, outputTarget);
+      const url = await createSignedUrl(row.storageKey, ttl, filename);
+      // Withhold a late response if response-time + TTL would pass expiry.
+      if (Date.now() + ttl * 1000 > expiresAt) return null;
+      return { url, filename };
+    });
+  } catch (error) {
+    if (error instanceof DocumentUnavailableError) return null;
+    throw new Error(
+      "Could not prepare the document download. Please try again."
+    );
   }
 }
 

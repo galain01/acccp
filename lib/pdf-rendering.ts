@@ -1,7 +1,10 @@
 // Node-only, memory-only renderer. Uploaded bytes never become arguments or files.
 import { spawn } from "node:child_process";
 import { join } from "node:path";
-import { MAX_FILE_SIZE_BYTES } from "./document-input";
+import {
+  MAX_FILE_SIZE_BYTES,
+  MAX_PPTX_PREVIEW_PDF_SIZE_BYTES,
+} from "./document-input";
 import {
   createJobDiagnostic,
   describeJobDiagnostic,
@@ -112,6 +115,7 @@ interface RendererWaiter {
   timer: ReturnType<typeof setTimeout>;
   deadline: number;
   elapsed: () => number;
+  expirationError: () => PdfRenderingError;
 }
 interface RendererQueue {
   active: boolean;
@@ -149,7 +153,7 @@ function rendererRelease(): ReleaseRenderer {
       clearTimeout(waiter.timer);
       // Honor the deadline even if a blocked event loop delayed its timer.
       if (performance.now() >= waiter.deadline) {
-        waiter.reject(rendererBusy(waiter.elapsed));
+        waiter.reject(waiter.expirationError());
         continue;
       }
       waiter.resolve(rendererRelease());
@@ -160,7 +164,8 @@ function rendererRelease(): ReleaseRenderer {
 }
 
 function acquireRenderer(
-  elapsed: () => number
+  elapsed: () => number,
+  requestDeadline?: number
 ): ReleaseRenderer | Promise<ReleaseRenderer> {
   if (!rendererQueue.active) {
     rendererQueue.active = true;
@@ -168,24 +173,34 @@ function acquireRenderer(
   }
   if (rendererQueue.waiting.length >= PDF_RENDERING_QUEUE_LIMITS.maxWaiting)
     throw rendererBusy(elapsed);
+  const queueTimeout = Math.min(
+    PDF_RENDERING_QUEUE_LIMITS.timeoutMs,
+    requestDeadline === undefined
+      ? Infinity
+      : Math.max(0, requestDeadline - performance.now())
+  );
+  const expirationError = () =>
+    requestDeadline !== undefined && performance.now() >= requestDeadline
+      ? renderingError("pdf_timeout", undefined, elapsed())
+      : rendererBusy(elapsed);
   return new Promise((resolve, reject) => {
     const waiter: RendererWaiter = {
       resolve,
       reject,
       elapsed,
-      deadline: performance.now() + PDF_RENDERING_QUEUE_LIMITS.timeoutMs,
+      expirationError,
+      deadline: performance.now() + queueTimeout,
       timer: setTimeout(() => {
         const index = rendererQueue.waiting.indexOf(waiter);
         if (index === -1) return;
         rendererQueue.waiting.splice(index, 1);
-        reject(rendererBusy(elapsed));
-      }, PDF_RENDERING_QUEUE_LIMITS.timeoutMs),
+        reject(expirationError());
+      }, queueTimeout),
     };
     rendererQueue.waiting.push(waiter);
   });
 }
 
-const MAX_STDIN_BYTES = Math.ceil(MAX_FILE_SIZE_BYTES / 3) * 4 + 64;
 const MAX_STDOUT_BYTES =
   Math.ceil(PDF_RENDERING_LIMITS.maxTotalPngBytes / 3) * 4 +
   PDF_RENDERING_LIMITS.maxTotalTextChars * 6 +
@@ -353,22 +368,57 @@ function parseResult(value: unknown): RenderedPdf {
  * The child has no inherited app environment, bounded pipes and an OS process
  * deadline. Native memory is isolated from the parent JS heap, not OS-sandboxed.
  */
-export async function renderPdfPages(buffer: Buffer): Promise<RenderedPdf> {
+export async function renderPdfPages(
+  buffer: Buffer,
+  options: {
+    timeoutMs?: number;
+    /** Server-selected origin; never accept this option from upload metadata. */
+    inputKind?: "uploaded-pdf" | "powerpoint-preview";
+  } = {}
+): Promise<RenderedPdf> {
   const started = performance.now();
   const elapsed = () => Math.max(0, Math.round(performance.now() - started));
+  const timeout = options.timeoutMs;
+  if (
+    timeout !== undefined &&
+    (!Number.isFinite(timeout) ||
+      timeout < 1 ||
+      timeout >
+        PDF_RENDERING_QUEUE_LIMITS.timeoutMs + PDF_RENDERING_LIMITS.timeoutMs)
+  ) {
+    throw new RangeError(
+      "PDF rendering timeout must be between 1 and 120000 milliseconds."
+    );
+  }
+  // An explicit caller budget covers queue time and rendering together. Omitted
+  // budgets preserve the existing 30-second queue and 90-second active limits.
+  const requestDeadline = timeout === undefined ? undefined : started + timeout;
+  if (
+    options.inputKind !== undefined &&
+    options.inputKind !== "uploaded-pdf" &&
+    options.inputKind !== "powerpoint-preview"
+  )
+    throw new RangeError("Unknown PDF rendering input kind.");
+  const isPowerPointPreview = options.inputKind === "powerpoint-preview";
+  const maxInputBytes = isPowerPointPreview
+    ? MAX_PPTX_PREVIEW_PDF_SIZE_BYTES
+    : MAX_FILE_SIZE_BYTES;
+  const maxStdinBytes = Math.ceil(maxInputBytes / 3) * 4 + 64;
   if (
     !Buffer.isBuffer(buffer) ||
-    buffer.length > MAX_FILE_SIZE_BYTES ||
+    buffer.length > maxInputBytes ||
     buffer.subarray(0, 5).toString("ascii") !== "%PDF-"
   ) {
     throw renderingError("pdf_invalid", undefined, elapsed());
   }
-  const slot = acquireRenderer(elapsed);
+  const slot = acquireRenderer(elapsed, requestDeadline);
   const release = typeof slot === "function" ? slot : await slot;
   try {
+    if (requestDeadline !== undefined && performance.now() >= requestDeadline)
+      throw renderingError("pdf_timeout", undefined, elapsed());
     // Queued requests retain only their original bytes, not another base64 copy.
     const request = JSON.stringify({ pdf: buffer.toString("base64") });
-    if (Buffer.byteLength(request) > MAX_STDIN_BYTES)
+    if (Buffer.byteLength(request) > maxStdinBytes)
       throw renderingError("pdf_invalid", undefined, elapsed());
     const root = process.cwd();
     const childPath = join(root, "lib", "pdf-rendering-child.mjs");
@@ -377,6 +427,8 @@ export async function renderPdfPages(buffer: Buffer): Promise<RenderedPdf> {
     if (process.platform === "win32" && process.env.SystemRoot) {
       env.SystemRoot = process.env.SystemRoot;
     }
+    if (requestDeadline !== undefined && performance.now() >= requestDeadline)
+      throw renderingError("pdf_timeout", undefined, elapsed());
 
     return await new Promise<RenderedPdf>((resolve, reject) => {
       let child: ReturnType<typeof spawn>;
@@ -390,10 +442,12 @@ export async function renderPdfPages(buffer: Buffer): Promise<RenderedPdf> {
             `--allow-fs-read=${childPath}`,
             `--allow-fs-read=${join(root, "lib", "pdf-image-alternatives.mjs")}`,
             `--allow-fs-read=${join(root, "lib", "pdf-revisions.mjs")}`,
+            `--allow-fs-read=${join(root, "lib", "pdf-render-warnings.mjs")}`,
             `--allow-fs-read=${join(root, "node_modules", "pdf-lib", "dist", "pdf-lib.min.js")}`,
             `--allow-fs-read=${join(root, "node_modules", "pdfjs-dist")}`,
             `--allow-fs-read=${join(root, "node_modules", "@napi-rs")}`,
             childPath,
+            ...(isPowerPointPreview ? ["--powerpoint-preview"] : []),
           ],
           { env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] }
         );
@@ -417,7 +471,12 @@ export async function renderPdfPages(buffer: Buffer): Promise<RenderedPdf> {
       };
       const timer = setTimeout(
         () => stop("pdf_timeout"),
-        PDF_RENDERING_LIMITS.timeoutMs
+        Math.min(
+          PDF_RENDERING_LIMITS.timeoutMs,
+          requestDeadline === undefined
+            ? Infinity
+            : Math.max(0, requestDeadline - performance.now())
+        )
       );
       child.stdout?.on("data", (chunk: Buffer) => {
         stdoutBytes += chunk.length;
@@ -444,6 +503,11 @@ export async function renderPdfPages(buffer: Buffer): Promise<RenderedPdf> {
           return;
         }
         try {
+          if (
+            requestDeadline !== undefined &&
+            performance.now() >= requestDeadline
+          )
+            throw renderingError("pdf_timeout");
           const value: unknown = JSON.parse(
             Buffer.concat(chunks).toString("utf8")
           );
@@ -457,7 +521,13 @@ export async function renderPdfPages(buffer: Buffer): Promise<RenderedPdf> {
             );
           }
           if (code !== 0) throw renderingError("pdf_worker_failed");
-          resolve(parseResult(value));
+          const result = parseResult(value);
+          if (
+            requestDeadline !== undefined &&
+            performance.now() >= requestDeadline
+          )
+            throw renderingError("pdf_timeout");
+          resolve(result);
         } catch (error) {
           const diagnostic =
             error instanceof PdfRenderingError

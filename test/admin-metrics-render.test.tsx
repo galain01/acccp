@@ -337,9 +337,9 @@ describe("real admin metrics server rendering", () => {
     );
     expect(text).toContain("Median successful job time 45 s");
     expect(text).toContain("Minimum 10 s · maximum 1m 20s");
-    expect(text).toContain("Pages in selected jobs 24");
-    expect(text).toContain("8 of 12 jobs have page counts");
-    expect(text).toContain("Average pages per measured job 3");
+    expect(text).toContain("Pages / slides in selected jobs 24");
+    expect(text).toContain("8 of 12 jobs have page or slide counts");
+    expect(text).toContain("Average pages / slides per measured job 3");
     expect(text).toContain("Average cost per job $0.075");
     expect(text).toContain("8 of 12 jobs have pricing for every recorded call");
     expect(text).toContain("Includes estimates.");

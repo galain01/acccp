@@ -4,38 +4,45 @@ import { useRef, useState, type DragEvent } from "react";
 import { Upload } from "lucide-react";
 import { cn } from "@/lib/utils";
 import DocumentProcessingNotice from "./document-processing-notice";
+import { maxFileSizeForFilename } from "@/lib/document-input";
 import {
-  isSupportedDocumentFilename,
-  MAX_FILE_SIZE_BYTES,
-} from "@/lib/document-input";
+  DEFAULT_OUTPUT_TARGET,
+  isSupportedOutputForFilename,
+  type OutputTarget,
+} from "@/lib/output-formats";
 
 interface FileUploadProps {
   onFilesSelected: (files: File[]) => void;
   disabled?: boolean;
+  outputTarget?: OutputTarget;
 }
 
 export default function FileUpload({
   onFilesSelected,
   disabled = false,
+  outputTarget = DEFAULT_OUTPUT_TARGET,
 }: FileUploadProps): React.JSX.Element {
   const inputRef = useRef<HTMLInputElement>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [rejectHint, setRejectHint] = useState<string | null>(null);
+  const isPowerPoint = outputTarget === "accessible_pptx";
 
   const handleFiles = (fileList: FileList | null) => {
     if (!fileList || disabled) return;
 
     const accepted = Array.from(fileList).filter(
       (file) =>
-        isSupportedDocumentFilename(file.name) &&
+        isSupportedOutputForFilename(file.name, outputTarget) &&
         file.size > 0 &&
-        file.size <= MAX_FILE_SIZE_BYTES
+        file.size <= maxFileSizeForFilename(file.name)
     );
     const rejected = fileList.length - accepted.length;
 
     if (rejected > 0) {
       setRejectHint(
-        "Upload a PDF or Word (.docx) file up to 4 MB. Empty files are not supported."
+        isPowerPoint
+          ? "Upload a PowerPoint (.pptx) file up to 25 MB. Empty files and older .ppt files are not supported."
+          : "Upload a PDF or Word (.docx) file up to 4 MB. Empty files are not supported."
       );
       setTimeout(() => setRejectHint(null), 3000);
     }
@@ -86,16 +93,28 @@ export default function FileUpload({
       >
         <Upload className="size-8 text-muted-foreground" />
         <p className="text-sm font-medium">
-          Drop Word or PDF files here or click to browse
+          {isPowerPoint
+            ? "Drop PowerPoint files here or click to browse"
+            : "Drop Word or PDF files here or click to browse"}
         </p>
         <p className="text-xs text-muted-foreground">
-          Word (.docx) and PDF files up to 4 MB and 60 PDF pages. Word files are
-          converted automatically.
+          {isPowerPoint
+            ? "PowerPoint (.pptx) files up to 25 MB and 60 slides. Complex presentations may still exceed processing limits."
+            : "Word (.docx) and PDF files up to 4 MB and 60 PDF pages. Word files are converted automatically."}
         </p>
         <input
           ref={inputRef}
           type="file"
-          accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+          accept={
+            isPowerPoint
+              ? ".pptx,application/vnd.openxmlformats-officedocument.presentationml.presentation"
+              : ".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+          }
+          aria-label={
+            isPowerPoint
+              ? "Upload PowerPoint documents"
+              : "Upload Word or PDF documents"
+          }
           multiple
           className="hidden"
           disabled={disabled}
@@ -105,7 +124,7 @@ export default function FileUpload({
           }}
         />
       </div>
-      <DocumentProcessingNotice compact />
+      <DocumentProcessingNotice compact outputTarget={outputTarget} />
       {rejectHint && (
         <p role="status" className="text-sm text-destructive">
           {rejectHint}
