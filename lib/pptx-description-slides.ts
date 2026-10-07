@@ -29,12 +29,16 @@ const xml = (text: string) =>
     .replace(/'/g, "&apos;");
 const elements = (document: Document | Element, ns: string, name: string) =>
   Array.from(document.getElementsByTagNameNS(ns, name));
+// Match the package reader: a leading UTF-8 BOM is an encoding marker, not XML.
 const parse = (bytes: Buffer) =>
   new DOMParser({
     onError: () => {
       throw new Error("Invalid description-slide XML");
     },
-  }).parseFromString(bytes.toString("utf8"), "application/xml");
+  }).parseFromString(
+    new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+    "application/xml"
+  );
 const serialize = (document: Document) => {
   const copy = document.cloneNode(true) as Document;
   const declaration = Array.from(copy.childNodes).find(

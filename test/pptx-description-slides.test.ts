@@ -312,6 +312,53 @@ describe("editable PowerPoint description slides", () => {
     }
   });
 
+  it.each([false, true])(
+    "adds description slides to a package with UTF-8 BOMs (XML declaration: %s)",
+    async (declaration) => {
+      const originalParts = await unzipParts(await fixture({ declaration }));
+      for (const [name, bytes] of originalParts)
+        if (name.endsWith(".xml") || name.endsWith(".rels"))
+          originalParts.set(
+            name,
+            Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), bytes])
+          );
+      const source = await zipParts([...originalParts]);
+      expect((await inspectPptx(source)).slideCount).toBe(1);
+
+      const item = explanation();
+      const result = await applyPptxRepairs(source, plan(item), {
+        revisioned: true,
+      });
+      const reopened = await inspectPptx(result.buffer);
+      expect(reopened.slideCount).toBe(2);
+      expect(words(reopened.slides[1].objects[1].text)).toEqual(
+        words(item.paragraphs.join(" "))
+      );
+      expect(reopened.slides[0].objects[1].description).toBe(
+        `${item.summary} Detailed description on slide 2.`
+      );
+      expect(result.changes).toEqual([
+        expect.objectContaining({
+          type: "long-description",
+          slideNumber: 1,
+          objectId: "3",
+          generatedSlideNumbers: [2],
+        }),
+      ]);
+
+      const outputParts = await unzipParts(result.buffer);
+      const allowedChanges = new Set([
+        "[Content_Types].xml",
+        "ppt/presentation.xml",
+        "ppt/_rels/presentation.xml.rels",
+        "ppt/slides/slide1.xml",
+      ]);
+      for (const [name, bytes] of originalParts)
+        if (!allowedChanges.has(name))
+          expect(outputParts.get(name), name).toEqual(bytes);
+    }
+  );
+
   it("does not expose an image on a hidden source slide by appending a visible explanation", async () => {
     const source = await fixture({ hidden: true });
     const result = await applyPptxRepairs(source, plan(), { revisioned: true });
