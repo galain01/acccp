@@ -181,11 +181,26 @@ describe("saved PDF revisions through the real renderer child", () => {
     });
   }, 15_000);
 
-  it("checks the current page resource graph against the aggregate page budget", async () => {
-    const original = source([
-      { id: 16, body: image(4000, 5000) },
-      { id: 17, body: image(4000, 5000) },
-    ]);
+  it("checks currently invoked image resources against the aggregate page budget after a saved update", async () => {
+    const original = appendRevision(
+      source([
+        { id: 16, body: image(4000, 5000) },
+        { id: 17, body: image(4000, 5000) },
+      ]),
+      [
+        {
+          id: 5,
+          body: pdfStream("q 60 0 0 40 20 60 cm /Large1 Do /Large2 Do Q"),
+        },
+        {
+          id: 15,
+          body: "<< /Font << /F1 4 0 R >> /XObject << /Large1 6 0 R /Large2 14 0 R >> >>",
+        },
+      ]
+    );
+    // Initially these same operators select two valid 1px images. Only the
+    // latest resource dictionary redirects them to the declared 20 MP images.
+    expect((await renderPdfPages(original.bytes)).pageCount).toBe(1);
     const revised = appendRevision(original, [
       {
         id: 15,

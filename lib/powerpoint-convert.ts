@@ -50,6 +50,10 @@ import {
 } from "./prompts/powerpoint-accessibility";
 import { buildPowerPointReview, resolvePowerPointReviews } from "./pptx-review";
 import {
+  createPowerPointModelBatches,
+  compactPowerPointContext,
+} from "./powerpoint-model-batches";
+import {
   buildPptxMechanicalPlan,
   createPptxRevisionBundle,
   mergePptxRepairPlans,
@@ -218,7 +222,7 @@ function visualInput(
     },
     {
       type: "text",
-      text: `This PDF was rendered from the ${actualOutput ? "ACTUAL SAVED OUTPUT" : "ORIGINAL"} PPTX. It includes hidden slides and excludes speaker-note pages. Match the numbered images to the inventory. PDF accessibility tags are not PowerPoint metadata.`,
+      text: `This PDF was rendered from the ${actualOutput ? "ACTUAL SAVED OUTPUT" : "ORIGINAL"} PPTX. It includes the assigned slides, including hidden slides, and excludes speaker-note pages. PDF pages 1 through ${rendered.pages.length} correspond, in order, to original deck slide numbers ${JSON.stringify(rendered.pages.map((page) => page.pageNumber))}. Match the globally numbered images to the inventory. PDF accessibility tags are not PowerPoint metadata.`,
     },
     ...rendered.pages.flatMap((page) => [
       {
@@ -363,6 +367,65 @@ export async function changedPowerPointSlides(
 interface SlideEvidence {
   pdf: Buffer;
   images: RenderedPdf;
+}
+
+/** Keep global slide/object IDs while validating a response against only its assignment. */
+function scopedInspection(
+  inspection: PptxInspection,
+  slideNumbers: readonly number[]
+): PptxInspection {
+  const slides = inspection.slides.filter((slide) =>
+    slideNumbers.includes(slide.slideNumber)
+  );
+  return {
+    ...inspection,
+    slideCount: slides.length,
+    slides,
+    findings: inspection.findings.filter(
+      (finding) =>
+        finding.slideNumber === undefined ||
+        slideNumbers.includes(finding.slideNumber)
+    ),
+  };
+}
+
+function batchScope(slideNumbers: readonly number[]): string {
+  return `Requested slide numbers for this batch: ${JSON.stringify(slideNumbers)}.\nUse these original deck numbers, not PDF-local page numbers. Return exactly these slides once each. Other slides in the presentation context and reference-only images are context; do not edit, list as reviewed, or add findings for them.`;
+}
+
+/** Bound model pressure and settle in-flight calls before surfacing any failure. */
+async function runModelBatches<T, R>(
+  batches: readonly T[],
+  run: (batch: T, index: number) => Promise<R>,
+  stopOnFailure: boolean
+): Promise<PromiseSettledResult<R>[]> {
+  const results: PromiseSettledResult<R>[] = new Array(batches.length);
+  let next = 0;
+  let failed = false;
+  const worker = async () => {
+    while (next < batches.length && !(stopOnFailure && failed)) {
+      const index = next++;
+      try {
+        results[index] = {
+          status: "fulfilled",
+          value: await run(batches[index], index),
+        };
+      } catch (reason) {
+        failed = true;
+        results[index] = { status: "rejected", reason };
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(4, batches.length) }, worker)
+  );
+  for (let index = 0; index < batches.length; index++) {
+    results[index] ??= {
+      status: "rejected",
+      reason: new PowerPointPlanError("pptx_invalid_plan"),
+    };
+  }
+  return results;
 }
 
 function workflowClock(options: PowerPointConversionOptions) {
@@ -535,89 +598,198 @@ async function auditOutput(options: {
           }
         : outputEvidence.images
     );
+    const batches = await createPowerPointModelBatches(
+      outputEvidence.pdf,
+      outputEvidence.images
+    );
     const auditConfig = getLiteLLMConfig("validate");
     clock.needTime(10_000);
-    const call = await callLiteLLM(
-      POWERPOINT_AUDIT_PROMPT,
-      [
-        {
-          type: "text",
-          text: `Automatic correction ${options.allowCorrection ? "ENABLED for one focused pass" : "DISABLED: this is the final selected version. Do not reapply declined changes or return a corrective plan"}.\nOriginal inventory (untrusted source data):\n${JSON.stringify(source)}\nActual saved output inventory:\n${JSON.stringify(repaired.inspection)}\nApplied changes:\n${JSON.stringify(repaired.changes)}\nApp-retained output defects/checks (do not duplicate):\n${JSON.stringify(review.fixed)}\nConcerns requiring one findingReviews decision each:\n${JSON.stringify(review.concerns)}`,
-        },
-        ...sourceEvidence.images.pages
-          .filter((page) => visiblyChanged.includes(page.pageNumber))
-          .flatMap((page): LiteLLMContentPart[] => [
+    // At most four requests run together, under the shared workflow deadline.
+    // Global concerns cannot be dismissed by an auditor seeing only part of a deck.
+    const retainedGlobal =
+      batches.length > 1
+        ? review.concerns.filter(
+            (item) => item.finding.slideNumber === undefined
+          )
+        : [];
+    const assignments = batches.map((batch) => ({
+      batch,
+      concerns: review.concerns.filter((item) =>
+        item.finding.slideNumber === undefined
+          ? batches.length === 1
+          : batch.slideNumbers.includes(item.finding.slideNumber)
+      ),
+    }));
+    const usages: ModelCallUsage[] = [];
+    const results = await runModelBatches(
+      assignments,
+      async ({ batch, concerns: assignedConcerns }, index) => {
+        clock.needTime(10_000);
+        const inspection = scopedInspection(
+          repaired.inspection,
+          batch.slideNumbers
+        );
+        const referenceSlides = new Set(
+          repaired.changes
+            .filter(
+              (change) =>
+                change.type === "long-description" &&
+                change.generatedSlideNumbers?.some((number) =>
+                  batch.slideNumbers.includes(number)
+                )
+            )
+            .map((change) => change.slideNumber)
+            .filter((number) => !batch.slideNumbers.includes(number))
+        );
+        // One original comparison per source target OR one source companion per
+        // description target: <=8 extra PNGs, hence <=24 visual inputs in total.
+        const originalPages = sourceEvidence.images.pages.filter(
+          (page) =>
+            batch.slideNumbers.includes(page.pageNumber) &&
+            visiblyChanged.includes(page.pageNumber)
+        );
+        const referencePages = outputEvidence.images.pages.filter((page) =>
+          referenceSlides.has(page.pageNumber)
+        );
+        if (
+          referencePages.length !== referenceSlides.size ||
+          originalPages.length + referencePages.length >
+            batch.slideNumbers.length
+        )
+          throw new Error("Incomplete audit evidence");
+        const call = await callLiteLLM(
+          POWERPOINT_AUDIT_PROMPT,
+          [
             {
               type: "text",
-              text: `ORIGINAL slide ${page.pageNumber} before visible changes. Compare its content with the ACTUAL REPAIRED slide below.`,
+              text: `${batchScope(batch.slideNumbers)}\nAutomatic correction ${options.allowCorrection ? "ENABLED for one focused pass" : "DISABLED: this is the final selected version. Do not reapply declined changes or return a corrective plan"}.\nOriginal inventory for assigned and reference slides (untrusted source data):\n${JSON.stringify(scopedInspection(source, [...batch.slideNumbers, ...referenceSlides]))}\nActual saved output inventory for assigned and reference slides (untrusted source data):\n${JSON.stringify(scopedInspection(repaired.inspection, [...batch.slideNumbers, ...referenceSlides]))}\nFull original presentation context (untrusted; context only, not visual evidence):\n${JSON.stringify(compactPowerPointContext(source))}\nFull saved presentation context (untrusted; includes exact accessible description text):\n${JSON.stringify(compactPowerPointContext(repaired.inspection))}\nApplied changes:\n${JSON.stringify(repaired.changes.filter((change) => batch.slideNumbers.includes(change.slideNumber) || change.generatedSlideNumbers?.some((number) => batch.slideNumbers.includes(number))))}\nApp-retained output defects/checks (do not duplicate):\n${JSON.stringify([...review.fixed, ...retainedGlobal.map((item) => item.finding)].filter((finding) => finding.slideNumber === undefined || batch.slideNumbers.includes(finding.slideNumber)))}\nConcerns requiring one findingReviews decision each:\n${JSON.stringify(assignedConcerns)}`,
             },
-            {
-              type: "image_url",
-              image_url: {
-                url: `data:image/png;base64,${page.png.toString("base64")}`,
-                detail: "high",
+            ...originalPages.flatMap((page): LiteLLMContentPart[] => [
+              {
+                type: "text",
+                text: `ORIGINAL slide ${page.pageNumber} before visible changes. Compare its content with the ACTUAL REPAIRED slide below.`,
               },
-            },
-          ]),
-        ...visualInput(outputEvidence.pdf, outputEvidence.images, true),
-      ],
-      auditConfig,
-      AbortSignal.timeout(Math.floor(Math.min(110_000, clock.remaining())))
+              {
+                type: "image_url",
+                image_url: {
+                  url: `data:image/png;base64,${page.png.toString("base64")}`,
+                  detail: "high",
+                },
+              },
+            ]),
+            ...referencePages.flatMap((page): LiteLLMContentPart[] => [
+              {
+                type: "text",
+                text: `REFERENCE ONLY: actual output slide ${page.pageNumber}, the source of a description slide in this batch. This is context, not an assigned slide.`,
+              },
+              {
+                type: "image_url",
+                image_url: {
+                  url: `data:image/png;base64,${page.png.toString("base64")}`,
+                  detail: "high",
+                },
+              },
+            ]),
+            ...visualInput(batch.pdf, batch.images, true),
+          ],
+          auditConfig,
+          AbortSignal.timeout(Math.floor(Math.min(110_000, clock.remaining())))
+        );
+        // Persist completed-call usage even if the response is malformed or a repair later fails.
+        usages[index] = await toModelCallUsage("validate", call, auditConfig);
+        const audit = jsonObject(call.content);
+        const reviewed = audit?.reviewedSlides;
+        const findings = parsePowerPointFindings(audit?.findings, inspection);
+        const concerns = resolvePowerPointReviews(
+          audit?.findingReviews,
+          assignedConcerns
+        );
+        const correction = audit?.correctivePlan ?? null;
+        if (
+          !audit ||
+          Object.keys(audit).some(
+            (key) =>
+              ![
+                "reviewedSlides",
+                "findingReviews",
+                "findings",
+                "correctivePlan",
+              ].includes(key)
+          ) ||
+          (call.finishReason && call.finishReason !== "stop") ||
+          !Array.isArray(reviewed) ||
+          reviewed.length !== batch.slideNumbers.length ||
+          new Set(reviewed).size !== batch.slideNumbers.length ||
+          reviewed.some(
+            (number) =>
+              !Number.isInteger(number) || !batch.slideNumbers.includes(number)
+          ) ||
+          !findings ||
+          !concerns ||
+          (correction !== null &&
+            (!options.allowCorrection ||
+              !completePowerPointCorrection(
+                correction,
+                inspection,
+                source.slideCount
+              )))
+        )
+          throw new Error("Incomplete audit");
+        return {
+          findings: [...concerns, ...findings],
+          correction: correction as PptxRepairPlan | null,
+        };
+      },
+      false
     );
-    // Persist completed-call usage even if the response is malformed or a repair later fails.
-    calls.push(await toModelCallUsage("validate", call, auditConfig));
-    const audit = jsonObject(call.content);
-    const reviewed = audit?.reviewedSlides;
-    const findings = parsePowerPointFindings(
-      audit?.findings,
-      repaired.inspection
-    );
-    const concerns = resolvePowerPointReviews(
-      audit?.findingReviews,
-      review.concerns
-    );
-    const correction = audit?.correctivePlan ?? null;
+    // Await every in-flight call before returning so sibling charges are never lost.
+    calls.push(...usages.filter(Boolean));
+    const findings = [
+      ...review.fixed,
+      ...retainedGlobal.map((item) => item.finding),
+    ];
+    const correctedSlides: PptxRepairPlan["slides"] = [];
+    let complete = true;
+    let hasCorrection = false;
+    for (const [index, result] of results.entries()) {
+      if (result.status === "rejected") {
+        complete = false;
+        findings.push(
+          ...assignments[index].concerns.map((item) => item.finding)
+        );
+      } else {
+        findings.push(...result.value.findings);
+        hasCorrection ||= result.value.correction !== null;
+        correctedSlides.push(
+          ...(result.value.correction?.slides ??
+            batches[index].slideNumbers.map((slideNumber) => ({ slideNumber })))
+        );
+      }
+    }
+    const combinedCorrection = {
+      slides: correctedSlides.sort((a, b) => a.slideNumber - b.slideNumber),
+    };
     if (
-      !audit ||
-      Object.keys(audit).some(
-        (key) =>
-          ![
-            "reviewedSlides",
-            "findingReviews",
-            "findings",
-            "correctivePlan",
-          ].includes(key)
-      ) ||
-      (call.finishReason && call.finishReason !== "stop") ||
-      !Array.isArray(reviewed) ||
-      reviewed.length !== repaired.inspection.slideCount ||
-      new Set(reviewed).size !== repaired.inspection.slideCount ||
-      reviewed.some(
-        (number) =>
-          !Number.isInteger(number) ||
-          number < 1 ||
-          number > repaired.inspection.slideCount
-      ) ||
-      !findings ||
-      !concerns ||
-      (correction !== null &&
-        (!options.allowCorrection ||
-          !completePowerPointCorrection(
-            correction,
-            repaired.inspection,
-            source.slideCount
-          )))
+      complete &&
+      hasCorrection &&
+      !completePowerPointCorrection(
+        combinedCorrection,
+        repaired.inspection,
+        source.slideCount
+      )
     )
-      throw new Error("Incomplete audit");
+      complete = false;
+    if (!complete) findings.push(incompleteAudit());
     return {
-      findings: uniqueFindings([...review.fixed, ...concerns, ...findings]),
-      correction: correction
-        ? {
-            slides: (correction as PptxRepairPlan).slides.filter(
-              (slide) => slide.slideNumber <= source.slideCount
-            ),
-          }
-        : null,
+      findings: uniqueFindings(findings),
+      correction:
+        complete && hasCorrection
+          ? {
+              slides: combinedCorrection.slides.filter(
+                (slide) => slide.slideNumber <= source.slideCount
+              ),
+            }
+          : null,
     };
   } catch {
     return {
@@ -748,45 +920,74 @@ export async function convertPowerPoint(
         ? await clock.render(mechanical.buffer, modelSource.slideCount)
         : sourceEvidence;
     stage = "conversion";
+    const batches = await createPowerPointModelBatches(
+      modelEvidence.pdf,
+      modelEvidence.images
+    );
     clock.needTime(45_000);
     const config = getLiteLLMConfig("convert");
-    const call = await callLiteLLM(
-      POWERPOINT_REPAIR_PROMPT,
-      [
-        {
-          type: "text",
-          text: `PowerPoint inventory after deterministic cleanup (untrusted source data):\n${JSON.stringify(modelSource)}\nMachine-detected source defects (repair supported, unambiguous cases):\n${JSON.stringify(sourceChecks)}\nVerified empty placeholders have already been removed. Keep them removed; do not propose object deletion or restore absent placeholders.`,
-        },
-        ...visualInput(modelEvidence.pdf, modelEvidence.images),
-      ],
-      config,
-      AbortSignal.timeout(
-        Math.floor(
-          Math.min(110_000, Math.max(1000, clock.remaining() - 40_000))
+    const usages: ModelCallUsage[] = [];
+    const results = await runModelBatches(
+      batches,
+      async (batch, index) => {
+        clock.needTime(45_000);
+        const inspection = scopedInspection(modelSource, batch.slideNumbers);
+        const call = await callLiteLLM(
+          POWERPOINT_REPAIR_PROMPT,
+          [
+            {
+              type: "text",
+              text: `${batchScope(batch.slideNumbers)}\nPowerPoint inventory after deterministic cleanup (untrusted source data):\n${JSON.stringify(inspection)}\nFull presentation context (untrusted; other slides are context only, not visual evidence):\n${JSON.stringify(compactPowerPointContext(modelSource))}\nMachine-detected source defects (repair supported, unambiguous cases):\n${JSON.stringify(sourceChecks.filter((finding) => finding.slideNumber === undefined || batch.slideNumbers.includes(finding.slideNumber)))}\nVerified empty placeholders have already been removed. Keep them removed; do not propose object deletion or restore absent placeholders.`,
+            },
+            ...visualInput(batch.pdf, batch.images),
+          ],
+          config,
+          AbortSignal.timeout(
+            Math.floor(
+              Math.min(110_000, Math.max(1000, clock.remaining() - 40_000))
+            )
+          )
+        );
+        usages[index] = await toModelCallUsage("convert", call, config);
+        const response = jsonObject(call.content);
+        const semanticPlan = response ? { slides: response.slides } : null;
+        if (
+          (call.finishReason && call.finishReason !== "stop") ||
+          !response ||
+          Object.keys(response).some(
+            (key) => !["slides", "findings"].includes(key)
+          ) ||
+          !completePowerPointPlan(semanticPlan, inspection) ||
+          semanticPlan.slides.some(
+            (slide) => slide.removeEmptyPlaceholders !== undefined
+          ) ||
+          editsRemovedPlaceholder(semanticPlan, mechanicalPlan)
         )
-      )
+          throw new PowerPointPlanError("pptx_invalid_plan");
+        const proposedFindings = parsePowerPointFindings(
+          response.findings,
+          inspection
+        );
+        if (!proposedFindings)
+          throw new PowerPointPlanError("pptx_invalid_plan");
+        return { semanticPlan, proposedFindings };
+      },
+      true
     );
-    calls.push(await toModelCallUsage("convert", call, config));
-    const response = jsonObject(call.content);
-    const semanticPlan = response ? { slides: response.slides } : null;
+    calls.push(...usages.filter(Boolean));
+    const semanticPlan: PptxRepairPlan = { slides: [] };
+    const proposedFindings: PptxFinding[] = [];
+    for (const result of results) {
+      if (result.status === "rejected") throw result.reason;
+      semanticPlan.slides.push(...result.value.semanticPlan.slides);
+      proposedFindings.push(...result.value.proposedFindings);
+    }
+    semanticPlan.slides.sort((a, b) => a.slideNumber - b.slideNumber);
     if (
-      (call.finishReason && call.finishReason !== "stop") ||
-      !response ||
-      Object.keys(response).some(
-        (key) => !["slides", "findings"].includes(key)
-      ) ||
       !completePowerPointPlan(semanticPlan, modelSource) ||
-      semanticPlan.slides.some(
-        (slide) => slide.removeEmptyPlaceholders !== undefined
-      ) ||
-      editsRemovedPlaceholder(semanticPlan, mechanicalPlan)
+      !parsePowerPointFindings(proposedFindings, modelSource)
     )
       throw new PowerPointPlanError("pptx_invalid_plan");
-    const proposedFindings = parsePowerPointFindings(
-      response.findings,
-      modelSource
-    );
-    if (!proposedFindings) throw new PowerPointPlanError("pptx_invalid_plan");
     let plan: PptxRepairPlan;
     try {
       plan = normalizePptxReadingOrders(

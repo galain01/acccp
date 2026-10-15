@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
   pages: vi.fn(),
   call: vi.fn(),
   tracked: vi.fn(),
+  batches: vi.fn(),
 }));
 vi.mock("../lib/pptx-package", async (original) => ({
   ...(await original<typeof import("../lib/pptx-package")>()),
@@ -30,6 +31,10 @@ vi.mock("../lib/powerpoint-rendering", async (original) => ({
 vi.mock("../lib/pdf-rendering", async (original) => ({
   ...(await original<typeof import("../lib/pdf-rendering")>()),
   renderPdfPages: mocks.pages,
+}));
+vi.mock("../lib/powerpoint-model-batches", async (original) => ({
+  ...(await original<typeof import("../lib/powerpoint-model-batches")>()),
+  createPowerPointModelBatches: mocks.batches,
 }));
 vi.mock("../lib/litellm", async (original) => ({
   ...(await original<typeof import("../lib/litellm")>()),
@@ -51,7 +56,9 @@ import {
   buildPowerPointReviewPreviews,
 } from "../lib/powerpoint-convert";
 import { createCanvas } from "@napi-rs/canvas";
-import { LiteLLMError } from "../lib/litellm";
+import { LiteLLMError, type LiteLLMContentPart } from "../lib/litellm";
+import type { RenderedPdf } from "../lib/pdf-rendering";
+import { POWERPOINT_MODEL_BATCH_SIZE } from "../lib/powerpoint-model-batches";
 import { MAX_PPTX_FILE_SIZE_BYTES } from "../lib/document-input";
 
 const inspection: PptxInspection = {
@@ -153,6 +160,31 @@ beforeEach(() => {
   });
   mocks.render.mockResolvedValue(Buffer.from("%PDF-test"));
   mocks.pages.mockResolvedValue(pages());
+  mocks.batches.mockImplementation(
+    async (pdf: Buffer, rendered: RenderedPdf) => {
+      const batches = [];
+      for (
+        let start = 0;
+        start < rendered.pages.length;
+        start += POWERPOINT_MODEL_BATCH_SIZE
+      ) {
+        const selected = rendered.pages.slice(
+          start,
+          start + POWERPOINT_MODEL_BATCH_SIZE
+        );
+        const slideNumbers = selected.map((page) => page.pageNumber);
+        batches.push({
+          slideNumbers,
+          pdf:
+            rendered.pages.length <= POWERPOINT_MODEL_BATCH_SIZE
+              ? pdf
+              : Buffer.from(`%PDF-test-batch:${JSON.stringify(slideNumbers)}`),
+          images: { ...rendered, pages: selected },
+        });
+      }
+      return batches;
+    }
+  );
   mocks.call
     .mockResolvedValueOnce(resultCall(plan))
     .mockResolvedValueOnce(resultCall(audit));
@@ -699,6 +731,674 @@ describe("PowerPoint repair orchestration", () => {
   });
 });
 
+describe("PowerPoint model batches", () => {
+  const numbers = (count: number) =>
+    Array.from({ length: count }, (_, index) => index + 1);
+  const deck = (count: number): PptxInspection => ({
+    ...structuredClone(inspection),
+    slideCount: count,
+    slides: numbers(count).map((slideNumber) => ({
+      ...structuredClone(inspection.slides[0]),
+      slideNumber,
+      partName: `ppt/slides/slide${slideNumber}.xml`,
+      objects: [
+        {
+          ...structuredClone(inspection.slides[0].objects[0]),
+          text: `Slide ${slideNumber}`,
+        },
+      ],
+    })),
+  });
+  const deckPages = (count: number, png?: Buffer): RenderedPdf => ({
+    pageCount: count,
+    pages: numbers(count).map((pageNumber) => ({
+      ...pages(png).pages[0],
+      pageNumber,
+    })),
+  });
+  const selectedSlides = (parts: LiteLLMContentPart[], actual = false) =>
+    parts.flatMap((part) => {
+      if (part.type !== "text") return [];
+      const match = part.text.match(
+        actual
+          ? /^ACTUAL REPAIRED slide (\d+) of /
+          : /^ORIGINAL slide (\d+) of /
+      );
+      return match ? [Number(match[1])] : [];
+    });
+  const auditConcerns = (
+    parts: LiteLLMContentPart[]
+  ): { id: string; finding: PptxFinding }[] => {
+    for (const part of parts) {
+      if (part.type !== "text") continue;
+      const match = part.text.match(
+        /Concerns requiring one findingReviews decision each:\n([^\n]*)/
+      );
+      if (match) return JSON.parse(match[1]);
+    }
+    return [];
+  };
+  const evidenceJson = <T>(parts: LiteLLMContentPart[], label: string): T => {
+    const marker = `${label}:\n`;
+    for (const part of parts) {
+      if (part.type !== "text") continue;
+      const start = part.text.indexOf(marker);
+      if (start >= 0)
+        return JSON.parse(
+          part.text.slice(start + marker.length).split("\n")[0]
+        );
+    }
+    throw new Error(`Missing evidence section: ${label}`);
+  };
+  const locatedFinding = (slideNumber?: number): PptxFinding => ({
+    code: "instructor-review",
+    severity: "warning",
+    ...(slideNumber === undefined ? {} : { slideNumber, objectId: "2" }),
+    message:
+      slideNumber === undefined
+        ? "Confirm the presentation context."
+        : `Confirm the context on slide ${slideNumber}.`,
+    suggestion: "Check the meaning against your course material.",
+  });
+  const responseFor = (system: string, parts: LiteLLMContentPart[]) => {
+    const auditing = system.includes("independently audit");
+    const selected = selectedSlides(parts, auditing);
+    return auditing
+      ? {
+          reviewedSlides: selected,
+          findingReviews: auditConcerns(parts).map(({ id, finding }) => ({
+            id,
+            status: "needs_review",
+            message: finding.message,
+            suggestion: finding.suggestion,
+          })),
+          findings: [],
+        }
+      : {
+          slides: selected.toReversed().map((slideNumber) => ({ slideNumber })),
+          findings: [],
+        };
+  };
+  const prepare = (
+    sourceCount: number,
+    outputCount = sourceCount,
+    changed = false
+  ) => {
+    const source = deck(sourceCount);
+    const repaired = deck(outputCount);
+    const changes: PptxChange[] =
+      outputCount > sourceCount
+        ? [
+            {
+              type: "long-description",
+              slideNumber: 1,
+              objectId: "2",
+              message: "Added a detailed description.",
+              generatedSlideNumbers: numbers(outputCount).slice(sourceCount),
+            },
+          ]
+        : [];
+    mocks.inspect.mockResolvedValue(source);
+    mocks.repair.mockResolvedValue({
+      buffer: output,
+      inspection: repaired,
+      findings: [],
+      changes,
+    });
+    const dark = createCanvas(1, 1);
+    dark.getContext("2d").fillRect(0, 0, 1, 1);
+    mocks.pages
+      .mockReset()
+      .mockResolvedValueOnce(deckPages(sourceCount))
+      .mockResolvedValue(
+        deckPages(outputCount, changed ? dark.toBuffer("image/png") : undefined)
+      );
+    mocks.call
+      .mockReset()
+      .mockImplementation(async (system: string, parts: LiteLLMContentPart[]) =>
+        resultCall(responseFor(system, parts))
+      );
+    return { source, repaired, changes };
+  };
+
+  it("covers all 59 global slide numbers with bounded source and before/after audit evidence", async () => {
+    const { source, repaired, changes } = prepare(59, 59, true);
+    const active = { convert: 0, validate: 0 };
+    const peak = { convert: 0, validate: 0 };
+    mocks.call.mockImplementation(
+      async (system: string, parts: LiteLLMContentPart[]) => {
+        const stage = system.includes("independently audit")
+          ? "validate"
+          : "convert";
+        active[stage]++;
+        peak[stage] = Math.max(peak[stage], active[stage]);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        active[stage]--;
+        return resultCall(responseFor(system, parts));
+      }
+    );
+    const outsideText = "Exact course text outside the first batch. ".repeat(
+      24
+    );
+    const originalAlt =
+      "An authored alternative outside the first batch. ".repeat(20);
+    const savedAlt = "The saved alternative outside the first batch. ".repeat(
+      20
+    );
+    for (const inventory of [source, repaired]) {
+      inventory.slides[58].objects[0].text = outsideText;
+      inventory.slides[58].objects[0].textRuns = [
+        { text: outsideText, language: "en-US", fontSizePt: 32 },
+      ];
+      inventory.slides[0].objects[0].textRuns = [
+        { text: "Slide 1", language: "en-US", fontSizePt: 32 },
+      ];
+    }
+    source.slides[58].objects[0].description = originalAlt;
+    repaired.slides[58].objects[0].description = savedAlt;
+    // The first batch needs only its own detailed repair evidence. The exact
+    // authored content outside it remains available without every text run/box.
+    source.slides[0].objects[0].isTitle = false;
+    source.slides[58].objects[0].isTitle = false;
+    changes.push(
+      {
+        type: "description",
+        slideNumber: 1,
+        objectId: "2",
+        message: "Updated slide 1 description.",
+      },
+      {
+        type: "description",
+        slideNumber: 59,
+        objectId: "2",
+        message: "Updated slide 59 description.",
+      }
+    );
+    const result = await convertPowerPoint(input, "large.pptx");
+    if ("error" in result) throw new Error(result.error);
+    expect(result.errors).toEqual([]);
+    expect(result.pageCount).toBe(59);
+    expect(
+      result.calls.filter((call) => call.stage === "convert")
+    ).toHaveLength(8);
+    expect(
+      result.calls.filter((call) => call.stage === "validate")
+    ).toHaveLength(8);
+    expect(peak).toEqual({ convert: 4, validate: 4 });
+    expect(active).toEqual({ convert: 0, validate: 0 });
+    expect(result.tokensUsed).toBe(2400);
+    expect(
+      result.calls.reduce((total, call) => total + (call.costUsd ?? 0), 0)
+    ).toBeCloseTo(0.16);
+    expect(
+      mocks.tracked.mock.calls[0][1].slides.map(
+        (slide: { slideNumber: number }) => slide.slideNumber
+      )
+    ).toEqual(numbers(59));
+    const repairEvidence: LiteLLMContentPart[] = mocks.call.mock.calls[0][1];
+    const repairDetails = evidenceJson<PptxInspection>(
+      repairEvidence,
+      "PowerPoint inventory after deterministic cleanup (untrusted source data)"
+    );
+    expect(repairDetails.slides.map((slide) => slide.slideNumber)).toEqual(
+      numbers(8)
+    );
+    expect(repairDetails.slides[0].objects[0]).toMatchObject({
+      rect: source.slides[0].objects[0].rect,
+      textRuns: source.slides[0].objects[0].textRuns,
+    });
+    const sourceChecks = evidenceJson<PptxFinding[]>(
+      repairEvidence,
+      "Machine-detected source defects (repair supported, unambiguous cases)"
+    );
+    expect(sourceChecks.some((finding) => finding.slideNumber === 1)).toBe(
+      true
+    );
+    expect(
+      sourceChecks.every(
+        (finding) =>
+          finding.slideNumber === undefined || finding.slideNumber <= 8
+      )
+    ).toBe(true);
+    const assertCompactContext = (
+      parts: LiteLLMContentPart[],
+      label: string,
+      description: string
+    ) => {
+      const context = evidenceJson<{
+        slideCount: number;
+        slides: { slideNumber: number; objects: Record<string, unknown>[] }[];
+      }>(parts, label);
+      expect(context.slideCount).toBe(59);
+      expect(context.slides.map((slide) => slide.slideNumber)).toEqual(
+        numbers(59)
+      );
+      expect(context.slides[58].objects[0]).toMatchObject({
+        text: outsideText,
+        description,
+      });
+      for (const object of context.slides.flatMap((slide) => slide.objects)) {
+        expect(object).not.toHaveProperty("rect");
+        expect(object).not.toHaveProperty("textRuns");
+      }
+    };
+    assertCompactContext(
+      repairEvidence,
+      "Full presentation context (untrusted; other slides are context only, not visual evidence)",
+      originalAlt
+    );
+    const auditEvidence: LiteLLMContentPart[] = mocks.call.mock.calls.find(
+      ([system]) => system.includes("independently audit")
+    )![1];
+    for (const label of [
+      "Original inventory for assigned and reference slides (untrusted source data)",
+      "Actual saved output inventory for assigned and reference slides (untrusted source data)",
+    ]) {
+      const details = evidenceJson<PptxInspection>(auditEvidence, label);
+      expect(details.slides.map((slide) => slide.slideNumber)).toEqual(
+        numbers(8)
+      );
+      expect(details.slides[0].objects[0]).toHaveProperty("rect");
+      expect(details.slides[0].objects[0]).toHaveProperty("textRuns");
+    }
+    assertCompactContext(
+      auditEvidence,
+      "Full original presentation context (untrusted; context only, not visual evidence)",
+      originalAlt
+    );
+    assertCompactContext(
+      auditEvidence,
+      "Full saved presentation context (untrusted; includes exact accessible description text)",
+      savedAlt
+    );
+    expect(
+      evidenceJson<PptxChange[]>(auditEvidence, "Applied changes").map(
+        (change) => change.slideNumber
+      )
+    ).toEqual([1]);
+    for (const auditing of [false, true]) {
+      const requests = mocks.call.mock.calls.filter(
+        ([system]) => system.includes("independently audit") === auditing
+      );
+      expect(
+        requests.flatMap(([, parts]) => selectedSlides(parts, auditing))
+      ).toEqual(numbers(59));
+      for (const [, parts] of requests) {
+        const selected = selectedSlides(parts, auditing);
+        expect(selected.length).toBeLessThanOrEqual(8);
+        const images = parts.filter(
+          (part: LiteLLMContentPart) => part.type === "image_url"
+        );
+        expect(images.length).toBe(selected.length * (auditing ? 2 : 1));
+        // A PDF page and its explicit PNG each count as model visual inputs.
+        expect(images.length + selected.length).toBeLessThanOrEqual(24);
+        const file = parts.find(
+          (part: LiteLLMContentPart) => part.type === "file"
+        );
+        expect(
+          Buffer.from(file.file.file_data.split(",")[1], "base64").toString()
+        ).toBe(`%PDF-test-batch:${JSON.stringify(selected)}`);
+      }
+    }
+  });
+
+  it.each(["slide operation", "finding"])(
+    "rejects a repair batch's out-of-scope %s while retaining both completed calls",
+    async (kind) => {
+      prepare(9);
+      mocks.call.mockImplementation(
+        async (system: string, parts: LiteLLMContentPart[]) => {
+          const selected = selectedSlides(parts);
+          const response = responseFor(system, parts);
+          if (selected[0] === 1) {
+            if (kind === "slide operation")
+              return resultCall({
+                slides: selected.map((slideNumber, index) => ({
+                  slideNumber: index === 0 ? 9 : slideNumber,
+                })),
+                findings: [],
+              });
+            return resultCall({ ...response, findings: [locatedFinding(9)] });
+          }
+          return resultCall(response);
+        }
+      );
+      const result = await convertPowerPoint(input, "large.pptx");
+      expect(result).toMatchObject({
+        diagnostic: { code: "pptx_invalid_plan" },
+      });
+      expect(result.calls).toHaveLength(2);
+      expect(result.calls?.every((call) => call.costUsd === 0.01)).toBe(true);
+      expect(mocks.tracked).not.toHaveBeenCalled();
+    }
+  );
+
+  it("stops scheduling queued repair batches after a malformed response but awaits active calls and records their costs", async () => {
+    prepare(59);
+    const finishLater: (() => void)[] = [];
+    mocks.call.mockImplementation(
+      async (system: string, parts: LiteLLMContentPart[]) => {
+        if (selectedSlides(parts)[0] === 1)
+          return { ...resultCall({}), content: "private invalid JSON" };
+        return new Promise((resolve) => {
+          finishLater.push(() =>
+            resolve(resultCall(responseFor(system, parts)))
+          );
+        });
+      }
+    );
+    let settled = false;
+    const pending = convertPowerPoint(input, "large.pptx").finally(() => {
+      settled = true;
+    });
+    await vi.waitFor(() => expect(mocks.call).toHaveBeenCalledTimes(4));
+    expect(settled).toBe(false);
+    expect(finishLater).toHaveLength(3);
+    for (const finish of finishLater) finish();
+    const result = await pending;
+    expect(result).toMatchObject({ diagnostic: { code: "pptx_invalid_plan" } });
+    expect(mocks.call).toHaveBeenCalledTimes(4);
+    expect(result.calls).toHaveLength(4);
+    expect(result.calls?.every((call) => call.costUsd === 0.01)).toBe(true);
+    expect(JSON.stringify(result)).not.toContain("private invalid JSON");
+    expect(mocks.tracked).not.toHaveBeenCalled();
+  });
+
+  it("continues queued audit batches and keeps their findings when another audit batch is malformed", async () => {
+    prepare(59);
+    mocks.call.mockImplementation(
+      async (system: string, parts: LiteLLMContentPart[]) => {
+        const response = responseFor(system, parts);
+        if (system.includes("independently audit")) {
+          if (selectedSlides(parts, true)[0] === 1)
+            return { ...resultCall({}), content: "invalid JSON" };
+          return resultCall({
+            ...response,
+            findings: [locatedFinding(selectedSlides(parts, true)[0])],
+          });
+        }
+        return resultCall(response);
+      }
+    );
+    const result = await convertPowerPoint(input, "large.pptx");
+    if ("error" in result) throw new Error(result.error);
+    expect(result.calls).toHaveLength(16);
+    const requests = mocks.call.mock.calls.filter(([system]) =>
+      system.includes("independently audit")
+    );
+    expect(
+      requests.flatMap(([, parts]) => selectedSlides(parts, true))
+    ).toEqual(numbers(59));
+    for (const slideNumber of [9, 17, 25, 33, 41, 49, 57])
+      expect(result.errors).toContainEqual(
+        expect.objectContaining({
+          message: locatedFinding(slideNumber).message,
+        })
+      );
+    expect(result.errors).toContainEqual(
+      expect.objectContaining({
+        message: expect.stringContaining(
+          "independent AI review did not finish"
+        ),
+      })
+    );
+  });
+
+  it("assigns located concerns once and retains presentation-wide concerns outside individual audit batches", async () => {
+    prepare(9);
+    mocks.call.mockImplementation(
+      async (system: string, parts: LiteLLMContentPart[]) => {
+        const response = responseFor(system, parts);
+        if (!system.includes("independently audit")) {
+          const selected = selectedSlides(parts);
+          return resultCall({
+            ...response,
+            findings:
+              selected[0] === 1
+                ? [locatedFinding(), locatedFinding(1)]
+                : [locatedFinding(9)],
+          });
+        }
+        return resultCall(response);
+      }
+    );
+    const result = await convertPowerPoint(input, "large.pptx");
+    if ("error" in result) throw new Error(result.error);
+    const requests = mocks.call.mock.calls.filter(([system]) =>
+      system.includes("independently audit")
+    );
+    const concerns = requests.map(([, parts]) => auditConcerns(parts));
+    expect(concerns[0].map(({ finding }) => finding.slideNumber)).toEqual([1]);
+    expect(concerns[1].map(({ finding }) => finding.slideNumber)).toEqual([9]);
+    expect(new Set(concerns.flat().map(({ id }) => id)).size).toBe(2);
+    expect(result.errors.map((finding) => finding.message).sort()).toEqual(
+      [
+        locatedFinding().message,
+        locatedFinding(1).message,
+        locatedFinding(9).message,
+      ].sort()
+    );
+  });
+
+  it("audits an appended description slide in its own batch using its actual output number", async () => {
+    prepare(8, 9);
+    const result = await convertPowerPoint(input, "large.pptx");
+    if ("error" in result) throw new Error(result.error);
+    expect(result.errors).toEqual([]);
+    expect(result.pageCount).toBe(9);
+    expect(result.calls.map((call) => call.stage)).toEqual([
+      "convert",
+      "validate",
+      "validate",
+    ]);
+    const requests = mocks.call.mock.calls.filter(([system]) =>
+      system.includes("independently audit")
+    );
+    expect(requests.map(([, parts]) => selectedSlides(parts, true))).toEqual([
+      numbers(8),
+      [9],
+    ]);
+    expect(requests[1][1]).toContainEqual(
+      expect.objectContaining({
+        type: "text",
+        text: expect.stringContaining("REFERENCE ONLY"),
+      })
+    );
+    expect(
+      requests[1][1].filter(
+        (part: LiteLLMContentPart) => part.type === "image_url"
+      )
+    ).toHaveLength(2);
+    expect(
+      result.reviewPreviews?.find((preview) => preview.slideNumber === 9)
+    ).not.toHaveProperty("before");
+  });
+
+  it.each(["coverage", "finding", "correction"])(
+    "rejects an audit batch's out-of-scope %s",
+    async (kind) => {
+      prepare(9);
+      mocks.call.mockImplementation(
+        async (system: string, parts: LiteLLMContentPart[]) => {
+          const response = responseFor(system, parts);
+          if (
+            system.includes("independently audit") &&
+            selectedSlides(parts, true)[0] === 1
+          ) {
+            return resultCall({
+              ...response,
+              ...(kind === "coverage"
+                ? { reviewedSlides: [...numbers(7), 9] }
+                : kind === "finding"
+                  ? { findings: [locatedFinding(9)] }
+                  : {
+                      correctivePlan: {
+                        slides: [...numbers(7), 9].map((slideNumber) => ({
+                          slideNumber,
+                          ...(slideNumber === 9
+                            ? {
+                                descriptions: [
+                                  {
+                                    objectId: "2",
+                                    text: "Outside this batch.",
+                                  },
+                                ],
+                              }
+                            : {}),
+                        })),
+                      },
+                    }),
+            });
+          }
+          return resultCall(response);
+        }
+      );
+      const result = await convertPowerPoint(input, "large.pptx");
+      if ("error" in result) throw new Error(result.error);
+      expect(result.calls).toHaveLength(4);
+      expect(result.errors).toContainEqual(
+        expect.objectContaining({
+          message: expect.stringContaining(
+            "independent AI review did not finish"
+          ),
+        })
+      );
+    }
+  );
+
+  it("merges a scoped corrective plan and independently audits every corrected output batch", async () => {
+    const { repaired } = prepare(9);
+    const corrected = Buffer.from("corrected large-pptx");
+    mocks.repair
+      .mockResolvedValueOnce({
+        buffer: output,
+        inspection: repaired,
+        findings: [],
+        changes: [],
+      })
+      .mockResolvedValue({
+        buffer: corrected,
+        inspection: repaired,
+        findings: [],
+        changes: [],
+      });
+    mocks.call.mockImplementation(
+      async (system: string, parts: LiteLLMContentPart[]) => {
+        const response = responseFor(system, parts);
+        return resultCall(
+          system.includes("independently audit") &&
+            mocks.tracked.mock.calls.length === 1 &&
+            selectedSlides(parts, true)[0] === 9
+            ? {
+                ...response,
+                correctivePlan: {
+                  slides: [
+                    {
+                      slideNumber: 9,
+                      descriptions: [
+                        { objectId: "2", text: "A corrected description." },
+                      ],
+                    },
+                  ],
+                },
+              }
+            : response
+        );
+      }
+    );
+    const result = await convertPowerPoint(input, "large.pptx");
+    if ("error" in result) throw new Error(result.error);
+    expect(result.pptx).toEqual(corrected);
+    expect(result.errors).toEqual([]);
+    expect(
+      result.calls.filter((call) => call.stage === "validate")
+    ).toHaveLength(4);
+    expect(result.calls).toHaveLength(6);
+    expect(result.tokensUsed).toBe(900);
+    expect(mocks.tracked).toHaveBeenCalledTimes(2);
+    expect(mocks.tracked.mock.calls[1][0]).toEqual(input);
+    expect(
+      mocks.tracked.mock.calls[1][1].slides.map(
+        (slide: { slideNumber: number }) => slide.slideNumber
+      )
+    ).toEqual(numbers(9));
+    expect(mocks.tracked.mock.calls[1][1].slides[8]).toMatchObject({
+      slideNumber: 9,
+      descriptions: [{ objectId: "2", text: "A corrected description." }],
+    });
+    const finalRequests = mocks.call.mock.calls.slice(-2);
+    expect(
+      finalRequests.flatMap(([, parts]) => selectedSlides(parts, true))
+    ).toEqual(numbers(9));
+    for (const [, parts] of finalRequests)
+      expect(parts).toContainEqual(
+        expect.objectContaining({
+          type: "text",
+          text: expect.stringContaining("Automatic correction DISABLED"),
+        })
+      );
+  });
+
+  it.each([false, true])(
+    "batches selected-export audits with correction disabled (attempted correction: %s)",
+    async (attemptCorrection) => {
+      const { source, repaired } = prepare(9);
+      mocks.inspect
+        .mockReset()
+        .mockResolvedValueOnce(source)
+        .mockResolvedValueOnce(repaired);
+      mocks.call.mockImplementation(
+        async (system: string, parts: LiteLLMContentPart[]) => {
+          const response = responseFor(system, parts);
+          return resultCall(
+            attemptCorrection && selectedSlides(parts, true)[0] === 9
+              ? {
+                  ...response,
+                  correctivePlan: {
+                    slides: [
+                      {
+                        slideNumber: 9,
+                        descriptions: [
+                          { objectId: "2", text: "Unauthorized change" },
+                        ],
+                      },
+                    ],
+                  },
+                }
+              : response
+          );
+        }
+      );
+      const result = await recheckPowerPointRevision(input, output);
+      if ("error" in result) throw new Error(result.error);
+      expect(result.pptx).toEqual(output);
+      expect(result.calls.map((call) => call.stage)).toEqual([
+        "validate",
+        "validate",
+      ]);
+      expect(
+        mocks.call.mock.calls.flatMap(([, parts]) =>
+          selectedSlides(parts, true)
+        )
+      ).toEqual(numbers(9));
+      for (const [, parts] of mocks.call.mock.calls)
+        expect(parts).toContainEqual(
+          expect.objectContaining({
+            type: "text",
+            text: expect.stringContaining("Automatic correction DISABLED"),
+          })
+        );
+      expect(
+        result.errors.some((finding) =>
+          finding.message.includes("independent AI review")
+        )
+      ).toBe(attemptCorrection);
+      expect(mocks.repair).not.toHaveBeenCalled();
+      expect(mocks.tracked).not.toHaveBeenCalled();
+    }
+  );
+});
+
 describe("deterministic empty-placeholder preprocessing", () => {
   const original = (): PptxInspection => {
     const source = structuredClone(inspection);
@@ -785,9 +1485,7 @@ describe("deterministic empty-placeholder preprocessing", () => {
     const inventory = repairEvidence.find(
       (part: { type: string; text?: string }) =>
         part.type === "text" &&
-        part.text?.startsWith(
-          "PowerPoint inventory after deterministic cleanup"
-        )
+        part.text?.includes("PowerPoint inventory after deterministic cleanup")
     );
     expect(inventory.text).not.toContain('"id":"4"');
     expect(repairEvidence).toContainEqual({
