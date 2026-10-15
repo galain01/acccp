@@ -17,12 +17,26 @@ const app = process.cwd();
 const trace = join(app, ".next/server/app/api/convert/route.js.nft.json");
 const files = JSON.parse(await readFile(trace, "utf8")).files;
 // Both the initial conversion and selected-version export invoke this worker.
-const reviewTrace = join(app, ".next/server/app/api/powerpoint-review/route.js.nft.json");
-const reviewFiles = new Set(JSON.parse(await readFile(reviewTrace, "utf8")).files.map((item) => resolve(dirname(reviewTrace), item)));
+const reviewTrace = join(
+  app,
+  ".next/server/app/api/powerpoint-review/route.js.nft.json"
+);
+const reviewFiles = new Set(
+  JSON.parse(await readFile(reviewTrace, "utf8")).files.map((item) =>
+    resolve(dirname(reviewTrace), item)
+  )
+);
 for (const item of files) {
   const source = resolve(dirname(trace), item);
-  if (/(?:pdf-rendering-child|pdf-image-alternatives|pdf-revisions|pdf-render-warnings)\.mjs$|[/\\]pdfjs-dist[/\\]|[/\\]@napi-rs[/\\]/.test(source) && !reviewFiles.has(source))
-    throw new Error("PowerPoint review export is missing a traced renderer dependency.");
+  if (
+    /(?:pdf-rendering-child|pdf-image-alternatives|pdf-image-usage|pdf-revisions|pdf-render-warnings)\.mjs$|[/\\]pdfjs-dist[/\\]|[/\\]@napi-rs[/\\]/.test(
+      source
+    ) &&
+    !reviewFiles.has(source)
+  )
+    throw new Error(
+      "PowerPoint review export is missing a traced renderer dependency."
+    );
 }
 const target = await mkdtemp(join(tmpdir(), "acccp-pdf-build-"));
 try {
@@ -38,7 +52,7 @@ try {
     )
       continue;
     if (
-      !/^(?:lib[/\\]pdf-(?:rendering-child|image-alternatives|revisions|render-warnings)\.mjs|node_modules[/\\](?:pdfjs-dist|@napi-rs)[/\\]|node_modules[/\\]pdf-lib[/\\]dist[/\\]pdf-lib\.min\.js$)/.test(
+      !/^(?:lib[/\\]pdf-(?:rendering-child|image-alternatives|image-usage|revisions|render-warnings)\.mjs|node_modules[/\\](?:pdfjs-dist|@napi-rs)[/\\]|node_modules[/\\]pdf-lib[/\\]dist[/\\]pdf-lib\.min\.js$)/.test(
         sub
       )
     )
@@ -98,7 +112,9 @@ try {
   pdf.catalog.set(PDFName.of("MarkInfo"), pdf.context.obj({ Marked: true }));
   // A small compressed file may contain a high-resolution source scan. Exercise
   // the new source-image allowance using actual decoded pixels, not a declaration
-  // that PDF.js never draws. Every page has a distinct 20.16 MP bilevel image.
+  // that PDF.js never draws. Every page uses one distinct 20.16 MP bilevel image,
+  // while their shared resource list exceeds the 32 MP per-page bound.
+  const sharedScans = pdf.context.obj({});
   for (let index = 0; index < 18; index++) {
     const width = 3600,
       height = 5600;
@@ -117,9 +133,11 @@ try {
       })
     );
     const page = pdf.addPage([432, 672]);
+    const scanName = PDFName.of(`Scan${index + 1}`);
+    sharedScans.set(scanName, ref);
     page.node.set(
       PDFName.of("Resources"),
-      pdf.context.obj({ XObject: { Scan: ref } })
+      pdf.context.obj({ XObject: sharedScans })
     );
     page.pushOperators(
       PDFOperator.of("q"),
@@ -127,7 +145,7 @@ try {
         "cm",
         [432, 0, 0, 672, 0, 0].map((n) => pdf.context.obj(n))
       ),
-      PDFOperator.of("Do", [PDFName.of("Scan")]),
+      PDFOperator.of("Do", [scanName]),
       PDFOperator.of("Q")
     );
     page.drawText(`Scan page ${index + 1}`, { x: 10, y: 640, size: 10 });
@@ -159,6 +177,7 @@ try {
         "--allow-addons",
         `--allow-fs-read=${childPath}`,
         `--allow-fs-read=${join(target, "lib/pdf-image-alternatives.mjs")}`,
+        `--allow-fs-read=${join(target, "lib/pdf-image-usage.mjs")}`,
         `--allow-fs-read=${join(target, "lib/pdf-revisions.mjs")}`,
         `--allow-fs-read=${join(target, "lib/pdf-render-warnings.mjs")}`,
         `--allow-fs-read=${join(target, "node_modules/pdf-lib/dist/pdf-lib.min.js")}`,

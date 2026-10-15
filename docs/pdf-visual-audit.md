@@ -43,11 +43,18 @@ Uploads remain limited to 4 MiB. The renderer permits up to 60 pages, 90 seconds
 inspects up to 100,000 PDF objects, including unreferenced image streams and nested
 soft/explicit masks. Declared images and masks are limited to 24 million pixels and
 8192 pixels per dimension; combined base/mask dimensions must also fit. The sum
-of those declared image areas is limited to 32 million pixels in each page's
-resource graph and 480 million pixels across the document. A page's resource
-graph includes inherited resources, nested forms, patterns, Type3 fonts,
-transparency groups and annotation appearances; shared images count once per
-page. The document budget also includes unused images. These separate bounds
+of those declared image areas is limited to 32 million pixels used by each page
+and 480 million pixels across the document. A bounded content inspection follows
+images and invoked forms using that page's resource context, including inherited
+resources and image masks. This avoids counting an entire presentation's shared
+image list against every slide. Shared images count once per page. The original
+PDF bytes, image dimensions and rendered page resolution remain unchanged.
+
+When content cannot be interpreted confidently, the page keeps the conservative
+full-resource check. This includes inline images, unsupported content filters or
+syntax, patterns, Type3 fonts, transparency groups and annotation appearances.
+The full-resource graph includes their nested resources and masks. The document
+and individual-image budgets still include unused images. These separate bounds
 allow long scans without admitting the same large pixel total on a single page.
 Inline images retain PDF.js's per-image check; these guards are not a total native
 memory cap. The preflight follows the PDF's cross-reference index and saved

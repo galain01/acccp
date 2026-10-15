@@ -441,6 +441,7 @@ export async function renderPdfPages(
             "--allow-addons",
             `--allow-fs-read=${childPath}`,
             `--allow-fs-read=${join(root, "lib", "pdf-image-alternatives.mjs")}`,
+            `--allow-fs-read=${join(root, "lib", "pdf-image-usage.mjs")}`,
             `--allow-fs-read=${join(root, "lib", "pdf-revisions.mjs")}`,
             `--allow-fs-read=${join(root, "lib", "pdf-render-warnings.mjs")}`,
             `--allow-fs-read=${join(root, "node_modules", "pdf-lib", "dist", "pdf-lib.min.js")}`,
