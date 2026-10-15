@@ -173,7 +173,7 @@ export function diagnosticStageLabel(stage: DiagnosticStage): string {
 
 const EXPLANATIONS: Record<DiagnosticCode, string> = {
   pptx_invalid:
-    "The app could not safely read this presentation. Use an unprotected .pptx file under 4 MB, with at most 60 slides. Macro-enabled and digitally signed files are not supported.",
+    "The app could not safely read this presentation. Use an unprotected .pptx file up to 25 MB, with at most 60 slides. Macro-enabled and digitally signed files are not supported.",
   pptx_render_failed:
     "The app could not prepare all PowerPoint slides for visual checking. Try a smaller presentation or contact the administrator if this continues.",
   pptx_visual_change:
