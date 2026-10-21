@@ -532,6 +532,25 @@ describe("native PDF orchestration", () => {
 
     const repairParts = mocks.call.mock.calls[0][1] as LiteLLMContentPart[];
     expect(scope(repairParts)).toMatchObject({ findings: prepared.findings });
+    const repairPrompt = mocks.call.mock.calls[0][0] as string;
+    expect(repairPrompt).toContain(
+      "with an existing or proposed title it sets the window to display that title and adds a missing XMP metadata container containing the title."
+    );
+    expect(repairPrompt).toContain(
+      "It preserves an existing metadata container."
+    );
+    expect(repairPrompt).toContain(
+      "The app independently reruns those checks on the saved output and displays all remaining failures."
+    );
+    expect(repairPrompt).toContain(
+      "Do not copy machine findings into your findings array"
+    );
+    expect(repairPrompt).toContain(
+      "Report additional semantic, ambiguous or unsupported concerns only."
+    );
+    expect(repairPrompt).toContain(
+      "Never add a PDF/UA declaration."
+    );
     const auditParts = mocks.call.mock.calls[1][1] as LiteLLMContentPart[];
     const evidence = auditParts.find((p) => p.type === "text");
     if (!evidence || evidence.type !== "text") throw Error("Missing evidence");
