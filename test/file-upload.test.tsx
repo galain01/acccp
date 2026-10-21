@@ -37,17 +37,14 @@ async function choose(files: File[]) {
   });
 }
 
-describe("output-specific file selection", () => {
-  it("accepts only nonempty supported PowerPoints within the size limit", async () => {
+describe("mixed document selection", () => {
+  it("accepts mixed formats and their exact size boundaries in one upload", async () => {
     await act(async () =>
-      root.render(
-        <FileUpload
-          outputTarget="accessible_pptx"
-          onFilesSelected={onFilesSelected}
-        />
-      )
+      root.render(<FileUpload onFilesSelected={onFilesSelected} />)
     );
     const valid = new File(["synthetic"], "lecture.PPTX");
+    const pdf = new File([new Uint8Array(MAX_FILE_SIZE_BYTES)], "article.pdf");
+    const word = new File([new Uint8Array(MAX_FILE_SIZE_BYTES)], "notes.DOCX");
     const largeValid = new File(
       [new Uint8Array(MAX_PPTX_FILE_SIZE_BYTES)],
       "large-valid.pptx"
@@ -55,9 +52,11 @@ describe("output-specific file selection", () => {
     await choose([
       valid,
       largeValid,
+      pdf,
+      word,
       new File(["synthetic"], "old.ppt"),
       new File(["synthetic"], "macro.pptm"),
-      new File(["synthetic"], "article.pdf"),
+      new File(["synthetic"], "macro.docm"),
       new File([], "empty.pptx"),
       new File(
         [new Uint8Array(MAX_PPTX_FILE_SIZE_BYTES + 1)],
@@ -67,35 +66,52 @@ describe("output-specific file selection", () => {
     expect(onFilesSelected).toHaveBeenCalledExactlyOnceWith([
       valid,
       largeValid,
+      pdf,
+      word,
     ]);
     expect(host.textContent).toContain("25 MB");
     expect(host.querySelector("input")?.accept).toContain(".pptx");
-    expect(host.querySelector("input")?.accept).not.toContain(".pdf");
+    expect(host.querySelector("input")?.accept).toContain(".pdf,.docx,.pptx");
     expect(host.querySelector('[role="status"]')?.textContent).toContain(
       "PowerPoint (.pptx)"
     );
-    expect(host.textContent).toContain("Accessibility Checker");
-    expect(host.textContent).not.toContain("Preparing PDF pages");
   });
 
-  it("keeps Word and PDF input available for the default Canvas output", async () => {
+  it("rejects empty and over-limit files without hiding valid mixed uploads", async () => {
     await act(async () =>
       root.render(<FileUpload onFilesSelected={onFilesSelected} />)
     );
     const pdf = new File(["synthetic"], "article.pdf");
     const word = new File(["synthetic"], "notes.docx");
+    const slides = new File(["synthetic"], "slides.pptx");
     await choose([
       pdf,
       word,
-      new File(["synthetic"], "slides.pptx"),
+      slides,
+      new File([], "empty.pdf"),
+      new File([], "empty.docx"),
       new File([new Uint8Array(MAX_FILE_SIZE_BYTES + 1)], "large.pdf"),
       new File([new Uint8Array(MAX_FILE_SIZE_BYTES + 1)], "large.docx"),
     ]);
-    expect(onFilesSelected).toHaveBeenCalledExactlyOnceWith([pdf, word]);
+    expect(onFilesSelected).toHaveBeenCalledExactlyOnceWith([
+      pdf,
+      word,
+      slides,
+    ]);
     expect(host.querySelector("input")?.accept).toContain(".pdf,.docx");
     expect(host.querySelector('[role="status"]')?.textContent).toContain(
-      "PDF or Word"
+      "4 files were not added"
     );
-    expect(host.textContent).toContain("90-second limit");
+    await choose([pdf]);
+    expect(host.querySelector('[role="status"]')).toBeNull();
+  });
+
+  it("does not accept a selection while processing is active", async () => {
+    await act(async () =>
+      root.render(<FileUpload disabled onFilesSelected={onFilesSelected} />)
+    );
+    await choose([new File(["synthetic"], "slides.pptx")]);
+    expect(onFilesSelected).not.toHaveBeenCalled();
+    expect(host.querySelector<HTMLInputElement>("input")?.disabled).toBe(true);
   });
 });

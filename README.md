@@ -1,10 +1,13 @@
-# Accessible Canvas Content Conversion Platform
+# ACCCP — Document Accessibility Workspace
 
 ## Overview
 
-The Accessible Canvas Content Conversion Platform (dubbed "ACCCP" by the development team)
-is a centralized platform for OSU instructors to convert their Word and PDF course content into accessible
-Canvas-ready HTML by leveraging state-of-the-art LLM AI models.
+ACCCP helps OSU instructors improve the accessibility of teaching materials and
+choose the format they need. PowerPoint can be repaired in its original `.pptx`
+format; Word and PDF can currently be converted to Canvas-compatible HTML.
+Native Word and PDF repair are planned and remain unavailable until their
+dedicated engines are validated. See the [implementation roadmap](docs/document-accessibility-roadmap.md)
+for the format-preserving direction and release gates.
 
 This project was developed as part of a summer 2026 CSE 5911 capstone session
 at the Ohio State University by group members Adithya Balachandar, Braedon Salisbury,
@@ -44,10 +47,18 @@ project's technical reference for humans.
    **sessions** (think folders/course contexts), listed in the sidebar. Sessions
    can be created, renamed, and archived; a default session is created
    automatically on first visit.
-2. Inside a session, upload one or more `.docx` or `.pdf` files (up to 4 MB each and 60 PDF pages).
-   Word uploads require the [Word rendering service](docs/word-to-pdf.md).
-3. Click **Convert**. Word documents are first rendered to PDF by the configured
-   service. Each unlocked document then enters the same two-stage AI pipeline:
+2. Inside a session, add a mixed batch of `.docx`, `.pdf`, and `.pptx` files.
+   Word/PDF allow up to 4 MB and 60 rendered pages; PowerPoint allows up to
+   25 MB and 60 slides. Choose **Keep original format** or **HTML (Canvas)** for
+   new files, with an override beside each pending file. Unavailable destinations
+   are identified explicitly and never silently changed to HTML. Saved files keep
+   their existing destination. Word-to-HTML requires the
+   [Word rendering service](docs/word-to-pdf.md).
+3. Click **Improve accessibility**. Eligible new or failed unlocked documents are
+   processed; completed documents require an explicit rerun. Native PowerPoint
+   uses its [dedicated repair and review pipeline](docs/powerpoint-accessibility.md).
+   For Canvas HTML, Word documents are first rendered to PDF by the configured
+   service. Word/PDF then enter the two-stage HTML pipeline:
    - **Stage 1 — conversion**: the server renders every PDF page and sends the configured
      vision-capable model the original file plus explicit page images. The model
      infers headings and reading order from content and appearance, preserves
@@ -64,9 +75,10 @@ project's technical reference for humans.
    Word conversions also include a manual-review notice: linked content can be
    omitted and fonts or page layout can change during rendering. Compare the
    rendered result with the original even when conversion succeeds.
-4. Click a converted document to open the **result dialog**: the pretty-printed
-   HTML output, items labeled **Needs a fix** or **Please check**, and buttons to copy the HTML or
-   download it as an `.html` file — ready to paste into the Canvas RCE.
+4. Open a completed document to review its result. Native PowerPoint provides
+   an updated `.pptx`, measured changes and review items. HTML results provide
+   formatted HTML, items labeled **Needs a fix** or **Please check**, and buttons
+   to copy or download it for Canvas.
 5. Locking a document (padlock icon in the table) excludes it from the next
    Convert run. Re-converting a document overwrites its previous output.
    Deleting a document removes it and its stored files.

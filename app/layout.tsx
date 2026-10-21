@@ -1,4 +1,4 @@
-import { Geist, Geist_Mono, Inter } from "next/font/google";
+import { Geist_Mono, Inter } from "next/font/google";
 
 import "./globals.css";
 import { ThemeProvider } from "@/components/theme-provider";
@@ -29,10 +29,10 @@ export default function RootLayout({
       )}
     >
       <head>
-        <title>ACCCP</title>
+        <title>ACCCP | Document Accessibility</title>
       </head>
       <body>
-        {/* Forced light theme to match Canvas. May change in the future. */}
+        {/* Keep the established workspace appearance across output formats. */}
         <TooltipProvider>
           <ThemeProvider forcedTheme="light">{children}</ThemeProvider>
         </TooltipProvider>

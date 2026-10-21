@@ -108,13 +108,11 @@ export default function HomePage(): React.JSX.Element {
   return (
     <main className="flex min-h-svh flex-col items-center justify-center gap-8 px-4 py-12">
       <header className="flex w-full max-w-sm flex-col gap-1 text-center">
-        <h1 className="text-2xl font-bold">
-          Accessible Canvas Content Conversion Platform
-        </h1>
+        <h1 className="text-2xl font-bold">Document Accessibility Workspace</h1>
         <p className="text-sm text-muted-foreground">
-          Convert your Word and PDF course content into accessible Canvas-ready
-          HTML, or improve a PowerPoint presentation and download an updated
-          .pptx file.
+          Improve your teaching materials and choose the format you need.
+          PowerPoint repair and Word/PDF to Canvas HTML are available now.
+          Original-format Word and PDF repair are in development.
         </p>
       </header>
       {step === "email" ? (
@@ -230,7 +228,10 @@ export default function HomePage(): React.JSX.Element {
           </CardFooter>
         </Card>
       )}
-      <DocumentProcessingNotice className="w-full max-w-lg" />
+      <DocumentProcessingNotice
+        className="w-full max-w-lg"
+        outputTarget="mixed"
+      />
     </main>
   );
 }

@@ -1,11 +1,14 @@
 "use client";
 
 import { Lock, LockOpen, X } from "lucide-react";
-import { useState } from "react";
+import { useId, useState } from "react";
 import {
-  DEFAULT_OUTPUT_TARGET,
-  isSupportedOutputForFilename,
-} from "@/lib/output-formats";
+  canChooseDocumentOutput,
+  getDocumentOutputChoice,
+  getOutputChoice,
+  isOutputIntent,
+  type OutputIntent,
+} from "@/lib/output-intent";
 import { formatBytes, formatUploadTime } from "@/lib/format";
 import type { ConversionStatus, UploadedDocument } from "@/lib/types/document";
 import type { PowerPointReviewExport } from "@/lib/powerpoint-review-contract";
@@ -35,6 +38,7 @@ interface DocumentTableProps {
   onDeleteDocument: (docId: string) => void | Promise<void>;
   onReconvert: (docId: string) => void;
   isProcessing: boolean;
+  onChangeOutput: (documentId: string, intent: OutputIntent) => void;
   onReviewExport?: (documentId: string, result: PowerPointReviewExport) => void;
 }
 
@@ -98,8 +102,10 @@ export default function DocumentTable({
   onDeleteDocument,
   onReconvert,
   isProcessing,
+  onChangeOutput,
   onReviewExport,
 }: DocumentTableProps): React.JSX.Element {
+  const outputId = useId();
   const [selectedDocument, setSelectedDocument] =
     useState<UploadedDocument | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -129,10 +135,12 @@ export default function DocumentTable({
         </CardHeader>
         <CardContent>
           <p className="text-sm text-muted-foreground">
-            Choose an output format, then drag the matching files onto the
-            upload area above or click to browse, then click{" "}
-            <strong className="font-medium text-foreground">Convert</strong> to
-            start the conversion process.
+            Add Word, PDF, or PowerPoint files together. Choose how to download
+            each result, then click{" "}
+            <strong className="font-medium text-foreground">
+              Improve accessibility
+            </strong>
+            .
           </p>
           <p className="mt-2 text-sm text-muted-foreground">
             Documents saved online expire after 14 days and disappear from this
@@ -162,8 +170,8 @@ export default function DocumentTable({
                   <span className="sr-only">Conversion lock</span>
                 </TableHead>
                 <TableHead>Document name</TableHead>
-                <TableHead>Output format</TableHead>
-                <TableHead>Conversion status</TableHead>
+                <TableHead>Download as</TableHead>
+                <TableHead>Status</TableHead>
                 <TableHead>File size</TableHead>
                 <TableHead>Upload time</TableHead>
                 <TableHead>Actions</TableHead>
@@ -171,14 +179,15 @@ export default function DocumentTable({
             </TableHeader>
             <TableBody>
               {documents.map((doc) => {
+                const choice = getDocumentOutputChoice(doc);
+                const canChooseOutput = canChooseDocumentOutput(doc);
+                const originalChoice = getOutputChoice(doc.name, "original");
+                const htmlChoice = getOutputChoice(doc.name, "html");
+                const descriptionId = `${outputId}-${doc.id}-availability`;
                 const canOpenResult =
                   doc.status === "success" || doc.status === "error";
                 const canReconvert =
-                  doc.status === "success" &&
-                  isSupportedOutputForFilename(
-                    doc.name,
-                    doc.outputTarget ?? DEFAULT_OUTPUT_TARGET
-                  );
+                  doc.status === "success" && Boolean(choice.target);
 
                 return (
                   <TableRow key={doc.id}>
@@ -225,17 +234,61 @@ export default function DocumentTable({
                         <span className="truncate">{doc.name}</span>
                       )}
                     </TableCell>
-                    <TableCell>
-                      {doc.outputTarget === "accessible_pptx"
-                        ? "PowerPoint (.pptx)"
-                        : "Canvas HTML"}
+                    <TableCell className="max-w-sm min-w-56 whitespace-normal">
+                      {canChooseOutput ? (
+                        <select
+                          aria-label={`Download format for ${doc.name}`}
+                          aria-describedby={
+                            choice.unavailableReason ? descriptionId : undefined
+                          }
+                          value={
+                            doc.outputIntent ??
+                            (doc.outputTarget === "accessible_pptx"
+                              ? "original"
+                              : "html")
+                          }
+                          disabled={isProcessing}
+                          onChange={(event) => {
+                            if (isOutputIntent(event.target.value))
+                              onChangeOutput(doc.id, event.target.value);
+                          }}
+                          className="h-10 w-full rounded-lg border border-input bg-background px-2 text-sm focus-visible:outline-2 focus-visible:outline-ring disabled:opacity-50"
+                        >
+                          <option value="original">
+                            {originalChoice.label}
+                            {originalChoice.target
+                              ? ""
+                              : " — not available yet"}
+                          </option>
+                          <option value="html">
+                            HTML (Canvas)
+                            {htmlChoice.target ? "" : " — not available yet"}
+                          </option>
+                        </select>
+                      ) : (
+                        choice.label
+                      )}
+                      {choice.unavailableReason && (
+                        <p
+                          id={descriptionId}
+                          className="mt-1 text-xs text-muted-foreground"
+                        >
+                          {choice.unavailableReason}
+                        </p>
+                      )}
                     </TableCell>
                     <TableCell>
-                      {statusBadge(
-                        doc.status,
-                        doc.outputTarget === "accessible_pptx",
-                        doc.errors?.some((issue) => issue.severity === "error"),
-                        doc.processingPhase === "uploading"
+                      {!choice.target && doc.status === "idle" ? (
+                        <Badge variant="outline">Not available yet</Badge>
+                      ) : (
+                        statusBadge(
+                          doc.status,
+                          doc.outputTarget === "accessible_pptx",
+                          doc.errors?.some(
+                            (issue) => issue.severity === "error"
+                          ),
+                          doc.processingPhase === "uploading"
+                        )
                       )}
                       {issueBadges(doc)}
                     </TableCell>
