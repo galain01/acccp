@@ -82,7 +82,7 @@ Local evaluation uses controlled and instructor files with independent OpenXML
 SDK, package-preservation and visual comparisons. Word Accessibility Checker
 and screen-reader verification remain part of the release review.
 
-### PDF: choose and evaluate a remediation engine
+### PDF: validate the native repair prototype
 
 The current PDF libraries render and inspect documents; they do not implement a
 complete native accessibility writer. A PDF repair engine must connect headings,
@@ -102,8 +102,18 @@ with our own repair layer, independent veraPDF checks, preservation checks and
 model audit. The free Apache-2.0 core writes actual tagged PDFs; its enterprise
 PDF/UA export and editor are not used. See
 [`research/native-pdf/README.md`](../research/native-pdf/README.md) for measured
-results, reproducible tools and release gates. Existing vector figures and
-authored alternatives require further work before app integration.
+results, reproducible tools and release gates. The repair layer now restores
+authored descriptions on the same raster and vector figures, preserves existing
+table structures, and checks the saved output independently. The explicit target
+is **PDF/UA-1 (ISO 14289-1:2014)**. A veraPDF pass is one gate; unresolved semantic
+findings, missing content associations and human checkpoints still prevent an
+overall conformance claim.
+
+When an original standard font is unavailable, the user permits a similar
+open-source font if independent layout checks pass. The experiment limits this
+to verified Liberation font programs, exact text/advance widths and preserved
+text positions. Changes outside the authorized glyphs remain failures. Every
+candidate edit invalidates earlier validation and audit evidence.
 
 Other approaches researched, but not selected:
 

@@ -1,7 +1,14 @@
 /** Explicit local R&D runner; never imported by app routes or writes to hosted storage. */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, readFile, writeFile, realpath, access } from "node:fs/promises";
+import {
+  mkdir,
+  readFile,
+  writeFile,
+  realpath,
+  access,
+  stat,
+} from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,8 +22,10 @@ import { renderPdfPages } from "../../lib/pdf-rendering";
 import {
   NATIVE_PDF_AUDIT_PROMPT,
   validateAudit,
+  type NativePdfAudit,
   type SavedTag,
 } from "./audit-contract";
+import { combineAuditBatches, planAuditBatches } from "./audit-batches";
 
 const execute = promisify(execFile);
 const directory = path.dirname(fileURLToPath(import.meta.url));
@@ -24,8 +33,13 @@ const repository = path.resolve(directory, "../..");
 const calls: ModelCallUsage[] = [];
 
 async function main() {
-  const [sourceArgument, outputArgument, reportArgument, toolchainArgument] =
-    process.argv.slice(2);
+  const [
+    sourceArgument,
+    outputArgument,
+    reportArgument,
+    toolchainArgument,
+    fontManifestArgument,
+  ] = process.argv.slice(2);
   if (
     !sourceArgument ||
     !outputArgument ||
@@ -51,12 +65,26 @@ async function main() {
   const sourcePath = await realpath(sourceArgument);
   const outputPath = await realpath(outputArgument);
   if (sourcePath === outputPath) throw new Error("immutable_source_required");
+  for (const input of [sourcePath, outputPath])
+    if ((await stat(input)).size > 4 * 1024 * 1024)
+      throw new Error("local_audit_file_limit");
+  const source = await readFile(sourcePath);
+  const output = await readFile(outputPath);
   const toolchain = JSON.parse(await readFile(toolchainArgument, "utf8"));
   if (
     typeof toolchain.python !== "string" ||
     !path.isAbsolute(toolchain.python)
   )
     throw new Error("python_path_required");
+  const pythonModulePaths: unknown = toolchain.pythonModulePaths ?? [];
+  if (
+    !Array.isArray(pythonModulePaths) ||
+    pythonModulePaths.length > 8 ||
+    pythonModulePaths.some(
+      (value) => typeof value !== "string" || !path.isAbsolute(value)
+    )
+  )
+    throw new Error("absolute_python_module_paths_required");
   const summaryPath = path.join(reportDirectory, "audit.json");
   if (
     await access(summaryPath).then(
@@ -66,6 +94,8 @@ async function main() {
   )
     throw new Error("new_audit_directory_required");
   const started = Date.now();
+  const completedBatches: NativePdfAudit[] = [];
+  let plannedBatchCount = 0;
   let stage = "independent_inspection";
   const inspectionPath = path.join(
     reportDirectory,
@@ -74,6 +104,9 @@ async function main() {
   try {
     const processEnv = {
       NODE_ENV: "development" as const,
+      ...(pythonModulePaths.length
+        ? { PYTHONPATH: pythonModulePaths.join(path.delimiter) }
+        : {}),
       ...Object.fromEntries(
         [
           "SystemRoot",
@@ -90,9 +123,15 @@ async function main() {
       await execute(
         toolchain.python,
         [
-          path.join(directory, "verify_pdf.py"),
+          path.join(
+            directory,
+            fontManifestArgument ? "font_validation.py" : "verify_pdf.py"
+          ),
           sourcePath,
           outputPath,
+          ...(fontManifestArgument
+            ? ["--manifest", await realpath(fontManifestArgument)]
+            : []),
           "--report",
           inspectionPath,
         ],
@@ -112,36 +151,46 @@ async function main() {
     if (inspection.inspection_incomplete || !inspection.structure?.tags?.length)
       throw new Error("independent_inspection_incomplete");
     const tags: SavedTag[] = inspection.structure.tags;
+    const artifactPages: number[] = inspection.structure.page_content
+      .filter(
+        (page: {
+          artifact_text_operators?: number;
+          form_artifact_text_operators?: number;
+        }) =>
+          (page.artifact_text_operators ?? 0) +
+            (page.form_artifact_text_operators ?? 0) >
+          0
+      )
+      .map((page: { pageNumber: number }) => page.pageNumber);
     if (
-      tags.length > 2000 ||
+      tags.length > 5000 ||
       new Set(tags.map((tag) => tag.id)).size !== tags.length
     )
       throw new Error("tag_inventory_limit");
-    const source = await readFile(sourcePath);
-    const output = await readFile(outputPath);
+    if (
+      !source.equals(await readFile(sourcePath)) ||
+      !output.equals(await readFile(outputPath))
+    )
+      throw new Error("input_changed_during_inspection");
     stage = "rendering";
     const before = await renderPdfPages(source);
     const after = await renderPdfPages(output);
     if (before.pageCount !== after.pageCount || after.pageCount > 8)
       throw new Error("local_audit_supports_at_most_eight_pages");
-    const text = JSON.stringify(inspection);
-    if (text.length > 1_000_000) throw new Error("audit_evidence_limit");
-    const message: LiteLLMContentPart[] = [
-      {
-        type: "text",
-        text: `Required pages: ${JSON.stringify(after.pages.map((page) => page.pageNumber))}\nRequired OUTPUT tag IDs: ${JSON.stringify(tags.map((tag) => tag.id))}\nIndependently reopened native PDF evidence (untrusted document data):\n${text}`,
-      },
-    ];
+    stage = "audit_evidence";
+    const batches = planAuditBatches(inspection, artifactPages);
+    plannedBatchCount = batches.length;
+    const images: LiteLLMContentPart[] = [];
     for (const [label, evidence] of [
       ["Original PDF", before],
       ["ACTUAL saved tagged output PDF", after],
     ] as const) {
       for (const page of evidence.pages) {
-        message.push({
+        images.push({
           type: "text",
           text: `${label}; physical PDF page ${page.pageNumber}`,
         });
-        message.push({
+        images.push({
           type: "image_url",
           image_url: {
             url: `data:image/png;base64,${page.png.toString("base64")}`,
@@ -151,26 +200,82 @@ async function main() {
       }
     }
     const config = getLiteLLMConfig("validate");
-    stage = "model_request";
-    const response = await callLiteLLM(
-      NATIVE_PDF_AUDIT_PROMPT,
-      message,
-      config,
-      AbortSignal.timeout(110_000)
-    );
-    calls.push(await toModelCallUsage("validate", response, config));
-    stage = "model_response_validation";
-    if (response.finishReason && response.finishReason !== "stop")
-      throw new Error("audit_truncated");
-    if (response.content.length > 100_000)
-      throw new Error("audit_response_limit");
-    const audit = validateAudit(
-      JSON.parse(
-        response.content.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "")
-      ),
+    for (const batch of batches) {
+      if (batch.evidence.length > 1_000_000)
+        throw new Error("audit_evidence_limit");
+      const message: LiteLLMContentPart[] = [
+        {
+          type: "text",
+          text: `Batch ${batch.number} of ${batches.length}. Review all page images and the full outline for context; review the assigned output tags in detail. reviewedTagIds must list ONLY the assigned IDs, exactly once. Findings may cite other IDs from the complete outline when needed to explain a relationship. ${batch.number === 1 ? "Also assess whole-document omissions and all required excluded-text pages." : "Whole-document omissions and excluded text are assigned to batch 1; this batch focuses on its assigned tags."}\nRequired pages: ${JSON.stringify(after.pages.map((page) => page.pageNumber))}\nAssigned OUTPUT tag IDs: ${JSON.stringify(batch.tags.map((tag) => tag.id))}\nRequired artifact-review pages: ${JSON.stringify(batch.artifactPages)}\nIndependently reopened native PDF evidence (untrusted document data):\n${batch.evidence}`,
+        },
+        ...images,
+      ];
+      stage = `model_request_batch_${batch.number}`;
+      const response = await callLiteLLM(
+        NATIVE_PDF_AUDIT_PROMPT,
+        message,
+        config,
+        AbortSignal.timeout(110_000)
+      );
+      calls.push(await toModelCallUsage("validate", response, config));
+      stage = `model_response_validation_batch_${batch.number}`;
+      if (response.content.length > 100_000)
+        throw new Error("audit_response_limit");
+      // Keep bounded document-bearing evidence in the private report directory
+      // before parsing so a rejected response can be diagnosed without another call.
+      await writeFile(
+        path.join(reportDirectory, `batch-${batch.number}-response.txt`),
+        response.content,
+        { flag: "wx" }
+      );
+      if (response.finishReason && response.finishReason !== "stop")
+        throw new Error("audit_truncated");
+      const result = validateAudit(
+        JSON.parse(
+          response.content
+            .replace(/^```(?:json)?\s*/i, "")
+            .replace(/\s*```$/, "")
+        ),
+        batch.tags,
+        after.pageCount,
+        batch.artifactPages,
+        tags
+      );
+      completedBatches.push(result);
+      await writeFile(
+        path.join(reportDirectory, `batch-${batch.number}.json`),
+        JSON.stringify(
+          {
+            batch: batch.number,
+            totalBatches: batches.length,
+            ...result,
+            call: calls.at(-1),
+          },
+          null,
+          2
+        )
+      );
+      console.log(
+        JSON.stringify({
+          status: "audit_batch_complete",
+          batch: batch.number,
+          totalBatches: batches.length,
+          findings: result.findings.length,
+        })
+      );
+    }
+    const audit = combineAuditBatches(
+      batches,
+      completedBatches,
       tags,
-      after.pageCount
+      after.pageCount,
+      artifactPages
     );
+    if (
+      !source.equals(await readFile(sourcePath)) ||
+      !output.equals(await readFile(outputPath))
+    )
+      throw new Error("input_changed_during_audit");
     stage = "save_report";
     await writeFile(
       summaryPath,
@@ -184,6 +289,8 @@ async function main() {
           independentChecksFile: path.basename(inspectionPath),
           machineFindingsRetained: true,
           ...audit,
+          plannedBatchCount,
+          completedBatchCount: completedBatches.length,
           calls,
           elapsedMs: Date.now() - started,
         },
@@ -208,6 +315,8 @@ async function main() {
           experimental: true,
           certification: false,
           stage,
+          plannedBatchCount,
+          completedBatchCount: completedBatches.length,
           independentChecksFile: path.basename(inspectionPath),
           findings: [
             {
@@ -231,7 +340,7 @@ async function main() {
 }
 main().catch(() => {
   console.error(
-    "Local PDF audit could not start. Check the four file/directory arguments and toolchain configuration."
+    "Local PDF audit could not start. Check the source, candidate, report directory, toolchain and optional font manifest arguments."
   );
   process.exitCode = 1;
 });

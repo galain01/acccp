@@ -2,3 +2,8 @@
 pypdf==6.10.0
 pypdfium2==5.14.0
 Pillow==12.3.0
+# Opt-in font verification uses FontTools independently of the ReportLab writer.
+# FontTools 4.60.1 was obtained from its official PyPI Windows wheel.
+fonttools==4.60.1
+reportlab==4.4.9
+numpy==2.3.5

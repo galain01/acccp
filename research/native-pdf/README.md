@@ -27,7 +27,7 @@ and upstream default content filters. Core tagging is local. The optional
 semantic audit sends document evidence to the already-configured institutional
 LiteLLM endpoint; it does not introduce another model provider.
 
-## What was tested on 2026-10-21
+## Initial evaluation on 2026-10-21
 
 Six synthetic/public benchmark PDFs, totaling **24 pages**, retained identical
 PDFium pixels, extracted text, normalized drawing operations, fonts and image
@@ -75,6 +75,87 @@ failures from 64 to 3, with identical pages and zero findings in the subsequent
 model audit. Two unembedded fonts and the absent conformance declaration remain;
 the candidate is still not declared conformant.
 
+## Preservation and conformance follow-up
+
+The explicit target is **PDF/UA-1, ISO 14289-1:2014**. The fresh assessment gate
+runs veraPDF's `ua1` profile against the actual candidate, independent content
+and layout checks, and a semantic audit bound to the original/candidate hashes.
+Edits invalidate earlier evidence. Missing inspections, wrong validation
+profiles, stale audits, partial batch coverage and unresolved findings all block
+success. Even a complete automated pass records the remaining human checkpoints
+and does not declare the engine ready for app integration.
+
+The preservation repair restored all **six authored Figure alternatives** in the
+three relevant PDFs, totaling **10 pages**: two raster figures and four vector
+figures. Matching uses unchanged native painting occurrences, including repeated
+objects, rather than similar-looking pictures or a total count of alternatives.
+Existing visible text, graphics, image payloads, links and form behavior remain
+protected by independent checks. The exact authored alternative stays attached
+to the same figure; uncertain associations and unsupported scopes are rejected.
+
+The already-tagged CDC report needs its original structure retained: fresh
+tagging flattened its tables into paragraphs. The existing-structure route
+retains both tables, 156 rows, 32 header cells and 828 data cells, with all three
+vector Figures restored. It also exposed a real upstream cross-page paragraph
+mapping error, which the independent checks detected despite a veraPDF pass.
+The bounded `cross_page_repairs.py` helper restores all seven original paragraph
+lines to pages 2 and 3 with explicit page references and ParentTree ownership.
+It retains native language/layout attributes and rejects ambiguous ordering or
+unsupported scopes. The saved candidate retains identical pixels on all eight
+pages and passes UA1 machine validation. Independent checks still report **13
+unresolved local link destinations already present in the original**; these are
+real remaining defects, not repaired guesses.
+
+Semantic testing also found another Discussion continuation excluded as Artifact
+on page 7, despite identical rendered pages. The source has unambiguous native
+references spanning pages 5 and 7, but the current paragraph writer safely
+rejects this case because page 5 also contains preserved Figure metadata scopes
+it cannot reconstruct. No incomplete repair is substituted for that finding.
+This remaining omission, heading/reading-order defects and missing table row
+header relationships block full accessibility approval and app integration.
+The completed six-batch audit covers all 2,030 saved tags, eight physical pages
+and eight excluded-text reviews. It reports 27 findings across the batches
+(including related table issues), rather than a passing overall result.
+
+| Final candidate | UA1 machine checks | Independent preservation | Semantic audit / overall automated result |
+| --- | --- | --- | --- |
+| Authored-image fixture, with authorized fonts | Pass, 0 failures | Pass with verified font substitution | 0 findings; automated checks pass, human review required |
+| One-page CDC chart, existing structure retained | Pass, 0 failures | Pass, identical page pixels | 3 findings; blocked |
+| Eight-page CDC report, figures and first continuation restored | Pass, 0 failures | Pass, identical page pixels | 27 reported findings plus 13 broken original local destinations; blocked |
+
+The authored-image fixture now passes veraPDF UA1 with **zero failed checks**,
+independent preservation/layout checks, and the model audit with **zero remaining
+findings**. Its source contained unavailable Helvetica fonts. With explicit
+user authorization, the candidate embeds pinned OFL-licensed Liberation Sans
+regular and bold fonts. Text, character origins, font sizes and advances remain
+unchanged; glyph shapes can differ. Independent checks found no new word
+collisions, page-edge clipping or pixel changes outside the authorized glyph
+regions. Font substitution/layout checks also passed on the workshop and field
+methods fixtures, for **nine tested pages** overall. These additional font runs
+alone do not establish their complete PDF accessibility.
+
+The one-page CDC chart passes UA1 machine and preservation checks but still has
+three semantic findings on the existing-structure route: heading relationships,
+an incomplete original chart description, and a wrapped URL exposed as duplicate
+links. Preserving an authored description is distinct from establishing that it
+contains an adequate equivalent of a complex chart. Those findings block an
+overall automated pass and remain explicit in the report.
+
+`conformance_repairs.py` handles bounded technical fixes and inventories missing
+fonts. `semantic_repairs.py` applies an exact-file, audit-supported role change
+to a native leaf tag; it does not change text or page appearance. `link_repairs.py`
+replaces generated annotation placeholders only where unchanged native link text
+and annotation targets are proven. Broken original named destinations remain
+reported instead of being invented. Font replacement uses `font_repairs.py` and
+a separate `font_validation.py` implementation with independently pinned programs.
+
+The internal validation candidates may carry a staged PDF/UA-1 identification
+entry so the complete validator profile runs. That entry is evaluation evidence,
+not a certificate or a production deliverable. Human checks still include
+screen-reader navigation and judgment about appropriate meaning, language and
+alternatives. See [veraPDF validation scope](https://docs.verapdf.org/validation/)
+and the [Matterhorn Protocol](https://pdfa.org/resource/the-matterhorn-protocol/).
+
 ## Reproduce locally
 
 Use a separate toolchain JSON containing absolute executable paths. Download
@@ -114,30 +195,55 @@ fixtures, not an exposed upload service or an OS security sandbox.
 python research/native-pdf/evaluate.py --toolchain TOOLCHAIN.json --output NEW_OUTPUT_DIRECTORY source.pdf
 python research/native-pdf/verify_pdf.py source.pdf candidate.pdf --report REPORT.json
 python research/native-pdf/repair_metadata.py tagged.pdf new-candidate.pdf --language en-US
+python research/native-pdf/preserve_figures.py source.pdf tagged.pdf figures-restored.pdf
+python research/native-pdf/assess_candidate.py source.pdf candidate.pdf --toolchain TOOLCHAIN.json --output NEW_ASSESSMENT_DIRECTORY --audit AUDIT.json
 ```
 
 The optional audit uses existing app credentials loaded locally. It supports up
-to eight pages per local run, requires every saved tag and page in the response,
-retains every completed call's token/cost information, and marks unavailable or
-invalid audit results incomplete. Use a fresh report directory for each run.
+to eight pages and 5,000 native tags per local run. Larger tag inventories are
+split into batches of at most 400 detailed tags, with the complete hierarchy and
+all page images provided as context. Every saved tag must be reviewed exactly
+once, every page must be reviewed, and all excluded-text pages need explicit
+review. Missing, repeated or invalid batches prevent completion. Every completed
+call's token/cost information is retained, including calls in partial runs. Use
+a fresh report directory for each run.
+Raw model responses are saved locally before response validation, bounded to
+100,000 characters. A finding may cite up to 50 known native tag IDs; the prompt
+states this and the other response limits explicitly. The full tag/page coverage
+requirements are independent of that per-finding limit. A valid table finding
+with 23 references is no longer rejected by an undocumented 20-reference cap.
 
 ```text
 node --conditions=react-server --env-file=PRIVATE_ENV_FILE --import tsx research/native-pdf/audit.ts source.pdf candidate.pdf NEW_REPORT_DIRECTORY TOOLCHAIN.json
 ```
+
+For an explicitly authorized font replacement, pass its exact-file manifest as
+the audit runner's optional fifth argument, and use `--font-manifest MANIFEST.json`
+with `assess_candidate.py`. Ordinary comparisons remain strict. The manifest
+must bind the immutable original and final candidate hashes, each font resource,
+the original and replacement font dictionaries, and embedded font program.
+The independent checker rechecks actual glyph coverage, advance widths, content,
+character positions, graphics, links and forms, and confines pixel differences
+to authorized glyph regions. It does not accept a writer's success assertion.
+
+An isolated fontTools installation can be supplied through a trusted toolchain
+`pythonModulePaths` array of absolute directories. The audit subprocess receives
+only those explicit module paths and basic runtime environment variables;
+model credentials are not passed to Python.
 
 The saved-tag inventory includes native table scopes, spans and header IDs,
 ordered text/child-tag content, and verified annotation references. This gives
 the auditor evidence for table and link relationships instead of making it
 infer those relationships from the rendered page alone.
 
-Verification completed: 41 Python tests, five audit-contract tests, TypeScript
+Verification completed: 160 Python tests, eleven audit-contract/batching tests, TypeScript
 checking and linting of the new TypeScript files.
 
 Tests:
 
 ```text
 python -m unittest discover -s research/native-pdf -p "test_*.py"
-npx vitest run research/native-pdf/audit-contract.test.ts
+npx vitest run research/native-pdf/audit-contract.test.ts research/native-pdf/audit-batches.test.ts
 npm run typecheck
 ```
 

@@ -33,6 +33,9 @@ MAX_FINDINGS = 100
 MAX_TAGS = 10_000
 MAX_ALT_CHARS = 128_000
 MAX_REPORT_BYTES = 16 * 1024 * 1024
+MAX_PAINT_ATOMS = 2_000_000
+MAX_ARTIFACT_TEXT_CHARS = 16_000
+MAX_TEXT_EXTRACTION_OPERATORS = 5_000_000
 RENDER_SCALE = 1.5
 STANDARD_ROLES = {"Document", "Part", "Art", "Sect", "Div", "BlockQuote", "Caption", "TOC", "TOCI", "Index", "NonStruct", "Private", "P", "H", "H1", "H2", "H3", "H4", "H5", "H6", "L", "LI", "Lbl", "LBody", "Table", "TR", "TH", "TD", "THead", "TBody", "TFoot", "Span", "Quote", "Note", "Reference", "BibEntry", "Code", "Link", "Annot", "Ruby", "RB", "RT", "RP", "Warichu", "WT", "WP", "Figure", "Formula", "Form"}
 
@@ -75,10 +78,15 @@ class Canonicalizer:
 
     def __init__(self, pages: list[Any] | None = None):
         self.pages = {id(resolved(page)): index for index, page in enumerate(pages or [])}
-        self.page_refs = {reference_key(page): index for index, page in enumerate(pages or []) if reference_key(page) is not None}
+        self.page_refs = {self.owned_reference(page): index for index, page in enumerate(pages or []) if reference_key(page) is not None}
         self.nodes = 0
         self.stream_bytes = 0
         self.memo: dict[int, int] = {}
+
+    @staticmethod
+    def owned_reference(value: Any) -> tuple[int, int, int] | None:
+        ref = value if isinstance(value, IndirectObject) else getattr(value, "indirect_reference", None)
+        return (id(ref.pdf), ref.idnum, ref.generation) if isinstance(ref, IndirectObject) else None
 
     def value(self, item: Any, active: dict[int, int] | None = None, depth: int = 0) -> Any:
         if depth == 0:
@@ -86,8 +94,8 @@ class Canonicalizer:
         self.nodes += 1
         if self.nodes > MAX_NODES or depth > MAX_DEPTH:
             raise InspectionError("object_complexity_limit")
-        if reference_key(item) in self.page_refs:
-            return {"page": self.page_refs[reference_key(item)]}
+        if self.owned_reference(item) in self.page_refs:
+            return {"page": self.page_refs[self.owned_reference(item)]}
         item = resolved(item)
         if id(item) in self.pages:
             return {"page": self.pages[id(item)]}
@@ -135,7 +143,12 @@ class Canonicalizer:
         if isinstance(item, float):
             if not math.isfinite(item):
                 raise InspectionError("invalid_number")
-            return float(item)
+            # PDF serializers may write 1.0 as 1; these are the same operand.
+            # Decimal reserialization can discard binary float noise such as
+            # 208.88400000000001 -> 208.884. A nanounit remains far below PDF
+            # renderer coordinate precision while preserving meaningful changes.
+            number = round(float(item), 9)
+            return int(number) if number.is_integer() else number
         # pypdf NullObject and BooleanObject do not inherit Python primitives.
         if type(item).__name__ == "NullObject":
             return None
@@ -155,6 +168,24 @@ def operations(page: Any) -> list[tuple[Any, bytes]]:
     if len(result) > MAX_OPERATORS:
         raise InspectionError("operator_limit")
     return result
+
+
+def extraction_stream(ops: list[tuple[Any, bytes]], reader: PdfReader) -> ContentStream:
+    """Decode original text bytes through native fonts, not PDFDocEncoding guesses.
+
+    Converting text-show operands to ByteStringObject has the same effect as
+    reparsing the filtered stream with pypdf's force_encoding='bytes', without
+    repeatedly serializing every graphics-state operation for each MCID.
+    """
+    def raw_text(item: Any) -> Any:
+        if isinstance(item, TextStringObject):
+            return ByteStringObject(item.original_bytes)
+        if isinstance(item, (ArrayObject, list)):
+            return ArrayObject([raw_text(value) for value in item])
+        return item
+    content = ContentStream(None, reader)
+    content.operations = [(raw_text(args), operator) if operator in (b"Tj", b"TJ", b"'", b'"') else (args, operator) for args, operator in ops]
+    return content
 
 
 def drawing_fingerprint(ops: list[tuple[Any, bytes]], canonical: Canonicalizer) -> str:
@@ -540,6 +571,115 @@ def tag_attributes(item: Any, class_map: Any) -> tuple[list[dict[str, Any]], lis
     return result, gaps
 
 
+class LocalDestinations:
+    """Resolve only native local destinations; never fetch or execute actions."""
+
+    def __init__(self, catalog: Any, page_lookup: dict[Any, int]):
+        self.catalog = catalog
+        self.page_lookup = page_lookup
+        self.cache: dict[str, tuple[dict[bytes, Any], str | None]] = {}
+
+    @staticmethod
+    def string_key(value: Any) -> bytes:
+        value = resolved(value)
+        if isinstance(value, ByteStringObject):
+            return bytes(value)
+        if isinstance(value, TextStringObject):
+            return value.original_bytes
+        raise InspectionError("invalid_named_destination_key")
+
+    def index(self, kind: str) -> tuple[dict[bytes, Any], str | None]:
+        if kind in self.cache:
+            return self.cache[kind]
+        entries: dict[bytes, Any] = {}
+        try:
+            if kind == "legacy":
+                table = resolved(self.catalog.get("/Dests", {}))
+                if not isinstance(table, dict) or len(table) > 5000:
+                    raise InspectionError("invalid_legacy_destinations")
+                for key, value in table.items():
+                    if not isinstance(key, NameObject):
+                        raise InspectionError("invalid_named_destination_key")
+                    entries[str(key).encode("utf-8")] = value
+            else:
+                names = resolved(self.catalog.get("/Names", {}))
+                if not isinstance(names, dict):
+                    raise InspectionError("invalid_destination_name_tree")
+                tree = names.get("/Dests")
+                visited: set[int] = set()
+
+                def walk(node: Any, depth: int = 0) -> None:
+                    node = resolved(node)
+                    if not isinstance(node, dict) or id(node) in visited or depth > MAX_DEPTH or len(visited) >= 5000:
+                        raise InspectionError("invalid_destination_name_tree")
+                    visited.add(id(node))
+                    if "/Names" in node and "/Kids" in node:
+                        raise InspectionError("invalid_destination_name_tree")
+                    if "/Kids" in node:
+                        kids = resolved(node["/Kids"])
+                        if not isinstance(kids, list) or not kids or len(kids) > 5000:
+                            raise InspectionError("invalid_destination_name_tree")
+                        for child in kids:
+                            walk(child, depth + 1)
+                    else:
+                        values = resolved(node.get("/Names"))
+                        if not isinstance(values, list) or len(values) % 2 or len(values) > 10000:
+                            raise InspectionError("invalid_destination_name_tree")
+                        for offset in range(0, len(values), 2):
+                            key = self.string_key(values[offset])
+                            if key in entries or len(entries) >= 5000:
+                                raise InspectionError("ambiguous_named_destination")
+                            entries[key] = values[offset + 1]
+
+                if tree is not None:
+                    walk(tree)
+            self.cache[kind] = entries, None
+        except (InspectionError, UnicodeError, AttributeError) as error:
+            code = str(error) if isinstance(error, InspectionError) else "invalid_named_destination_key"
+            self.cache[kind] = {}, code
+        return self.cache[kind]
+
+    def resolve(self, destination: Any) -> dict[str, Any]:
+        destination = resolved(destination)
+        result: dict[str, Any] = {"destinationResolved": False, "destinationPageNumber": None}
+        if isinstance(destination, (NameObject, TextStringObject, ByteStringObject)):
+            kind = "legacy" if isinstance(destination, NameObject) else "nameTree"
+            result["destinationKind"] = "named"
+            result["destinationStorage"] = kind
+            try:
+                key = str(destination).encode("utf-8") if kind == "legacy" else self.string_key(destination)
+            except (UnicodeError, AttributeError, InspectionError):
+                result["destinationUnresolvedReason"] = "invalid_named_destination_key"
+                return result
+            result["destinationNameSha256"] = digest(key)
+            entries, error = self.index(kind)
+            if error is not None or key not in entries:
+                result["destinationUnresolvedReason"] = error or "named_destination_missing"
+                return result
+            destination = resolved(entries[key])
+        else:
+            result["destinationKind"] = "explicit"
+        if isinstance(destination, dict):
+            destination = resolved(destination.get("/D"))
+        modes = {"/XYZ": 5, "/Fit": 2, "/FitH": 3, "/FitV": 3, "/FitR": 6, "/FitB": 2, "/FitBH": 3, "/FitBV": 3}
+        if not isinstance(destination, list) or len(destination) < 2 or not isinstance(destination[1], NameObject) or modes.get(str(destination[1])) != len(destination):
+            result["destinationUnresolvedReason"] = "invalid_local_destination"
+            return result
+        page = self.page_lookup.get(reference_key(destination[0]))
+        if page is None:
+            result["destinationUnresolvedReason"] = "destination_page_missing"
+            return result
+        for coordinate in destination[2:]:
+            coordinate = resolved(coordinate)
+            if type(coordinate).__name__ == "NullObject" and destination[1] != "/FitR":
+                continue
+            if isinstance(coordinate, bool) or not isinstance(coordinate, (int, float)) or not math.isfinite(coordinate):
+                result["destinationUnresolvedReason"] = "invalid_destination_coordinates"
+                return result
+        result.update({"destinationResolved": True, "destinationPageNumber": page, "destinationView": str(destination[1]).lstrip("/")})
+        return result
+
+
 def structure_inventory(reader: PdfReader) -> dict[str, Any]:
     """Read actual saved tags; do not infer associations from visual proximity."""
     pages = list(reader.pages)
@@ -558,6 +698,8 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
     content_seen: set[tuple[int, int]] = set()
     role_map = resolved(root.get("/RoleMap", {}))
     content_text: dict[tuple[int, int], str | None] = {}
+    form_scopes: dict[Any, dict[str, Any]] = {}
+    form_invocations: list[dict[str, Any]] = []
     decoded_text_chars = 0
     extraction_work = 0
     report_text_chars = 0
@@ -565,6 +707,9 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
     class_map = resolved(root.get("/ClassMap", {}))
     annotation_locations: dict[tuple[str, Any], list[dict[str, Any]]] = {}
     annotation_objects: dict[str, Any] = {}
+    annotation_destinations: dict[str, dict[str, Any]] = {}
+    local_destinations = LocalDestinations(catalog, lookup)
+    info["unresolved_local_destinations"] = 0
     object_reference_owners: set[str] = set()
     attribute_gaps = 0
     info["resolved_object_references"] = 0
@@ -578,6 +723,14 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
                 raise InspectionError("invalid_annotation")
             location = {"id": f"p{page_number}-a{index + 1}", "pageNumber": page_number, "annotationIndex": index + 1}
             annotation_objects[location["id"]] = obj
+            action = resolved(obj.get("/A"))
+            if "/Dest" in obj or isinstance(action, dict) and action.get("/S") == "/GoTo":
+                destination = obj.get("/Dest") if "/Dest" in obj else action.get("/D")
+                evidence = local_destinations.resolve(destination)
+                annotation_destinations[location["id"]] = evidence
+                if not evidence["destinationResolved"]:
+                    info["unresolved_local_destinations"] += 1
+                    info["findings"].append({"code": "local_link_destination_unresolved", "severity": "error", "page": page_number, "annotationId": location["id"], "reason": evidence["destinationUnresolvedReason"]})
             key = ("ref", reference_key(annotation)) if reference_key(annotation) is not None else ("object", id(obj))
             annotation_locations.setdefault(key, []).append(location)
     # Re-extract each MCID from a shallow page copy containing only its text-show
@@ -587,6 +740,8 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
         properties = resolved(resolved(page.get("/Resources", {})).get("/Properties", {}))
         stack: list[tuple[int | None, bool]] = []
         current_owners: list[int | None] = []
+        current_artifacts: list[bool] = []
+        form_content_uninspected = False
         occurrence_ids: dict[int, list[str]] = {}
         text_index = 0
         unowned = 0
@@ -603,17 +758,34 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
                         props = resolved(properties.get(props))
                     if isinstance(props, dict):
                         mcid = integer(props.get("/MCID"))
+                        if "/MCID" in props and mcid is None:
+                            info["findings"].append({"code": "invalid_mcid", "severity": "error", "page": page_number})
+                    else:
+                        info["findings"].append({"code": "invalid_marked_content_properties", "severity": "error", "page": page_number})
+                elif operator == b"BDC":
+                    info["findings"].append({"code": "invalid_marked_content_properties", "severity": "error", "page": page_number})
                 if mcid is not None:
+                    if any(key is not None for key, _ in stack):
+                        info["findings"].append({"code": "nested_mcid_scope_unsupported", "severity": "error", "page": page_number})
                     duplicate_mcids |= mcid in page_mcids
                     page_mcids.add(mcid)
                 if len(stack) >= MAX_DEPTH:
                     raise InspectionError("structure_complexity_limit")
                 stack.append((mcid, artifact))
             owner = next((key for key, _ in reversed(stack) if key is not None), None)
+            is_artifact = any(artifact for _, artifact in stack)
             current_owners.append(owner)
+            current_artifacts.append(is_artifact)
+            if operator == b"Do":
+                xobjects = resolved(resolved(page.get("/Resources", {})).get("/XObject", {}))
+                asset = resolved(xobjects.get(operands[0])) if len(operands) == 1 else None
+                if isinstance(asset, StreamObject) and asset.get("/Subtype") == "/Form":
+                    form_invocations.append({"stream": asset, "pageNumber": page_number, "artifact": is_artifact, "pageOwner": owner})
+                elif not isinstance(asset, dict):
+                    form_content_uninspected = True
             if operator in (b"Tj", b"TJ", b"'", b'"'):
                 text_index += 1
-                if any(artifact for _, artifact in stack):
+                if is_artifact:
                     artifacts += 1
                 elif owner is None:
                     unowned += 1
@@ -632,23 +804,141 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
             info["findings"].append({"code": "untagged_page_text", "severity": "error", "page": page_number})
         if artifacts:
             info["findings"].append({"code": "artifact_text_needs_semantic_review", "severity": "warning", "page": page_number})
-        info["page_content"].append({"pageNumber": page_number, "mcids": sorted(page_mcids), "text_show_operators": text_index, "untagged_text_operators": unowned, "artifact_text_operators": artifacts, "occurrence_ids_by_mcid": occurrence_ids})
+        artifact_text = ""
+        artifact_complete = not form_content_uninspected
+        if artifacts:
+            extraction_work += len(ops)
+            if extraction_work > MAX_TEXT_EXTRACTION_OPERATORS:
+                artifact_complete = False
+            else:
+                # Keep text state while removing every other text-show operation.
+                # Do is omitted because a Form can contain unrelated/internal text.
+                selected = [(operands, operator) for (operands, operator), artifact in zip(ops, current_artifacts) if operator not in (b"Do", b"INLINE IMAGE") and (operator not in (b"Tj", b"TJ", b"'", b'"') or artifact)]
+                page_copy = copy.copy(page)
+                page_copy[NameObject("/Contents")] = extraction_stream(selected, reader)
+                artifact_text = page_copy.extract_text() or ""
+                decoded_text_chars += len(artifact_text)
+                artifact_complete &= len(artifact_text) <= MAX_ARTIFACT_TEXT_CHARS and decoded_text_chars <= MAX_TEXT_CHARS
+                artifact_text = artifact_text[:MAX_ARTIFACT_TEXT_CHARS] if decoded_text_chars <= MAX_TEXT_CHARS else ""
+        info["page_content"].append({"pageNumber": page_number, "mcids": sorted(page_mcids), "text_show_operators": text_index, "untagged_text_operators": unowned, "artifact_text_operators": artifacts, "artifactText": artifact_text, "artifactTextComplete": artifact_complete, "occurrence_ids_by_mcid": occurrence_ids})
         for mcid in page_mcids:
             extraction_work += len(ops)
-            if extraction_work > 2_000_000:
+            if extraction_work > MAX_TEXT_EXTRACTION_OPERATORS:
                 content_text[(page_number, mcid)] = None
                 continue
-            selected = [(operands, operator) for (operands, operator), owner in zip(ops, current_owners) if operator not in (b"Tj", b"TJ", b"'", b'"') or owner == mcid]
-            stream = ContentStream(None, reader)
-            stream.operations = selected
+            selected = [(operands, operator) for (operands, operator), owner, artifact in zip(ops, current_owners, current_artifacts) if operator not in (b"Do", b"INLINE IMAGE") and (operator not in (b"Tj", b"TJ", b"'", b'"') or (owner == mcid and not artifact))]
             page_copy = copy.copy(page)
-            page_copy[NameObject("/Contents")] = stream
+            page_copy[NameObject("/Contents")] = extraction_stream(selected, reader)
             text = page_copy.extract_text() or ""
             decoded_text_chars += len(text)
             if decoded_text_chars > MAX_TEXT_CHARS:
                 content_text[(page_number, mcid)] = None
             else:
                 content_text[(page_number, mcid)] = text
+
+    # Reopen leaf Form content streams by their actual drawing invocation. A
+    # /Stm pointer is accepted only when it names this exact, uniquely used Form.
+    # Repeated all-Artifact leaf Forms are safe to decode once per page occurrence.
+    form_counts = Counter(reference_key(call["stream"]) for call in form_invocations)
+    info["form_content"] = []
+    for call in form_invocations:
+        form = call["stream"]
+        form_key = reference_key(form)
+        pn = call["pageNumber"]
+        page = pages[pn - 1]
+        page_info = info["page_content"][pn - 1]
+        resources = resolved(form.get("/Resources", page.get("/Resources", {})))
+        props = resolved(resources.get("/Properties", {}))
+        ops = ContentStream(form, reader).operations
+        if len(ops) > MAX_OPERATORS:
+            raise InspectionError("operator_limit")
+        owners: list[int | None] = []
+        artifacts: list[bool] = []
+        stack: list[tuple[int | None, bool]] = []
+        mcids: set[int] = set()
+        gaps: set[str] = set()
+        unowned = 0
+        artifact_shows = 0
+        for operands, operator in ops:
+            if operator in (b"BMC", b"BDC"):
+                mcid = None
+                if not operands or len(stack) >= MAX_DEPTH:
+                    raise InspectionError("invalid_marked_content")
+                if operator == b"BDC":
+                    marked_props = resolved(operands[1]) if len(operands) == 2 else None
+                    if isinstance(marked_props, NameObject):
+                        marked_props = resolved(props.get(marked_props))
+                    if isinstance(marked_props, dict):
+                        mcid = integer(marked_props.get("/MCID"))
+                        if "/MCID" in marked_props and mcid is None:
+                            gaps.add("invalid_form_mcid")
+                    else:
+                        gaps.add("invalid_form_marked_content_properties")
+                if mcid is not None:
+                    if any(key is not None for key, _ in stack):
+                        gaps.add("nested_form_mcid_scope_unsupported")
+                    if mcid in mcids:
+                        gaps.add("duplicate_form_mcid")
+                    mcids.add(mcid)
+                stack.append((mcid, str(operands[0]) == "/Artifact"))
+            owner = next((key for key, _ in reversed(stack) if key is not None), None)
+            artifact = call["artifact"] or any(flag for _, flag in stack)
+            owners.append(owner)
+            artifacts.append(artifact)
+            if operator in (b"Tj", b"TJ", b"'", b'"'):
+                if artifact:
+                    artifact_shows += 1
+                elif owner is None:
+                    unowned += 1
+            if operator == b"Do":
+                xobject = resolved(resolved(resources.get("/XObject", {})).get(operands[0])) if len(operands) == 1 else None
+                if not isinstance(xobject, dict) or xobject.get("/Subtype") == "/Form":
+                    gaps.add("nested_form_content_uninspected")
+            if operator == b"EMC":
+                if not stack:
+                    gaps.add("unbalanced_form_marked_content")
+                else:
+                    stack.pop()
+        if stack:
+            gaps.add("unbalanced_form_marked_content")
+        if mcids and (form_key is None or form_counts[form_key] != 1 or call["artifact"]):
+            gaps.add("ambiguous_form_content_invocation")
+        if unowned:
+            gaps.add("form_text_without_native_mcid")
+        scope = {"id": f"form-{len(info['form_content']) + 1}", "pageNumber": pn, "mcids": sorted(mcids), "stream": form, "text": {}, "gaps": gaps}
+        for selected_mcid in [None, *sorted(mcids)]:
+            extraction_work += len(ops)
+            if extraction_work > MAX_TEXT_EXTRACTION_OPERATORS:
+                gaps.add("form_text_extraction_limit")
+                continue
+            selected = [(args, operator) for (args, operator), owner, artifact in zip(ops, owners, artifacts) if operator not in (b"Do", b"INLINE IMAGE") and (operator not in (b"Tj", b"TJ", b"'", b'"') or (artifact if selected_mcid is None else owner == selected_mcid and not artifact))]
+            page_copy = copy.copy(page)
+            page_copy[NameObject("/Contents")] = extraction_stream(selected, reader)
+            page_copy[NameObject("/Resources")] = resources
+            text = page_copy.extract_text() or ""
+            decoded_text_chars += len(text)
+            if decoded_text_chars > MAX_TEXT_CHARS:
+                gaps.add("form_text_extraction_limit")
+                continue
+            if selected_mcid is None:
+                if text:
+                    page_info["artifactText"] = "\n".join(filter(None, [page_info["artifactText"], text]))
+                    if len(page_info["artifactText"]) > MAX_ARTIFACT_TEXT_CHARS:
+                        page_info["artifactText"] = page_info["artifactText"][:MAX_ARTIFACT_TEXT_CHARS]
+                        gaps.add("artifact_text_size_limit")
+            else:
+                scope["text"][selected_mcid] = text
+        if artifact_shows:
+            page_info["form_artifact_text_operators"] = page_info.get("form_artifact_text_operators", 0) + artifact_shows
+            if not any(f.get("code") == "artifact_text_needs_semantic_review" and f.get("page") == pn for f in info["findings"]):
+                info["findings"].append({"code": "artifact_text_needs_semantic_review", "severity": "warning", "page": pn})
+        if gaps:
+            page_info["artifactTextComplete"] = False
+            for gap in sorted(gaps):
+                info["findings"].append({"code": gap, "severity": "warning", "page": pn})
+        elif mcids:
+            form_scopes[form_key] = scope
+        info["form_content"].append({"streamId": scope["id"], "pageNumber": pn, "mcids": sorted(mcids), "checksComplete": not gaps, "gaps": sorted(gaps)})
     parent_tree = None
     try:
         parent_tree = number_tree(root.get("/ParentTree"))
@@ -732,17 +1022,21 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
                 tag["content"].append(content)
                 segment: dict[str, Any] = {"kind": "markedContent", **content, "text": None}
                 tag["contentSequence"].append(segment)
-                if child_page is not None and stream_ref is None:
-                    key = (child_page, mcid)
+                scope = form_scopes.get(reference_key(stream_ref)) if stream_ref is not None else None
+                if child_page is not None and (stream_ref is None or (scope is not None and scope["pageNumber"] == child_page)):
+                    key = (scope["id"] if scope is not None else child_page, mcid)
+                    if scope is not None:
+                        content["streamId"] = scope["id"]
+                        segment["streamId"] = scope["id"]
                     if key in content_seen:
                         info["findings"].append({"code": "duplicate_structure_content", "severity": "error", "page": child_page})
                     content_seen.add(key)
-                    if mcid not in info["page_content"][child_page - 1]["mcids"]:
+                    if mcid not in (scope["mcids"] if scope is not None else info["page_content"][child_page - 1]["mcids"]):
                         info["findings"].append({"code": "missing_marked_content", "severity": "error", "page": child_page})
                     else:
                         content["resolved"] = True
                         segment["resolved"] = True
-                    text = content_text.get(key)
+                    text = scope["text"].get(mcid) if scope is not None else content_text.get(key)
                     if text is not None:
                         report_text_chars += len(text)
                         if report_text_chars <= MAX_TEXT_CHARS:
@@ -752,10 +1046,10 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
                             tag["textIncomplete"] = True
                     else:
                         tag["textIncomplete"] = True
-                    if child_page == page_number:
+                    if child_page == page_number and scope is None:
                         tag["mcids"].append(mcid)
                     if parent_tree is not None:
-                        parent_key = integer(pages[child_page - 1].get("/StructParents"))
+                        parent_key = integer((scope["stream"] if scope is not None else pages[child_page - 1]).get("/StructParents"))
                         entries = parent_tree.get(parent_key)
                         if not isinstance(entries, list) or mcid >= len(entries) or resolved(entries[mcid]) is not item:
                             info["findings"].append({"code": "parent_tree_owner_mismatch", "severity": "error", "page": child_page})
@@ -763,6 +1057,7 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
                         else:
                             segment["parentTreeVerified"] = True
                 else:
+                    segment["unresolvedReason"] = "form_content_scope_unresolved" if stream_ref is not None else "content_page_unresolved"
                     info["unresolved_content_references"] += 1
                     tag["textIncomplete"] = True
             elif isinstance(value, dict) and str(value.get("/Type")) == "/OBJR":
@@ -801,12 +1096,7 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
                         entry["actionType"] = str(action.get("/S", "")).lstrip("/")[:100]
                         if action.get("/S") == "/URI" and "/URI" in action:
                             entry["uri"], _ = native_string(action["/URI"], 8000)
-                        elif action.get("/S") == "/GoTo":
-                            destination = resolved(action.get("/D"))
-                            entry["destinationPageNumber"] = lookup.get(reference_key(destination[0])) if isinstance(destination, list) and destination else None
-                    if "/Dest" in obj:
-                        destination = resolved(obj["/Dest"])
-                        entry["destinationPageNumber"] = lookup.get(reference_key(destination[0])) if isinstance(destination, list) and destination else None
+                    entry.update(annotation_destinations.get(location["id"], {}))
                 if reason:
                     entry["unresolvedReason"] = reason
                     info["unresolved_content_references"] += 1
@@ -847,14 +1137,259 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
     for page in info["page_content"]:
         if any((page["pageNumber"], mcid) not in content_seen for mcid in page["mcids"]):
             info["findings"].append({"code": "unowned_marked_content", "severity": "error", "page": page["pageNumber"]})
+    for scope in form_scopes.values():
+        if any((scope["id"], mcid) not in content_seen for mcid in scope["mcids"]):
+            info["findings"].append({"code": "unowned_form_marked_content", "severity": "error", "page": scope["pageNumber"]})
     info["findings"] = info["findings"][:MAX_FINDINGS]
     info["tag_count"] = len(info["tags"])
-    info["mcid_count"] = sum(len(page["mcids"]) for page in info["page_content"])
+    info["mcid_count"] = sum(len(page["mcids"]) for page in info["page_content"]) + sum(len(scope["mcids"]) for scope in form_scopes.values())
     if not info["tag_count"]:
         info["findings"].append({"code": "empty_structure_tree", "severity": "error"})
     info["machine_checks_passed"] = not any(item["severity"] == "error" for item in info["findings"])
-    info["checks_complete"] = not info["unresolved_content_references"] and not attribute_gaps and not any(tag.get("textIncomplete") for tag in info["tags"])
+    info["checks_complete"] = not info["unresolved_content_references"] and not info["unresolved_local_destinations"] and not attribute_gaps and not any(tag.get("textIncomplete") for tag in info["tags"]) and all(page["artifactTextComplete"] for page in info["page_content"])
     return info
+
+
+def figure_association_inventory(reader: PdfReader) -> dict[str, Any]:
+    """Bind native Figures to exact paint occurrences, independently of tag IDs.
+
+    The full normalized page program and resources must match before occurrence
+    positions can establish identity. This avoids matching repeated images by
+    payload alone and includes vector fills/strokes, text and shading. Internal
+    Form MCIDs and reused Form content remain explicitly outside this subset.
+    """
+    pages = list(reader.pages)
+    page_ids = {reference_key(page): number for number, page in enumerate(pages, 1)}
+    root = resolved(reader.trailer["/Root"].get("/StructTreeRoot"))
+    result: dict[str, Any] = {"figures": [], "pages": {}, "supported": True, "scope": "page-scoped MCIDs with exact normalized paint-occurrence membership; internal or reused Form content is not inferred"}
+    if not isinstance(root, dict):
+        return result
+    form_uses: Counter = Counter()
+    atom_count = 0
+    paint_ops = {b"S", b"s", b"f", b"F", b"f*", b"B", b"B*", b"b", b"b*", b"sh", b"Do", b"INLINE IMAGE"}
+    for page_number, page in enumerate(pages, 1):
+        resources = resolved(page.get("/Resources", {}))
+        properties = resolved(resources.get("/Properties", {}))
+        tokens: list[Any] = []
+        owned: dict[int, set[int]] = {}
+        artifact_events: set[int] = set()
+        forms_by_event: dict[int, Any] = {}
+        stack: list[tuple[int | None, bool]] = []
+        declared_mcids: set[int] = set()
+        gaps: set[str] = set()
+        asset_hashes: dict[int, str] = {}
+        canonical = Canonicalizer()
+
+        def emit(token: Any, paint: bool = False, form: Any = None) -> None:
+            nonlocal atom_count
+            atom_count += 1
+            if atom_count > MAX_PAINT_ATOMS:
+                raise InspectionError("paint_atom_limit")
+            index = len(tokens)
+            tokens.append(token)
+            if not paint:
+                return
+            if any(artifact for _, artifact in stack):
+                artifact_events.add(index)
+            else:
+                for mcid, _ in stack:
+                    if mcid is not None:
+                        owned.setdefault(mcid, set()).add(index)
+            if form is not None:
+                forms_by_event[index] = form
+                form_uses[form] += 1
+
+        for operands, operator in operations(page):
+            if operator in (b"BMC", b"BDC"):
+                if not operands or len(stack) >= MAX_DEPTH:
+                    raise InspectionError("invalid_marked_content")
+                artifact = str(operands[0]) == "/Artifact"
+                mcid = None
+                if operator == b"BDC":
+                    props = resolved(operands[1]) if len(operands) == 2 else None
+                    if isinstance(props, NameObject):
+                        props = resolved(properties.get(props))
+                    if not isinstance(props, dict):
+                        gaps.add("unsupported_marked_content_properties")
+                    elif "/MCID" in props:
+                        mcid = integer(props["/MCID"])
+                        if mcid is None or mcid in declared_mcids:
+                            gaps.add("duplicate_or_invalid_mcid")
+                        elif any(key is not None for key, _ in stack):
+                            gaps.add("nested_mcid_scope_unsupported")
+                        else:
+                            declared_mcids.add(mcid)
+                stack.append((mcid, artifact))
+                continue
+            if operator == b"EMC":
+                if not stack:
+                    gaps.add("unbalanced_marked_content")
+                else:
+                    stack.pop()
+                continue
+            if operator in (b"MP", b"DP"):
+                continue
+            if operator in (b"Tj", b"TJ", b"'", b'"'):
+                if operator in (b"'", b'"'):
+                    emit([operator.decode("ascii"), canonical.value(operands[:-1])])
+                pieces = operands[0] if operator == b"TJ" else operands[-1:]
+                for piece in pieces:
+                    if isinstance(piece, (str, bytes)):
+                        raw = piece.original_bytes if isinstance(piece, TextStringObject) else bytes(piece) if isinstance(piece, bytes) else piece.encode("utf-8")
+                        for byte in raw:
+                            emit(["text-byte", byte], paint=True)
+                    else:
+                        amount = float(piece)
+                        if not math.isfinite(amount):
+                            raise InspectionError("invalid_number")
+                        if amount:
+                            if tokens and tokens[-1][0] == "text-adjust":
+                                tokens[-1][1] += amount
+                            else:
+                                emit(["text-adjust", amount])
+                continue
+            form = None
+            token = [operator.decode("ascii"), canonical.value(operands)]
+            if operator == b"Do":
+                asset = resolved(resolved(resources.get("/XObject", {})).get(operands[0])) if len(operands) == 1 else None
+                if not isinstance(asset, StreamObject) or asset.get("/Subtype") not in ("/Form", "/Image"):
+                    gaps.add("unresolved_painted_xobject")
+                else:
+                    if id(asset) not in asset_hashes:
+                        asset_hashes[id(asset)] = Canonicalizer().hash(asset)
+                    token.append(asset_hashes[id(asset)])
+                    if asset.get("/Subtype") == "/Form":
+                        form = reference_key(asset) or ("direct", id(asset))
+            emit(token, operator in paint_ops, form)
+        if stack:
+            gaps.add("unbalanced_marked_content")
+        result["pages"][page_number] = {"executionHash": digest(json.dumps(tokens, separators=(",", ":"), ensure_ascii=True).encode()), "resourcesHash": Canonicalizer().hash(resources), "owned": owned, "artifactEvents": artifact_events, "formsByEvent": forms_by_event, "gaps": gaps}
+    try:
+        parents = number_tree(root.get("/ParentTree"))
+    except InspectionError:
+        parents = None
+    role_map = resolved(root.get("/RoleMap", {}))
+    visited: set[int] = set()
+
+    def page_of(item: Any, inherited: int | None) -> int | None:
+        return page_ids.get(reference_key(item["/Pg"])) if "/Pg" in item else inherited
+
+    def collect(item: Any, owner: Any, page_number: int | None, leaves: list[Any], gaps: set[str], depth: int = 0, active: set[int] | None = None) -> None:
+        if depth > MAX_DEPTH or len(leaves) > MAX_NODES:
+            raise InspectionError("structure_complexity_limit")
+        item = resolved(item)
+        active = set() if active is None else active
+        if isinstance(item, (list, dict)):
+            if id(item) in active:
+                gaps.add("cyclic_figure_structure")
+                return
+            active = active | {id(item)}
+        if isinstance(item, list):
+            for child in item:
+                collect(child, owner, page_number, leaves, gaps, depth + 1, active)
+        elif integer(item) is not None:
+            leaves.append((page_number, integer(item), owner))
+        elif isinstance(item, dict):
+            page_number = page_of(item, page_number)
+            if item.get("/Type") == "/MCR":
+                if item.get("/Stm") is not None:
+                    gaps.add("internal_form_mcid_unsupported")
+                else:
+                    leaves.append((page_number, integer(item.get("/MCID")), owner))
+            elif item.get("/Type") == "/OBJR":
+                gaps.add("figure_object_reference_unsupported")
+            elif item.get("/Type") == "/StructElem" or "/S" in item:
+                collect(item.get("/K"), item, page_number, leaves, gaps, depth + 1, active)
+            else:
+                gaps.add("unsupported_figure_content")
+        else:
+            gaps.add("unsupported_figure_content")
+
+    def walk(item: Any, inherited: int | None = None, depth: int = 0) -> None:
+        item = resolved(item)
+        if depth > MAX_DEPTH or len(visited) > MAX_TAGS:
+            raise InspectionError("structure_complexity_limit")
+        if isinstance(item, list):
+            for child in item:
+                walk(child, inherited, depth + 1)
+            return
+        if not isinstance(item, dict) or id(item) in visited:
+            return
+        visited.add(id(item))
+        page_number = page_of(item, inherited)
+        role = str(item.get("/S", ""))
+        seen_roles: set[str] = set()
+        while role not in ("/" + value for value in STANDARD_ROLES) and role in role_map and role not in seen_roles:
+            seen_roles.add(role)
+            role = str(resolved(role_map[role]))
+        if role == "/Figure":
+            leaves: list[Any] = []
+            gaps: set[str] = set()
+            collect(item.get("/K"), item, page_number, leaves, gaps)
+            events: dict[int, set[int]] = {}
+            leaf_ids: list[dict[str, Any]] = []
+            seen_leaves: set[tuple[int, int]] = set()
+            for leaf_page, mcid, owner in leaves:
+                if leaf_page is None or mcid is None or leaf_page not in result["pages"]:
+                    gaps.add("unresolved_figure_content_location")
+                    continue
+                if (leaf_page, mcid) in seen_leaves:
+                    gaps.add("duplicate_figure_content_reference")
+                seen_leaves.add((leaf_page, mcid))
+                leaf_ids.append({"pageNumber": leaf_page, "mcid": mcid})
+                scan = result["pages"][leaf_page]
+                gaps.update(scan["gaps"])
+                parent_key = integer(pages[leaf_page - 1].get("/StructParents"))
+                parent_array = parents.get(parent_key) if parents is not None else None
+                if not isinstance(parent_array, list) or mcid >= len(parent_array) or resolved(parent_array[mcid]) is not owner:
+                    gaps.add("figure_parent_tree_owner_mismatch")
+                paint = scan["owned"].get(mcid, set())
+                if not paint:
+                    gaps.add("figure_has_no_semantic_paint")
+                events.setdefault(leaf_page, set()).update(paint)
+                if any(form_uses[scan["formsByEvent"][event]] > 1 for event in paint if event in scan["formsByEvent"]):
+                    gaps.add("reused_form_figure_unsupported")
+            membership = [{"pageNumber": number, "executionHash": result["pages"][number]["executionHash"], "resourcesHash": result["pages"][number]["resourcesHash"], "paintOccurrences": sorted(indices)} for number, indices in sorted(events.items())]
+            if not membership:
+                gaps.add("empty_figure_membership")
+            figure: dict[str, Any] = {"id": f"figure-{len(result['figures']) + 1}", "pageNumber": page_number, "contentKeys": leaf_ids, "paintCount": sum(len(indices) for indices in events.values()), "membershipHash": digest(json.dumps(membership, sort_keys=True, separators=(",", ":")).encode()) if not gaps else None, "supported": not gaps, "gaps": sorted(gaps), "events": events}
+            for key, name in (("/Alt", "alt"), ("/ActualText", "actualText")):
+                if key in item:
+                    figure[name], _ = native_string(item[key], 8000)
+            result["figures"].append(figure)
+        walk(item.get("/K"), page_number, depth + 1)
+    walk(root.get("/K"))
+    result["supported"] = all(figure["supported"] for figure in result["figures"])
+    return result
+
+
+def compare_figure_associations(source: PdfReader, output: PdfReader) -> dict[str, Any]:
+    before = figure_association_inventory(source)
+    after = figure_association_inventory(output)
+    comparisons = []
+    used_candidates: set[str] = set()
+    for original in before["figures"]:
+        matches = [candidate for candidate in after["figures"] if original["membershipHash"] is not None and candidate["membershipHash"] == original["membershipHash"]]
+        row: dict[str, Any] = {"sourceFigureId": original["id"], "pageNumber": original["pageNumber"], "sourceContentKeys": original["contentKeys"], "sourcePaintCount": original["paintCount"], "candidateCount": len(matches), "membershipVerified": False, "descriptionsIdentical": False, "gaps": original["gaps"]}
+        if len(matches) == 1 and matches[0]["id"] not in used_candidates:
+            candidate = matches[0]
+            used_candidates.add(candidate["id"])
+            row.update({"outputFigureId": candidate["id"], "outputContentKeys": candidate["contentKeys"], "membershipVerified": True, "descriptionsIdentical": all(key not in original or candidate.get(key) == original[key] for key in ("alt", "actualText"))})
+            if not row["descriptionsIdentical"]:
+                row["failureCode"] = "authored_figure_description_changed"
+        elif not original["supported"]:
+            row["failureCode"] = "figure_membership_unverified"
+        elif matches:
+            row["failureCode"] = "ambiguous_figure_membership"
+        else:
+            hidden = False
+            for number, events in original["events"].items():
+                a, b = before["pages"][number], after["pages"].get(number)
+                if b and a["executionHash"] == b["executionHash"] and a["resourcesHash"] == b["resourcesHash"] and events & b["artifactEvents"]:
+                    hidden = True
+            row["failureCode"] = "source_figure_hidden_as_artifact" if hidden else "source_figure_membership_changed"
+        comparisons.append(row)
+    return {"passed": all(row["membershipVerified"] and row["descriptionsIdentical"] for row in comparisons), "checksComplete": all(row["membershipVerified"] for row in comparisons), "sourceFigureCount": len(before["figures"]), "outputFigureCount": len(after["figures"]), "comparisons": comparisons, "scope": before["scope"]}
 
 
 def compare_pdfs(source: Path, output: Path, strict_text_subset: bool = False) -> dict[str, Any]:
@@ -959,7 +1494,12 @@ def compare_pdfs(source: Path, output: Path, strict_text_subset: bool = False) -
                 report["preservation"]["passed"] = False
                 break
         report["structure"]["authored_alternative_strings_retained"] = not bool(Counter(source_alts) - Counter(output_alts))
-        report["structure"]["authored_alternative_associations_verified"] = not bool(source_alts)
+        report["figure_associations"] = compare_figure_associations(before, after)
+        nonfigure_source_alts = any("alt" in tag and tag["role"] != "Figure" for tag in report["source_structure"]["tags"])
+        report["structure"]["authored_alternative_associations_verified"] = report["figure_associations"]["passed"] and not nonfigure_source_alts
+        for comparison in report["figure_associations"]["comparisons"]:
+            if comparison.get("failureCode"):
+                finding(comparison["failureCode"], "An original figure's exact painted content and authored description could not both be verified in the repaired PDF.", comparison.get("pageNumber"))
         report["structure"]["passed"] = report["structure"].get("machine_checks_passed", False)
         if strict_text_subset:
             try:

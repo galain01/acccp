@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import ArrayObject, BooleanObject, DecodedStreamObject, DictionaryObject, NameObject, NumberObject, TextStringObject
+from pypdf.generic import ArrayObject, BooleanObject, DecodedStreamObject, DictionaryObject, FloatObject, IndirectObject, NameObject, NullObject, NumberObject, TextStringObject
 
 import verify_pdf as v
 
@@ -77,6 +77,99 @@ def inline_link_reader(*, bad_parent=False, wrong_page=False, missing_object=Fal
     return edited_reader(edit, link=True)
 
 
+def named_link_reader(*, legacy=False, missing=False, direct=False, duplicate=False, broken_page=False):
+    writer = PdfWriter(clone_from=inline_link_reader())
+    page = writer.pages[0]
+    annotation = page["/Annots"][0].get_object()
+    name = NameObject("/chapter") if legacy else TextStringObject("chapter")
+    destination = ArrayObject([page.indirect_reference, NameObject("/Fit")])
+    if broken_page:
+        destination[0] = writer._add_object(DictionaryObject({NameObject("/Type"): NameObject("/Page")}))
+    if direct:
+        del annotation[NameObject("/A")]
+        annotation[NameObject("/Dest")] = name
+    else:
+        annotation[NameObject("/A")] = DictionaryObject({NameObject("/S"): NameObject("/GoTo"), NameObject("/D"): name})
+    if not missing:
+        if legacy:
+            writer.root_object[NameObject("/Dests")] = DictionaryObject({name: DictionaryObject({NameObject("/D"): destination})})
+        else:
+            values = ArrayObject([name, destination])
+            if duplicate:
+                values.extend([name, destination])
+            leaf = writer._add_object(DictionaryObject({NameObject("/Names"): values}))
+            writer.root_object[NameObject("/Names")] = DictionaryObject({NameObject("/Dests"): DictionaryObject({NameObject("/Kids"): ArrayObject([leaf])})})
+    data = io.BytesIO()
+    writer.write(data)
+    return PdfReader(io.BytesIO(data.getvalue()))
+
+
+def figure_reader(*, kind="image", alts=("Left figure", "Right figure"), callback=None):
+    """Two distinct occurrences sharing the same image/Form resource when used."""
+    writer = PdfWriter(clone_from=PdfReader(io.BytesIO(pdf_bytes(tagged=True))))
+    page = writer.pages[0]
+    root = writer.root_object["/StructTreeRoot"]
+    document = root["/K"][0].get_object()
+    asset = DecodedStreamObject()
+    if kind == "image":
+        asset.update({NameObject("/Type"): NameObject("/XObject"), NameObject("/Subtype"): NameObject("/Image"), NameObject("/Width"): NumberObject(1), NameObject("/Height"): NumberObject(1), NameObject("/ColorSpace"): NameObject("/DeviceGray"), NameObject("/BitsPerComponent"): NumberObject(8)})
+        asset.set_data(b"\x80")
+    elif kind == "form":
+        asset.update({NameObject("/Type"): NameObject("/XObject"), NameObject("/Subtype"): NameObject("/Form"), NameObject("/BBox"): ArrayObject([NumberObject(n) for n in (0, 0, 30, 20)]), NameObject("/Resources"): DictionaryObject()})
+        asset.set_data(b"0 0 30 20 re f")
+    asset_ref = writer._add_object(asset) if kind in ("image", "form") else None
+    if asset_ref is not None:
+        page["/Resources"][NameObject("/XObject")] = DictionaryObject({NameObject("/Im0"): asset_ref})
+    refs = []
+    bodies = []
+    for number, alt in enumerate(alts):
+        tag = DictionaryObject({NameObject("/Type"): NameObject("/StructElem"), NameObject("/S"): NameObject("/Figure"), NameObject("/P"): document.indirect_reference, NameObject("/Pg"): page.indirect_reference, NameObject("/K"): NumberObject(number), NameObject("/Alt"): TextStringObject(alt)})
+        refs.append(writer._add_object(tag))
+        if kind in ("image", "form"):
+            body = f"q 30 0 0 30 {20 + number * 70} 20 cm /Im0 Do Q"
+        else:
+            body = f"q 0 0 0 rg {20 + number * 70} 20 30 20 re f BT /F1 10 Tf {20 + number * 70} 45 Td (Label{number}) Tj ET Q"
+        bodies.append(f"/Figure << /MCID {number} >> BDC {body} EMC")
+    document[NameObject("/K")] = ArrayObject(refs)
+    root["/ParentTree"][NameObject("/Nums")] = ArrayObject([NumberObject(0), ArrayObject(refs)])
+    stream = DecodedStreamObject()
+    stream.set_data(" ".join(bodies).encode("ascii"))
+    page[NameObject("/Contents")] = writer._add_object(stream)
+    if callback:
+        callback(writer, page, root, document, refs, stream, asset_ref)
+    data = io.BytesIO()
+    writer.write(data)
+    return PdfReader(io.BytesIO(data.getvalue()))
+
+
+def native_form_reader(*, bad_parent=False, reused=False, artifact=False, detached=False, orphan=False, malformed=None):
+    def edit(writer, root, document, ref, tag):
+        page = writer.pages[0]
+        form = DecodedStreamObject()
+        form.update({NameObject("/Type"): NameObject("/XObject"), NameObject("/Subtype"): NameObject("/Form"), NameObject("/BBox"): ArrayObject([NumberObject(n) for n in (0, 0, 200, 100)]), NameObject("/Resources"): DictionaryObject({NameObject("/Font"): page["/Resources"]["/Font"]})})
+        form.set_data((b"/Artifact BMC " if artifact else b"/P << /MCID 0 >> BDC ") + b"BT /F1 12 Tf 20 40 Td (Form text) Tj ET EMC")
+        if malformed == "nested":
+            form.set_data(form.get_data().replace(b"BT ", b"/Span << /MCID 1 >> BDC BT ") + b" EMC")
+        elif malformed == "negative":
+            form.set_data(form.get_data().replace(b"/MCID 0", b"/MCID -1"))
+        elif malformed == "properties":
+            form.set_data(form.get_data().replace(b"<< /MCID 0 >>", b"/MissingProperties"))
+        form_ref = writer._add_object(form)
+        page["/Resources"][NameObject("/XObject")] = DictionaryObject({NameObject("/Fm0"): form_ref})
+        stream = DecodedStreamObject()
+        stream.set_data(b"/Fm0 Do /Fm0 Do" if reused else b"/Fm0 Do")
+        page[NameObject("/Contents")] = writer._add_object(stream)
+        if artifact:
+            tag[NameObject("/K")] = ArrayObject()
+            root["/ParentTree"][NameObject("/Nums")] = ArrayObject([NumberObject(0), ArrayObject()])
+        else:
+            form[NameObject("/StructParents")] = NumberObject(2)
+            target = writer._add_object(DecodedStreamObject()) if detached else form_ref
+            tag[NameObject("/K")] = ArrayObject() if orphan else DictionaryObject({NameObject("/Type"): NameObject("/MCR"), NameObject("/Pg"): page.indirect_reference, NameObject("/Stm"): target, NameObject("/MCID"): NumberObject(0)})
+            root["/ParentTree"][NameObject("/Nums")] = ArrayObject([NumberObject(0), ArrayObject(), NumberObject(2), ArrayObject([document.indirect_reference if bad_parent else ref])])
+    return edited_reader(edit)
+
+
 class OperatorChecks(unittest.TestCase):
     def fingerprint(self, ops):
         return v.drawing_fingerprint(ops, v.Canonicalizer())
@@ -94,6 +187,21 @@ class OperatorChecks(unittest.TestCase):
 
     def test_changed_text_is_not_equivalent(self):
         self.assertNotEqual(self.fingerprint([([b"abc"], b"Tj")]), self.fingerprint([([b"abd"], b"Tj")]))
+
+    def test_equivalent_numeric_serialization_is_identical(self):
+        self.assertEqual(v.Canonicalizer().hash([FloatObject(1.0), FloatObject(0.5)]), v.Canonicalizer().hash([NumberObject(1), FloatObject(0.5)]))
+
+    def test_binary_float_noise_is_normalized_but_geometry_changes_are_not(self):
+        self.assertEqual(v.Canonicalizer().hash(FloatObject(208.88400000000001)), v.Canonicalizer().hash(FloatObject(208.884)))
+        self.assertNotEqual(v.Canonicalizer().hash(FloatObject(208.88401)), v.Canonicalizer().hash(FloatObject(208.884)))
+
+    def test_page_reference_identity_includes_owning_reader(self):
+        source = PdfReader(io.BytesIO(pdf_bytes()))
+        output = PdfReader(io.BytesIO(pdf_bytes()))
+        page_ref = output.pages[0].indirect_reference
+        foreign = DictionaryObject({NameObject("/Meaning"): NameObject("/Font")})
+        foreign.indirect_reference = IndirectObject(page_ref.idnum, page_ref.generation, source)
+        self.assertEqual(v.Canonicalizer(list(output.pages)).value(foreign), {"/Meaning": "/Font"})
 
     def test_duplicate_mcid_rejected(self):
         sequence = [([NameObject("/P"), DictionaryObject({NameObject("/MCID"): NumberObject(0)})], b"BDC"), ([], b"EMC")]
@@ -176,6 +284,83 @@ class PreservationChecks(unittest.TestCase):
 
 
 class SavedStructureEvidence(unittest.TestCase):
+    def test_filtered_text_uses_font_tounicode_in_tags_and_artifacts(self):
+        def edit(writer, root, document, ref, tag):
+            font = writer.pages[0]["/Resources"]["/Font"]["/F1"]
+            mapping = DecodedStreamObject()
+            mapping.set_data(b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def /CMapName /NativeTest def /CMapType 2 def 1 begincodespacerange <00> <ff> endcodespacerange 2 beginbfchar <80> <2265> <81> <2020> endbfchar endcmap CMapName currentdict /CMap defineresource pop end end")
+            font[NameObject("/ToUnicode")] = writer._add_object(mapping)
+            stream = DecodedStreamObject()
+            stream.set_data(b"/P << /MCID 0 >> BDC BT /F1 12 Tf 20 40 Td <80> Tj ET EMC /Artifact BMC BT /F1 12 Tf 20 10 Td <81> Tj ET EMC")
+            writer.pages[0][NameObject("/Contents")] = writer._add_object(stream)
+        info = v.structure_inventory(edited_reader(edit))
+        self.assertEqual(next(tag for tag in info["tags"] if tag["role"] == "P")["text"].strip(), "\u2265")
+        self.assertEqual(info["page_content"][0]["artifactText"].strip(), "\u2020")
+
+    def test_artifact_text_is_decoded_and_separate_from_tag_text(self):
+        def edit(writer, root, document, ref, tag):
+            stream = DecodedStreamObject()
+            stream.set_data(b"/P << /MCID 0 >> BDC BT /F1 12 Tf 20 40 Td (Meaningful text) Tj ET /Artifact BMC BT /F1 10 Tf 20 10 Td (Page 1) Tj ET EMC EMC")
+            writer.pages[0][NameObject("/Contents")] = writer._add_object(stream)
+        info = v.structure_inventory(edited_reader(edit))
+        self.assertEqual(info["page_content"][0]["artifactText"].strip(), "Page 1")
+        self.assertTrue(info["page_content"][0]["artifactTextComplete"])
+        self.assertEqual(next(tag for tag in info["tags"] if tag["role"] == "P")["text"].strip(), "Meaningful text")
+
+    def test_artifact_text_bounds_cannot_silently_pass(self):
+        info = v.structure_inventory(PdfReader(io.BytesIO(pdf_bytes(tagged=True, artifact=True, text="X" * (v.MAX_ARTIFACT_TEXT_CHARS + 1)))))
+        self.assertEqual(len(info["page_content"][0]["artifactText"]), v.MAX_ARTIFACT_TEXT_CHARS)
+        self.assertFalse(info["page_content"][0]["artifactTextComplete"])
+        self.assertFalse(info["checks_complete"])
+
+    def test_leaf_vector_form_has_complete_empty_artifact_text(self):
+        info = v.structure_inventory(figure_reader(kind="form"))
+        self.assertTrue(info["page_content"][0]["artifactTextComplete"])
+        self.assertEqual(info["page_content"][0]["artifactText"], "")
+
+    def test_unique_form_mcr_resolves_actual_text_and_parent_tree(self):
+        info = v.structure_inventory(native_form_reader())
+        tag = next(tag for tag in info["tags"] if tag["role"] == "P")
+        self.assertEqual(tag["text"].strip(), "Form text")
+        self.assertTrue(tag["contentSequence"][0]["resolved"])
+        self.assertTrue(tag["contentSequence"][0]["parentTreeVerified"])
+        self.assertEqual(tag["contentSequence"][0]["streamId"], "form-1")
+        self.assertEqual(info["unresolved_content_references"], 0)
+        self.assertTrue(info["checks_complete"])
+
+    def test_wrong_form_parent_tree_does_not_pass(self):
+        info = v.structure_inventory(native_form_reader(bad_parent=True))
+        self.assertFalse(info["machine_checks_passed"])
+        self.assertIn("parent_tree_owner_mismatch", [f["code"] for f in info["findings"]])
+
+    def test_semantic_form_reuse_is_an_explicit_gap(self):
+        info = v.structure_inventory(native_form_reader(reused=True))
+        self.assertFalse(info["page_content"][0]["artifactTextComplete"])
+        self.assertFalse(info["checks_complete"])
+        self.assertIn("ambiguous_form_content_invocation", [f["code"] for f in info["findings"]])
+
+    def test_repeated_artifact_form_text_is_exposed_for_each_occurrence(self):
+        info = v.structure_inventory(native_form_reader(artifact=True, reused=True))
+        self.assertEqual(info["page_content"][0]["artifactText"].count("Form text"), 2)
+        self.assertEqual(info["page_content"][0]["form_artifact_text_operators"], 2)
+        self.assertTrue(info["page_content"][0]["artifactTextComplete"])
+
+    def test_detached_form_stream_mcr_is_unresolved(self):
+        info = v.structure_inventory(native_form_reader(detached=True))
+        self.assertEqual(info["unresolved_content_references"], 1)
+        self.assertFalse(info["checks_complete"])
+
+    def test_form_mcid_without_structure_owner_is_rejected(self):
+        info = v.structure_inventory(native_form_reader(orphan=True))
+        self.assertIn("unowned_form_marked_content", [f["code"] for f in info["findings"]])
+
+    def test_malformed_or_nested_form_mcids_remain_explicit_gaps(self):
+        for mutation, code in [("nested", "nested_form_mcid_scope_unsupported"), ("negative", "invalid_form_mcid"), ("properties", "invalid_form_marked_content_properties")]:
+            with self.subTest(mutation=mutation):
+                info = v.structure_inventory(native_form_reader(malformed=mutation))
+                self.assertFalse(info["checks_complete"])
+                self.assertIn(code, [f["code"] for f in info["findings"]])
+
     def test_table_attributes_and_native_language_are_exposed(self):
         def edit(writer, root, document, ref, tag):
             tag[NameObject("/S")] = NameObject("/TH")
@@ -232,6 +417,42 @@ class SavedStructureEvidence(unittest.TestCase):
         self.assertEqual(objr["uri"], "https://example.org/read")
         self.assertEqual(link["contentSequence"][1]["text"].strip(), "Link")
         self.assertEqual(info["unresolved_content_references"], 0)
+        self.assertEqual(info["unresolved_local_destinations"], 0)
+        self.assertNotIn("destinationResolved", objr)
+
+    def test_named_destinations_resolve_native_name_tree_and_legacy_dictionary(self):
+        for legacy in (False, True):
+            for direct in (False, True):
+                with self.subTest(legacy=legacy, direct=direct):
+                    info = v.structure_inventory(named_link_reader(legacy=legacy, direct=direct))
+                    objr = next(tag for tag in info["tags"] if tag["role"] == "Link")["contentSequence"][0]
+                    self.assertTrue(info["checks_complete"], info["findings"])
+                    self.assertTrue(info["machine_checks_passed"])
+                    self.assertTrue(objr["destinationResolved"])
+                    self.assertEqual(objr["destinationPageNumber"], 1)
+                    self.assertEqual(objr["destinationView"], "Fit")
+
+    def test_missing_named_destination_blocks_completion_even_when_objr_resolves(self):
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                info = v.structure_inventory(named_link_reader(legacy=legacy, missing=True))
+                objr = next(tag for tag in info["tags"] if tag["role"] == "Link")["contentSequence"][0]
+                self.assertTrue(objr["resolved"])
+                self.assertFalse(objr["destinationResolved"])
+                self.assertFalse(info["checks_complete"])
+                self.assertFalse(info["machine_checks_passed"])
+                self.assertEqual(info["unresolved_local_destinations"], 1)
+                self.assertIn("local_link_destination_unresolved", [finding["code"] for finding in info["findings"]])
+
+    def test_ambiguous_named_destination_is_not_guessed(self):
+        info = v.structure_inventory(named_link_reader(duplicate=True))
+        self.assertFalse(info["checks_complete"])
+        self.assertEqual(next(f for f in info["findings"] if f["code"] == "local_link_destination_unresolved")["reason"], "ambiguous_named_destination")
+
+    def test_named_destination_must_point_to_a_real_document_page(self):
+        info = v.structure_inventory(named_link_reader(broken_page=True))
+        self.assertFalse(info["checks_complete"])
+        self.assertEqual(next(f for f in info["findings"] if f["code"] == "local_link_destination_unresolved")["reason"], "destination_page_missing")
 
     def test_wrong_objr_parent_owner_remains_unresolved(self):
         info = v.structure_inventory(inline_link_reader(bad_parent=True))
@@ -247,6 +468,79 @@ class SavedStructureEvidence(unittest.TestCase):
         info = v.structure_inventory(inline_link_reader(missing_object=True))
         self.assertFalse(info["checks_complete"])
         self.assertIn("annotation_object_not_uniquely_on_page", [finding["code"] for finding in info["findings"]])
+
+
+class AuthoredFigureAssociation(unittest.TestCase):
+    def compare(self, source=None, output=None):
+        return v.compare_figure_associations(source or figure_reader(), output or figure_reader())
+
+    def test_identical_image_payloads_are_distinguished_by_occurrence(self):
+        self.assertTrue(self.compare()["passed"])
+        changed = figure_reader(alts=("Right figure", "Left figure"))
+        result = self.compare(output=changed)
+        self.assertFalse(result["passed"])
+        self.assertTrue(all(row["membershipVerified"] for row in result["comparisons"]))
+        self.assertEqual({row["failureCode"] for row in result["comparisons"]}, {"authored_figure_description_changed"})
+
+    def test_mcid_renumbering_preserves_figure_identity(self):
+        def change(writer, page, root, document, refs, stream, asset):
+            stream.set_data(stream.get_data().replace(b"MCID 0", b"MCID 2").replace(b"MCID 1", b"MCID 3"))
+            for number, ref in enumerate(refs, 2):
+                ref.get_object()[NameObject("/K")] = NumberObject(number)
+            root["/ParentTree"][NameObject("/Nums")] = ArrayObject([NumberObject(0), ArrayObject([NullObject(), NullObject(), *refs])])
+        self.assertTrue(self.compare(output=figure_reader(callback=change))["passed"])
+
+    def test_vector_paths_and_text_are_both_members(self):
+        result = self.compare(figure_reader(kind="vector"), figure_reader(kind="vector"))
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["comparisons"][0]["sourcePaintCount"], 7)
+
+    def test_split_tj_and_tj_array_preserve_membership(self):
+        def change(writer, page, root, document, refs, stream, asset):
+            stream.set_data(stream.get_data().replace(b"(Label0) Tj", b"(La) Tj [(bel0)] TJ"))
+        self.assertTrue(self.compare(figure_reader(kind="vector"), figure_reader(kind="vector", callback=change))["passed"])
+
+    def test_vector_path_hidden_as_artifact_is_rejected(self):
+        def change(writer, page, root, document, refs, stream, asset):
+            stream.set_data(stream.get_data().replace(b"30 20 re f", b"30 20 re /Artifact BMC f EMC", 1))
+        result = self.compare(figure_reader(kind="vector"), figure_reader(kind="vector", callback=change))
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["comparisons"][0]["failureCode"], "source_figure_hidden_as_artifact")
+
+    def test_text_removed_from_vector_figure_is_rejected(self):
+        def change(writer, page, root, document, refs, stream, asset):
+            stream.set_data(stream.get_data().replace(b"(Label0) Tj", b"EMC (Label0) Tj /Figure BMC"))
+        result = self.compare(figure_reader(kind="vector"), figure_reader(kind="vector", callback=change))
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["comparisons"][0]["failureCode"], "source_figure_membership_changed")
+
+    def test_copied_alt_on_empty_tag_does_not_preserve_authored_figure(self):
+        def change(writer, page, root, document, refs, stream, asset):
+            refs[0].get_object()[NameObject("/K")] = ArrayObject()
+        self.assertFalse(self.compare(output=figure_reader(callback=change))["passed"])
+
+    def test_exact_punctuation_and_actual_text_are_retained(self):
+        authored = 'Chart "A" [group] & <value>'
+        def exact(writer, page, root, document, refs, stream, asset):
+            refs[0].get_object()[NameObject("/ActualText")] = TextStringObject("Authored replacement & detail")
+        source = figure_reader(alts=(authored, "Right figure"), callback=exact)
+        self.assertTrue(self.compare(source, figure_reader(alts=(authored, "Right figure"), callback=exact))["passed"])
+        self.assertFalse(self.compare(source, figure_reader(alts=("Chart A group value", "Right figure"), callback=exact))["passed"])
+        self.assertFalse(self.compare(source, figure_reader(alts=(authored, "Right figure")))["passed"])
+
+    def test_reused_form_is_explicitly_unsupported(self):
+        result = self.compare(figure_reader(kind="form"), figure_reader(kind="form"))
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["checksComplete"])
+        self.assertIn("reused_form_figure_unsupported", result["comparisons"][0]["gaps"])
+
+    def test_internal_form_mcid_is_explicitly_unsupported(self):
+        def change(writer, page, root, document, refs, stream, asset):
+            refs[0].get_object()[NameObject("/K")] = DictionaryObject({NameObject("/Type"): NameObject("/MCR"), NameObject("/Pg"): page.indirect_reference, NameObject("/Stm"): asset, NameObject("/MCID"): NumberObject(0)})
+        source = figure_reader(kind="form", callback=change)
+        result = self.compare(source, source)
+        self.assertFalse(result["passed"])
+        self.assertIn("internal_form_mcid_unsupported", result["comparisons"][0]["gaps"])
 
 
 if __name__ == "__main__":
