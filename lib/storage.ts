@@ -62,6 +62,15 @@ export function docxOutputKey(
   return `${sessionId}/${documentId}/${jobId}/output.docx`;
 }
 
+/** Repaired PDF stays distinct from the immutable uploaded source.pdf. */
+export function pdfOutputKey(
+  sessionId: string,
+  documentId: string,
+  jobId: string
+): string {
+  return `${sessionId}/${documentId}/${jobId}/output.pdf`;
+}
+
 export function outputReviewKey(
   sessionId: string,
   documentId: string,

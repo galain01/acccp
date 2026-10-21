@@ -111,6 +111,85 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
+describe("native PDF results", () => {
+  it("shows page-specific findings and a PDF download without fetching HTML or implying certification", async () => {
+    const clicked: string[] = [];
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+      this: HTMLAnchorElement
+    ) {
+      clicked.push(this.href);
+    });
+    vi.mocked(getDocumentOutputDownload).mockResolvedValue({
+      url: "https://storage.example.test/fresh-pdf",
+      filename: "Course-repaired.pdf",
+    });
+    await mount({
+      outputTarget: "accessible_pdf",
+      html: undefined,
+      changes: ["Page 5: connected the table headings to their columns."],
+      errors: [
+        finding({
+          severity: "warning",
+          suggestion: "Check the labels in the repaired PDF on page 5.",
+        }),
+      ],
+    });
+    const dialog = resultDialog();
+    expect(dialog.textContent).toContain("connected the table headings");
+    expect(dialog.textContent).toContain(
+      "Automatic checks do not certify PDF accessibility"
+    );
+    expect(facultyText()).toContain("Where: PDF page 5");
+    expect(facultyText()).toContain("repaired PDF on page 5");
+    expect(dialog.textContent).not.toContain("Canvas");
+    const actions = Array.from(dialog.querySelectorAll("button"));
+    expect(actions.map((button) => button.textContent)).not.toContain(
+      "Review changes"
+    );
+    expect(actions.map((button) => button.textContent)).not.toContain(
+      "Copy HTML"
+    );
+    const download = actions.find(
+      (button) => button.textContent === "Download repaired PDF"
+    )!;
+    await act(async () => download.click());
+    await act(async () => download.click());
+    expect(getDocumentOutputDownload).toHaveBeenCalledTimes(2);
+    expect(getDocumentOutputDownload).toHaveBeenCalledWith(
+      "doc-1",
+      "accessible_pdf"
+    );
+    expect(clicked).toEqual([
+      "https://storage.example.test/fresh-pdf",
+      "https://storage.example.test/fresh-pdf",
+    ]);
+    expect(getDocumentHtml).not.toHaveBeenCalled();
+    expect(reviewItem()).not.toBeNull();
+  });
+
+  it("retains changes and findings when the repaired PDF has expired", async () => {
+    vi.mocked(getDocumentOutputDownload).mockResolvedValueOnce(null);
+    await mount({
+      outputTarget: "accessible_pdf",
+      html: undefined,
+      changes: ["Added document language."],
+      errors: [finding({ suggestion: "Check the repaired PDF." })],
+    });
+    const download = Array.from(resultDialog().querySelectorAll("button")).find(
+      (button) => button.textContent === "Download repaired PDF"
+    )!;
+    await act(async () => download.click());
+    expect(
+      resultDialog().querySelector('[role="alert"]')?.textContent
+    ).toContain("expire after 14 days");
+    expect(resultDialog().textContent).toContain("Added document language.");
+    expect(
+      resultDialog().querySelector('[role="status"]')?.textContent
+    ).toContain("a PDF editor");
+    expect(getDocumentHtml).not.toHaveBeenCalled();
+  });
+});
+
 describe("native Word results", () => {
   it("shows actual changes and review locations without fetching HTML or offering HTML actions", async () => {
     await mount({

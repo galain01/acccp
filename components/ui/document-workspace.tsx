@@ -384,9 +384,9 @@ export default function DocumentWorkspace({
           className="text-sm text-muted-foreground"
         >
           Choose a format for new files, then adjust individual files below.
-          Original-format improvements are available for Word and PowerPoint.
-          Word and PDF can also become HTML. PDF repair and PowerPoint to HTML
-          are not available yet.
+          Keep Word, PDF, and PowerPoint documents in their original format with
+          accessibility improvements. Word and PDF can also become HTML.
+          PowerPoint to HTML is not available yet.
         </p>
         {hasDocuments && (
           <div>

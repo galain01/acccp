@@ -603,7 +603,7 @@ describe("document conversion route", () => {
 
   it("rejects unsupported targets and does not silently infer a new destination", async () => {
     expect(
-      (await POST(request({ outputTarget: "accessible_pdf" }))).status
+      (await POST(request({ outputTarget: "accessible_rtf" }))).status
     ).toBe(400);
     expect(
       (await POST(request({ name: "slides.pptx", contents: DOCX }))).status

@@ -1,5 +1,8 @@
 /** Data-only, bounded diagnostics. No provider messages or arbitrary metadata. */
 export const DIAGNOSTIC_STAGES = [
+  "native_pdf_prepare",
+  "native_pdf_repair",
+  "native_pdf_audit",
   "pptx_prepare",
   "docx_prepare",
   "docx_repair",
@@ -14,6 +17,13 @@ export const DIAGNOSTIC_STAGES = [
 export type DiagnosticStage = (typeof DIAGNOSTIC_STAGES)[number];
 
 export const DIAGNOSTIC_CODES = [
+  "native_pdf_configuration",
+  "native_pdf_unsupported",
+  "native_pdf_preservation",
+  "native_pdf_invalid_plan",
+  "native_pdf_worker_failed",
+  "native_pdf_timeout",
+  "native_pdf_busy",
   "docx_invalid",
   "docx_invalid_plan",
   "docx_visual_change",
@@ -165,6 +175,9 @@ export function readJobDiagnostic(input: unknown): JobDiagnostic | null {
 }
 
 const STAGE_LABELS: Record<DiagnosticStage, string> = {
+  native_pdf_prepare: "PDF repair preparation",
+  native_pdf_repair: "PDF accessibility repair",
+  native_pdf_audit: "PDF accessibility review",
   docx_prepare: "Word preparation",
   docx_repair: "Word accessibility repair",
   docx_audit: "Word accessibility review",
@@ -181,6 +194,20 @@ export function diagnosticStageLabel(stage: DiagnosticStage): string {
 }
 
 const EXPLANATIONS: Record<DiagnosticCode, string> = {
+  native_pdf_configuration:
+    "The PDF repair service is not configured. Contact the app administrator.",
+  native_pdf_unsupported:
+    "This PDF contains a feature the repair service cannot safely change. Use an unsigned, unprotected PDF without scripts, embedded files or XFA forms. The original file has been kept.",
+  native_pdf_preservation:
+    "The app could not verify that the proposed repair preserved the original pages and content. No repaired PDF was saved. Try exporting a fresh PDF from the original document.",
+  native_pdf_invalid_plan:
+    "The AI service did not return a complete, usable PDF repair plan. Try again or contact the app administrator.",
+  native_pdf_worker_failed:
+    "The PDF repair service could not complete its checks. Try again; if this continues, contact the app administrator.",
+  native_pdf_timeout:
+    "Repairing and checking this PDF took longer than the app allows. Split it into shorter documents and try again.",
+  native_pdf_busy:
+    "Several PDFs are being repaired right now. Try this document again shortly.",
   docx_invalid:
     "The app could not safely read this Word document. Use an unprotected .docx file up to 4 MB. Embed linked images or templates and remove fields that load external files. Macro-enabled and digitally signed files are not supported.",
   docx_invalid_plan:

@@ -78,6 +78,68 @@ beforeEach(() => {
 afterEach(() => vi.useRealTimers());
 
 describe("owned output downloads", () => {
+  it("signs the owned repaired PDF rather than its immutable source or HTML", async () => {
+    const builder = chain([
+      { storageKey: "session/doc/job/output.pdf", filename: "Lecture.PDF" },
+    ]);
+    mocks.db.select.mockReturnValueOnce(builder);
+    expect(
+      await getDocumentOutputDownload("pdf-doc", "accessible_pdf")
+    ).toEqual({
+      url: "https://storage.example.test/owned-signed-download",
+      filename: "Lecture-repaired.pdf",
+    });
+    const compiled = query(builder.where.mock.calls[0][0]);
+    expect(compiled.sql).toContain('"sessions"."owner_user_id"');
+    expect(compiled.sql).toContain("clock_timestamp()");
+    expect(compiled.params).toEqual(
+      expect.arrayContaining([
+        "pdf-doc",
+        "owner-1",
+        "accessible_pdf",
+        "pdf_output",
+        "available",
+      ])
+    );
+    expect(compiled.params).not.toContain("source_pdf");
+    expect(compiled.params).not.toContain("html_output");
+    expect(mocks.sign).toHaveBeenCalledExactlyOnceWith(
+      "session/doc/job/output.pdf",
+      60,
+      "Lecture-repaired.pdf"
+    );
+    expect(mocks.download).not.toHaveBeenCalled();
+  });
+
+  it("withholds PDF downloads from another owner, an expired document, or a late signer", async () => {
+    expect(
+      await getDocumentOutputDownload("other-pdf", "accessible_pdf")
+    ).toBeNull();
+    mocks.retained.mockRejectedValueOnce(new DocumentUnavailableError());
+    expect(
+      await getDocumentOutputDownload("expired-pdf", "accessible_pdf")
+    ).toBeNull();
+    expect(mocks.sign).not.toHaveBeenCalled();
+    createdAt = new Date(
+      now.getTime() - DOCUMENT_RETENTION_MS + 12_000
+    ).toISOString();
+    mocks.db.select.mockReturnValueOnce(
+      chain([{ storageKey: "owned-pdf", filename: "Guide.pdf" }])
+    );
+    mocks.sign.mockImplementationOnce(async () => {
+      vi.setSystemTime(new Date(now.getTime() + 2_000));
+      return "https://storage.example.test/late-pdf";
+    });
+    expect(
+      await getDocumentOutputDownload("pdf-doc", "accessible_pdf")
+    ).toBeNull();
+    expect(mocks.sign).toHaveBeenCalledExactlyOnceWith(
+      "owned-pdf",
+      11,
+      "Guide-repaired.pdf"
+    );
+  });
+
   it("signs only an owned Word result with its native artifact and attachment filename", async () => {
     const builder = chain([
       { storageKey: "session/doc/job/output.docx", filename: "Course.DOCX" },

@@ -34,16 +34,16 @@ Only enable a destination after its repair and validation pipeline works.
 ## Implementation status
 
 The shared workflow and native Word repair were released on 2026-10-21.
-Native PDF remains planned.
+Native PDF repair also uses this workflow, with a separate private worker.
 
 | Input | Keep original format | HTML |
 | --- | --- | --- |
 | `.pptx` | Existing native repair engine | Not implemented |
 | `.docx` | Native repair engine | Existing Canvas HTML engine |
-| `.pdf` | Not implemented | Existing Canvas HTML engine |
+| `.pdf` | Native repair engine with layout preservation | Existing Canvas HTML engine |
 
 In the UI, requested `original`/`html` intent is distinct from
-executable `OutputTarget`. The server accepts `accessible_docx`, `accessible_pptx` and
+executable `OutputTarget`. The server accepts `accessible_pdf`, `accessible_docx`, `accessible_pptx` and
 `canvas_html`, with its existing input/target checks. An unavailable choice must
 never be submitted using the legacy Canvas default. Destination changes are
 limited to local pending files; an attempted/saved file keeps its fixed target.
@@ -82,12 +82,15 @@ Local evaluation uses controlled and instructor files with independent OpenXML
 SDK, package-preservation and visual comparisons. Word Accessibility Checker
 and screen-reader verification remain part of the release review.
 
-### PDF: choose and evaluate a remediation engine
+### PDF: native repair integration
 
-The current PDF libraries render and inspect documents; they do not implement a
-complete native accessibility writer. A PDF repair engine must connect headings,
-paragraphs, tables, figures, forms, and reading order to the actual page content.
-Adding a detached structure tree or document metadata would not be sufficient.
+See [native PDF repair](pdf-accessibility.md) for the app pipeline, supported
+operations, bounds, storage and migration. The first general engine uses the
+private open-source worker to preserve existing tags, tag untagged files and
+apply bounded metadata, leaf text-role, missing-description and simple
+table-header changes. It preserves original pages, reopens the written output,
+and runs machine checks and an independent audit. Scans, font defects, complex
+forms and uncertain semantics remain visible when they need additional work.
 
 Evaluate native tag writing on the original PDF, including existing tags,
 reused content objects, multi-column layouts, links/forms, scans/OCR, fonts,
@@ -96,7 +99,26 @@ and existing alternatives. Include independent PDF/UA validation and semantic
 audit; machine checks alone cannot establish meaningful reading order or image
 descriptions.
 
-Candidate approaches, based on official documentation checked 2026-10-21:
+The user selected **open-source components only** on 2026-10-21. The local
+prototype now evaluates **OpenDataLoader PDF 2.5.14** as the native tag writer,
+with our own repair layer, independent veraPDF checks, preservation checks and
+model audit. The free Apache-2.0 core writes actual tagged PDFs; its enterprise
+PDF/UA export and editor are not used. See
+[`research/native-pdf/README.md`](../research/native-pdf/README.md) for measured
+results, reproducible tools and release gates. The repair layer now restores
+authored descriptions on the same raster and vector figures, preserves existing
+table structures, and checks the saved output independently. The explicit target
+is **PDF/UA-1 (ISO 14289-1:2014)**. A veraPDF pass is one gate; unresolved semantic
+findings, missing content associations and human checkpoints still prevent an
+overall conformance claim.
+
+When an original standard font is unavailable, the user permits a similar
+open-source font if independent layout checks pass. The experiment limits this
+to verified Liberation font programs, exact text/advance widths and preserved
+text positions. Changes outside the authorized glyphs remain failures. Every
+candidate edit invalidates earlier validation and audit evidence.
+
+Other approaches researched, but not selected:
 
 - [PDFix SDK](https://pdfix.net/products/pdfix-sdk/): licensed tooling that can
   run on our worker and write/repair structure. Evaluate the actual selected
@@ -108,11 +130,14 @@ Candidate approaches, based on official documentation checked 2026-10-21:
   supported subset, but substantial engineering for arbitrary PDFs. Do not
   equate extraction tools with a remediated-PDF writer.
 
-The preference is to evaluate a self-hosted engine first given the existing
-privacy requirements. No engine/license/account has been purchased, installed,
-or connected, and no document has been sent to a new provider by this work.
-[veraPDF](https://docs.verapdf.org/validation/) is a candidate independent
-validator for machine-verifiable PDF/UA requirements.
+OpenDataLoader and veraPDF run locally in the research setup. No paid license or
+new provider account has been purchased. Semantic experiments use the existing
+institutional LiteLLM configuration. The branch now integrates a bounded
+general repair path; the broader fixture-specific OCR, font, form and appendix
+experiments remain research tools. The production PDF repair destination has
+not been activated. The final manual interactive review was stopped at the
+user's request, so the app makes no claim that such testing has been completed
+for arbitrary uploaded documents.
 
 ### HTML
 
@@ -124,10 +149,11 @@ without changing existing saved Canvas outputs.
 
 ## Shared persistence and rollout
 
-Explicit dispatch and typed results now separate Canvas HTML, native Word and
-native PowerPoint, including artifacts, MIME types, downloads and purge paths.
-The future `accessible_pdf` destination must add these together; it cannot
-fall through to the HTML branch.
+Explicit dispatch and typed results separate Canvas HTML, native Word, native
+PowerPoint and native PDF, including artifacts, MIME types, downloads and purge
+paths. The PDF target requires migration `0016_native_pdf_outputs` and its
+configured private worker before hosted activation; it cannot fall through to
+the HTML branch.
 
 One source should eventually own several independent result jobs. The current
 database still enforces legacy `UNIQUE(document_id)` alongside

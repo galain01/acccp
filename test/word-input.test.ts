@@ -120,5 +120,17 @@ describe("PowerPoint uploads and output destinations", () => {
     expect(outputFilename("Lecture.PPTX", "accessible_pptx")).toBe(
       "Lecture-accessible.pptx"
     );
+    expect(isSupportedOutputForFilename("Lecture.PDF", "accessible_pdf")).toBe(
+      true
+    );
+    expect(isSupportedOutputForFilename("Lecture.docx", "accessible_pdf")).toBe(
+      false
+    );
+    expect(isSupportedOutputForFilename("Lecture.pptx", "accessible_pdf")).toBe(
+      false
+    );
+    expect(outputFilename("Lecture.PDF", "accessible_pdf")).toBe(
+      "Lecture-repaired.pdf"
+    );
   });
 });

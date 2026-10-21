@@ -110,8 +110,13 @@ export default function ConversionResultDialog({
   const documentId = document?.documentId;
   const isPowerPoint = document?.outputTarget === "accessible_pptx";
   const isNativeWord = document?.outputTarget === "accessible_docx";
-  const isNative = isPowerPoint || isNativeWord;
-  const nativeLabel = isNativeWord ? "Word document" : "PowerPoint";
+  const isNativePdf = document?.outputTarget === "accessible_pdf";
+  const isNative = isPowerPoint || isNativeWord || isNativePdf;
+  const nativeLabel = isNativeWord
+    ? "Word document"
+    : isNativePdf
+      ? "PDF"
+      : "PowerPoint";
   const needsHtml =
     open && document?.status === "success" && !isNative && !document.html;
   const isLoadingHtml = Boolean(needsHtml) && fetchedHtml === undefined;
@@ -177,7 +182,11 @@ export default function ConversionResultDialog({
       // instructor is reading the findings. Ownership and expiry are server-checked.
       const download = await getDocumentOutputDownload(
         documentId,
-        isNativeWord ? "accessible_docx" : "accessible_pptx"
+        isNativeWord
+          ? "accessible_docx"
+          : isNativePdf
+            ? "accessible_pdf"
+            : "accessible_pptx"
       );
       if (!download) {
         setDownloadError(
@@ -208,7 +217,7 @@ export default function ConversionResultDialog({
           <DialogTitle>{document.name}</DialogTitle>
           <DialogDescription>
             {isNative
-              ? `${isNativeWord ? "Word" : "PowerPoint"} accessibility improvements and items to review.`
+              ? `${nativeLabel} accessibility improvements and items to review.`
               : "Conversion result for this document."}
           </DialogDescription>
           {(errorCount > 0 || warningCount > 0) && (
@@ -245,6 +254,17 @@ export default function ConversionResultDialog({
               keeping the surrounding layout. Page references use the app’s
               preview; Word may paginate differently on your computer.
             </p>
+          ) : isNativePdf ? (
+            <p>
+              <span className="font-semibold text-primary">
+                Review your repaired PDF
+              </span>{" "}
+              before sharing it. The app checks the file and asks an independent
+              AI reviewer to compare it with your original. Review the changes
+              and remaining questions below, including reading order, image
+              descriptions, and any form fields. Automatic checks do not certify
+              PDF accessibility. Page numbers count from the first page.
+            </p>
           ) : (
             <p>
               <span className="font-semibold text-primary">
@@ -268,8 +288,12 @@ export default function ConversionResultDialog({
           <p role="status" className="text-sm text-destructive">
             This file still has accessibility problems that need a fix. Download
             it and address the items marked “Needs a fix” in{" "}
-            {isNativeWord ? "Word" : "PowerPoint"} before sharing it with
-            students.
+            {isNativeWord
+              ? "Word"
+              : isNativePdf
+                ? "a PDF editor"
+                : "PowerPoint"}{" "}
+            before sharing it with students.
           </p>
         )}
 
@@ -317,7 +341,9 @@ export default function ConversionResultDialog({
                     ? "Preparing download…"
                     : isNativeWord
                       ? "Download Word document"
-                      : "Download PowerPoint"}
+                      : isNativePdf
+                        ? "Download repaired PDF"
+                        : "Download PowerPoint"}
                 </Button>
               )}
               {isPowerPoint && documentId && document.jobId && (
@@ -334,7 +360,11 @@ export default function ConversionResultDialog({
                 </p>
               )}
             </div>
-            {reviewOpen && open && documentId && document.jobId ? (
+            {isPowerPoint &&
+            reviewOpen &&
+            open &&
+            documentId &&
+            document.jobId ? (
               <PowerPointChangeReview
                 key={`${documentId}:${document.jobId}`}
                 documentId={documentId}

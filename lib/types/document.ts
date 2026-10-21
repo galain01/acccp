@@ -30,7 +30,7 @@ export interface UploadedDocument {
   errorMessage?: string;
   /** Accessibility/parsing issues from the most recent conversion run. */
   errors?: AccessibilityError[];
-  /** Plain-language summary of changes actually applied to a PowerPoint file. */
+  /** Plain-language summary of changes actually applied to a native output. */
   changes?: string[];
   /**
    * The picked local file, kept in browser memory for upload retries. Documents

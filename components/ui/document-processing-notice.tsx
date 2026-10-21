@@ -44,6 +44,42 @@ export default function DocumentProcessingNotice({
             questions. For Word and PowerPoint, also run the built-in
             Accessibility Checker before sharing the document.
           </p>
+          <p>
+            PDF repair preserves the page layout and checks supported changes
+            with machine checks and an independent AI review. Scans, complex
+            forms, and some fonts may need additional work. Review the remaining
+            items before sharing; automatic checks do not certify accessibility.
+          </p>
+        </div>
+      </aside>
+    );
+  }
+
+  if (outputTarget === "accessible_pdf") {
+    return (
+      <aside
+        aria-labelledby={headingId}
+        className={cn("rounded-xl border bg-muted/50 p-4 text-sm", className)}
+      >
+        <h2 id={headingId} className="mb-2 flex items-center gap-2 font-medium">
+          <Info className="size-4 shrink-0" aria-hidden="true" />
+          Review the repaired PDF
+        </h2>
+        <div className="space-y-2 leading-relaxed">
+          {!compact && (
+            <p>
+              Upload a PDF up to 4 MB and 60 pages. The tool preserves its page
+              layout while making supported accessibility improvements, then
+              checks the result with machine checks and an independent AI
+              review. Large images and complex files may reach processing limits
+              sooner.
+            </p>
+          )}
+          <p>
+            Scans, complex forms, and some fonts may need additional work. Open
+            the repaired PDF and review its changes and remaining items before
+            sharing. Automatic checks do not certify PDF accessibility.
+          </p>
         </div>
       </aside>
     );

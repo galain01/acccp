@@ -11,6 +11,12 @@
           "service": "renderer",
           "format": "url",
           "env": "GOTENBERG_URL"
+        },
+        {
+          "type": "service",
+          "service": "native-pdf",
+          "format": "url",
+          "env": "NATIVE_PDF_URL"
         }
       ]
     },
@@ -18,6 +24,11 @@
       "root": "services/renderer",
       "runtime": "container",
       "entrypoint": "Dockerfile.vercel"
+    },
+    "native-pdf": {
+      "root": ".",
+      "runtime": "container",
+      "entrypoint": "Dockerfile.native-pdf.vercel"
     }
   },
   "rewrites": [{ "source": "/(.*)", "destination": { "service": "web" } }]

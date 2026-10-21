@@ -21,6 +21,7 @@ import {
   htmlOutputKey,
   pptxOutputKey,
   docxOutputKey,
+  pdfOutputKey,
   outputReviewKey,
   removeObjects,
   sourceDocxKey,
@@ -262,6 +263,7 @@ async function purgeNextDocument(
                     document.id,
                     artifact.jobId
                   ),
+                  pdfOutputKey(document.sessionId, document.id, artifact.jobId),
                   outputReviewKey(
                     document.sessionId,
                     document.id,

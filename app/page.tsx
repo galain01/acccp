@@ -110,9 +110,9 @@ export default function HomePage(): React.JSX.Element {
       <header className="flex w-full max-w-sm flex-col gap-1 text-center">
         <h1 className="text-2xl font-bold">Document Accessibility Workspace</h1>
         <p className="text-sm text-muted-foreground">
-          Improve your teaching materials and choose the format you need. Word
-          and PowerPoint repair, and Word/PDF to Canvas HTML, are available.
-          Original-format PDF repair is in development.
+          Improve your teaching materials and choose the format you need. Word,
+          PDF, and PowerPoint repair, and Word/PDF to Canvas HTML, are
+          available.
         </p>
       </header>
       {step === "email" ? (

@@ -285,7 +285,8 @@ export default function DocumentTable({
                         statusBadge(
                           doc.status,
                           doc.outputTarget === "accessible_pptx" ||
-                            doc.outputTarget === "accessible_docx",
+                            doc.outputTarget === "accessible_docx" ||
+                            doc.outputTarget === "accessible_pdf",
                           doc.errors?.some(
                             (issue) => issue.severity === "error"
                           ),

@@ -8,20 +8,23 @@ import {
 export type OutputTarget =
   | "canvas_html"
   | "accessible_pptx"
-  | "accessible_docx";
+  | "accessible_docx"
+  | "accessible_pdf";
 
 export const DEFAULT_OUTPUT_TARGET: OutputTarget = "canvas_html";
 export const OUTPUT_PROFILES = {
   canvas_html: { label: "Canvas HTML", version: "canvas-html-v1" },
   accessible_pptx: { label: "Accessible PowerPoint", version: "powerpoint-v1" },
   accessible_docx: { label: "Accessible Word", version: "word-v1" },
+  accessible_pdf: { label: "PDF accessibility repair", version: "pdf-v1" },
 } as const;
 
 export function isOutputTarget(value: unknown): value is OutputTarget {
   return (
     value === "canvas_html" ||
     value === "accessible_pptx" ||
-    value === "accessible_docx"
+    value === "accessible_docx" ||
+    value === "accessible_pdf"
   );
 }
 
@@ -37,7 +40,9 @@ export function isSupportedOutputForFilename(
     ? isPptxFilename(filename)
     : outputTarget === "accessible_docx"
       ? isDocxFilename(filename)
-      : isPdfFilename(filename) || isDocxFilename(filename);
+      : outputTarget === "accessible_pdf"
+        ? isPdfFilename(filename)
+        : isPdfFilename(filename) || isDocxFilename(filename);
 }
 
 export const supportsOutputTarget = isSupportedOutputForFilename;
@@ -53,7 +58,9 @@ export function outputFilename(
     ? `${stem}-accessible.pptx`
     : outputTarget === "accessible_docx"
       ? `${stem}-accessible.docx`
-      : `${stem}.html`;
+      : outputTarget === "accessible_pdf"
+        ? `${stem}-repaired.pdf`
+        : `${stem}.html`;
 }
 
 /** Change summaries contain document content and follow the same retention. */

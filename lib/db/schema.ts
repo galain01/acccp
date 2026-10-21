@@ -36,6 +36,7 @@ export const artifactType = pgEnum("artifact_type", [
   "source_pptx",
   "pptx_output",
   "docx_output",
+  "pdf_output",
 ]);
 export const findingSeverity = pgEnum("finding_severity", [
   "info",
@@ -490,7 +491,9 @@ export const conversionJobs = pgTable(
     id: uuid().defaultRandom().primaryKey().notNull(),
     documentId: uuid("document_id").notNull(),
     outputTarget: text("output_target")
-      .$type<"canvas_html" | "accessible_pptx" | "accessible_docx">()
+      .$type<
+        "canvas_html" | "accessible_pptx" | "accessible_docx" | "accessible_pdf"
+      >()
       .default("canvas_html")
       .notNull(),
     profileVersion: text("profile_version").default("canvas-html-v1").notNull(),
@@ -576,7 +579,7 @@ export const conversionJobs = pgTable(
     ),
     check(
       "conversion_jobs_output_target_chk",
-      sql`output_target in ('canvas_html', 'accessible_pptx', 'accessible_docx')`
+      sql`output_target in ('canvas_html', 'accessible_pptx', 'accessible_docx', 'accessible_pdf')`
     ),
     check(
       "conversion_jobs_attempt_count_nonnegative_chk",
