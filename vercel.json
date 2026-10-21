@@ -28,7 +28,7 @@
     "native-pdf": {
       "root": ".",
       "runtime": "container",
-      "entrypoint": "services/native-pdf/Dockerfile.vercel"
+      "entrypoint": "Dockerfile.native-pdf.vercel"
     }
   },
   "rewrites": [{ "source": "/(.*)", "destination": { "service": "web" } }]

@@ -1,10 +1,10 @@
 # Only files explicitly copied by native-PDF's Dockerfile enter its context.
 **
+!Dockerfile.native-pdf.vercel
 !services/
 !services/native-pdf/
 !services/native-pdf/*.py
 !services/native-pdf/requirements.txt
-!services/native-pdf/Dockerfile.vercel
 !services/native-pdf/start-worker.sh
 !services/native-pdf/install-tools.py
 !research/

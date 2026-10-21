@@ -11,11 +11,16 @@ RUN python /opt/install-native-pdf-tools.py && rm /opt/install-native-pdf-tools.
 # Explicit source allowlist. No env files, model responses, uploaded documents,
 # research fixtures, work directories or application credentials are copied.
 COPY research/native-pdf/verify_pdf.py research/native-pdf/pdf_safety.py /app/research/native-pdf/
-COPY services/native-pdf/server.py services/native-pdf/worker.py /app/services/native-pdf/
+COPY services/native-pdf/server.py services/native-pdf/worker.py services/native-pdf/build-smoke.py /app/services/native-pdf/
 COPY --chmod=0555 services/native-pdf/start-worker.sh /usr/local/bin/start-native-pdf.sh
 RUN useradd --create-home --uid 10001 pdfworker \
     && chmod -R a-w /app /opt/native-pdf
 USER pdfworker
+# Exercise installed Java/PDFium binaries and production child-process limits
+# before an image can be published. The test uses one ephemeral synthetic PDF.
+RUN /usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/home/pdfworker \
+    LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC PYTHONDONTWRITEBYTECODE=1 \
+    /usr/local/bin/python /app/services/native-pdf/build-smoke.py --require-linux
 ENV PORT=80
 EXPOSE 80
 ENTRYPOINT ["/bin/sh", "/usr/local/bin/start-native-pdf.sh"]

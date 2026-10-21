@@ -37,7 +37,8 @@ output-file and core-dump limits. Neither mode claims to be an OS sandbox.
 
 ## Container
 
-The Docker build context is the repository root. A deny-by-default root
+The Dockerfile lives at the repository root because Vercel uses its containing
+directory as the build context. A deny-by-default root
 `.dockerignore` and explicit `COPY` paths exclude application secrets, source
 documents, local binaries and test outputs. Build-time tool downloads have
 pinned versions and SHA256 checks. Runtime document processing downloads
@@ -45,8 +46,15 @@ nothing. The image runs as an unprivileged user, and the startup script clears
 shared project variables before starting the HTTP supervisor.
 
 ```text
-docker build -f services/native-pdf/Dockerfile.vercel -t acccp-native-pdf .
+docker build -f Dockerfile.native-pdf.vercel -t acccp-native-pdf .
 ```
+
+Every image build runs `build-smoke.py` as the unprivileged application user.
+It creates an untagged synthetic page, rejects unauthenticated requests, then
+uses the real HTTP supervisor to tag and repair the page with the installed
+tools and production child-process limits. The build fails if veraPDF cannot
+finish, the native edit is missing, or the original text, content or page pixels
+change. Its temporary document and randomly generated test key are discarded.
 
 The Vercel service has no public rewrite. The web binding supplies its private
 URL, and the shared worker key provides application authentication. There is
