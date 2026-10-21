@@ -34,13 +34,13 @@ Only enable a destination after its repair and validation pipeline works.
 ## Implementation status
 
 The shared workflow and native Word repair were released on 2026-10-21.
-This branch adds native PDF repair; hosted activation has not occurred.
+Native PDF repair also uses this workflow, with a separate private worker.
 
 | Input | Keep original format | HTML |
 | --- | --- | --- |
 | `.pptx` | Existing native repair engine | Not implemented |
 | `.docx` | Native repair engine | Existing Canvas HTML engine |
-| `.pdf` | Native repair engine on this branch; not deployed | Existing Canvas HTML engine |
+| `.pdf` | Native repair engine with layout preservation | Existing Canvas HTML engine |
 
 In the UI, requested `original`/`html` intent is distinct from
 executable `OutputTarget`. The server accepts `accessible_pdf`, `accessible_docx`, `accessible_pptx` and

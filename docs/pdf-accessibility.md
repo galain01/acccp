@@ -5,9 +5,10 @@ PDF as a PDF or choose the existing Canvas HTML output. The repair edits the
 PDF's native accessibility information while preserving the original page
 layout. It does not print HTML into a replacement PDF.
 
-The app integration is local work as of 2026-10-21. Its database migration and
-private service must be installed before a hosted release; this document does
-not record a production deployment.
+Hosted use requires the private service and migration `0016_native_pdf_outputs`.
+That migration was applied and verified on the ACCCP production database on
+2026-10-21, preserving existing documents and aggregate usage totals. Other
+databases require their own reviewed migration before activation.
 
 ## Processing and review
 
@@ -126,6 +127,8 @@ comparison confirmed identical pixels on both original pages. Remaining link
 and standards findings are visible in the result.
 
 These results establish the implemented app path, not universal PDF coverage or
-PDF/UA conformance. Sixty-page orchestration was tested with mocks. The Docker
-image still needs a build and hosted verification because the local Docker
-daemon was unavailable. No further Acrobat/NVDA testing was run.
+PDF/UA conformance. Sixty-page orchestration was tested with mocks. The root
+`Dockerfile.native-pdf.vercel` runs an additional nonroot Linux HTTP test during
+every image build, exercising the installed tagger, validator and actual worker
+limits. Hosted upload/download verification remains a release gate. No further
+Acrobat/NVDA testing was run.
