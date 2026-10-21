@@ -42,6 +42,38 @@ class CandidateAssessmentTests(unittest.TestCase):
         self.audit["sourceSha256"] = "another source"
         self.assertFalse(self.assess()["automatedChecksPassed"])
 
+    def test_scanned_text_requires_independent_exact_page_review(self):
+        self.checks['ocr_validation']={'passed':True,'requiredAuditPages':[1]}
+        self.assertFalse(self.assess()['automatedChecksPassed'])
+        self.audit['ocrReviews']=[{'pageNumber':1,'decision':'matches-visible-page','textOnly':True,'explanation':'Every saved line agrees with the original visible page, including the date and quantity.'}]
+        self.assertTrue(self.assess()['automatedChecksPassed'])
+        for key,value in [('decision','uncertain'),('decision','incorrect-or-incomplete'),('textOnly',False),('pageNumber',2),('explanation','')]:
+            before=deepcopy(self.audit['ocrReviews'])
+            self.audit['ocrReviews'][0][key]=value
+            self.assertFalse(self.assess()['automatedChecksPassed'])
+            self.audit['ocrReviews']=before
+        self.checks['ocr_validation']['requiredAuditPages']=[]
+        self.assertFalse(self.assess()['automatedChecksPassed'])
+
+    def test_scan_review_cannot_override_failed_native_text_validation(self):
+        self.checks['ocr_validation']={'passed':False,'requiredAuditPages':[1]}
+        self.audit['ocrReviews']=[{'pageNumber':1,'decision':'matches-visible-page','textOnly':True,'explanation':'Agrees.'}]
+        self.assertFalse(self.assess()['automatedChecksPassed'])
+
+    def test_clean_audit_cannot_override_incomplete_form_evidence(self):
+        for kind in ('form_label_validation','form_order_validation'):
+            for evidence in ({'passed':False,'checksComplete':True},
+                             {'passed':True,'checksComplete':False},
+                             {'passed':True,'checksComplete':True,'reviewItems':[{'code':'ambiguous_control'}]},
+                             {'passed':True,'checksComplete':True,'findings':[{'severity':'error'}]}):
+                with self.subTest(kind=kind,evidence=evidence):
+                    self.checks[kind]=evidence
+                    self.assertIn(kind+'_not_passed',self.assess()['blockers'])
+                    del self.checks[kind]
+            self.checks[kind]={'passed':True,'checksComplete':True,'reviewItems':[],'findings':[]}
+            self.assertTrue(self.assess()['automatedChecksPassed'])
+            del self.checks[kind]
+
     def test_missing_or_partial_audit_blocks(self):
         for key, value in [("reviewedPages", []), ("reviewedTagIds", []), ("reviewedTagIds", ["tag-1", "tag-1"]), ("status", "incomplete"), ("findings", None), ("machineFindingsRetained", False), ("reviewedPages", [True])]:
             with self.subTest(key=key, value=value):

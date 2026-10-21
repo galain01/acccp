@@ -1,5 +1,9 @@
 # Broader native PDF tests
 
+This report records the initial matrix. The subsequent [scan and form repair
+results](SCAN_FORM_RESULTS.md) address its missing/incorrect OCR and generic form
+descriptions, with fresh saved-file validation and model audits.
+
 The local matrix on 2026-10-21 evaluated nine PDFs totaling 15 pages. It tested
 the current OpenDataLoader tagging path, independent preservation checks and
 veraPDF UA1 validation. It did not run model audits, keyboard or screen-reader

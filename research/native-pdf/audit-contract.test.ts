@@ -17,6 +17,80 @@ const complete = () => ({
   findings: [],
 });
 describe("native PDF experimental audit evidence", () => {
+  it("requires explicit saved OCR text and original-image agreement on every repaired page", () => {
+    const base = complete();
+    expect(() => validateAudit(base, tags, 2, [], tags, [1])).toThrow();
+    const reviewed = {
+      ...base,
+      ocrReviews: [
+        {
+          pageNumber: 1,
+          decision: "matches-visible-page",
+          textOnly: true,
+          explanation:
+            "Every line agrees with the original image, including dates and quantities.",
+        },
+      ],
+    };
+    expect(
+      validateAudit(reviewed, tags, 2, [], tags, [1]).ocrReviews
+    ).toHaveLength(1);
+    expect(() => validateAudit(reviewed, tags, 2)).toThrow();
+    expect(() =>
+      validateAudit(
+        {
+          ...reviewed,
+          ocrReviews: [...reviewed.ocrReviews, ...reviewed.ocrReviews],
+        },
+        tags,
+        2,
+        [],
+        tags,
+        [1]
+      )
+    ).toThrow();
+    const uncertain = {
+      ...reviewed,
+      ocrReviews: [{ ...reviewed.ocrReviews[0], decision: "uncertain" }],
+    };
+    expect(() => validateAudit(uncertain, tags, 2, [], tags, [1])).toThrow();
+    expect(
+      validateAudit(
+        {
+          ...uncertain,
+          findings: [
+            {
+              code: "ocr-accuracy",
+              severity: "warning",
+              pageNumber: 1,
+              tagIds: ["tag-2"],
+              location: "First heading",
+              message: "A word is unclear in the scan.",
+              suggestion: "Compare this word with a clearer original.",
+            },
+          ],
+        },
+        tags,
+        2,
+        [],
+        tags,
+        [1]
+      ).findings
+    ).toHaveLength(1);
+    expect(() =>
+      validateAudit(
+        {
+          ...reviewed,
+          ocrReviews: [{ ...reviewed.ocrReviews[0], textOnly: false }],
+        },
+        tags,
+        2,
+        [],
+        tags,
+        [1]
+      )
+    ).toThrow();
+  });
   it("keeps authored alternatives and content identities exact when compacting extraction whitespace", () => {
     const evidence = {
       tags: [

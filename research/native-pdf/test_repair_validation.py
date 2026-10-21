@@ -37,6 +37,21 @@ class RepairLedgerCompositionTests(unittest.TestCase):
         self.bundle.write_text(json.dumps({'schemaVersion':1,'navigationManifest':'nav.json','ignoreFailures':True}))
         with self.assertRaisesRegex(ValueError,'explicit_repair_bundle_required'):compare_with_authorized_repairs(self.source,self.final,self.bundle)
 
+    def test_scan_and_form_exceptions_require_their_own_verifier_and_bundle(self):
+        for key,target in [('ocrManifest','scan_ocr_validation.compare_with_authorized_ocr'),
+                           ('formLabelManifest','form_label_validation.compare_with_authorized_form_labels'),
+                           ('formOrderManifest','form_order_validation.compare_with_authorized_form_order')]:
+            with self.subTest(key=key):
+                self.bundle.write_text(json.dumps({'schemaVersion':1,key:'nav.json'}))
+                with patch(target,return_value={'passed':False,'findings':[{'code':'exact_check_failed'}]}) as verify:
+                    result=compare_with_authorized_repairs(self.source,self.final,self.bundle)
+                    self.assertFalse(result['passed'])
+                    self.assertEqual(verify.call_args.args,(self.source,self.final,self.nav))
+                    self.assertEqual(result['repair_evidence']['validatedLedgers'],[key])
+                self.bundle.write_text(json.dumps({'schemaVersion':1,key:'nav.json','appendixManifest':'appendix.json'}))
+                with self.assertRaisesRegex(ValueError,'separate_explicit_bundle'):
+                    compare_with_authorized_repairs(self.source,self.final,self.bundle)
+
     def evidence_ledger(self,data=b'{"rows": [["All", 44.5]]}'):
         evidence=self.root/'evidence.json';evidence.write_bytes(data)
         return {'approvedManifest':{'evidence':[{'id':'supplement','sha256':hashlib.sha256(data).hexdigest()}]},

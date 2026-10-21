@@ -9,13 +9,15 @@ export interface AuditBatch {
   number: number;
   tags: SavedTag[];
   artifactPages: number[];
+  ocrPages: number[];
   evidence: string;
 }
 
 /** Every native tag gets detailed review; a full outline keeps cross-batch context. */
 export function planAuditBatches(
   inspection: unknown,
-  artifactPages: number[]
+  artifactPages: number[],
+  ocrPages: number[] = []
 ): AuditBatch[] {
   const compact = JSON.parse(compactAuditEvidence(inspection));
   const tags: SavedTag[] = compact.structure?.tags;
@@ -43,7 +45,13 @@ export function planAuditBatches(
   if (group.length) groups.push(group);
   if (groups.length === 1)
     return [
-      { number: 1, tags, artifactPages, evidence: JSON.stringify(compact) },
+      {
+        number: 1,
+        tags,
+        artifactPages,
+        ocrPages,
+        evidence: JSON.stringify(compact),
+      },
     ];
   // The outline is context, not a substitute for any tag's detailed review.
   const outline = (items: SavedTag[]) =>
@@ -81,6 +89,7 @@ export function planAuditBatches(
       number: index + 1,
       tags: assigned,
       artifactPages: index === 0 ? artifactPages : [],
+      ocrPages: index === 0 ? ocrPages : [],
       evidence,
     };
   });
@@ -92,7 +101,8 @@ export function combineAuditBatches(
   results: NativePdfAudit[],
   tags: SavedTag[],
   pageCount: number,
-  artifactPages: number[]
+  artifactPages: number[],
+  ocrPages: number[] = []
 ): NativePdfAudit {
   if (!batches.length || results.length !== batches.length)
     throw new Error("audit_batch_missing");
@@ -102,7 +112,8 @@ export function combineAuditBatches(
       batches[index].tags,
       pageCount,
       batches[index].artifactPages,
-      tags
+      tags,
+      batches[index].ocrPages
     )
   );
   const findings = [
@@ -117,10 +128,13 @@ export function combineAuditBatches(
       reviewedPages: Array.from({ length: pageCount }, (_, index) => index + 1),
       reviewedTagIds: results.flatMap((result) => result.reviewedTagIds),
       artifactReviews: results.flatMap((result) => result.artifactReviews),
+      ocrReviews: results.flatMap((result) => result.ocrReviews ?? []),
       findings,
     },
     tags,
     pageCount,
-    artifactPages
+    artifactPages,
+    tags,
+    ocrPages
   );
 }

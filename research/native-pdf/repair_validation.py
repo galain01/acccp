@@ -41,18 +41,30 @@ def _appendix_source_evidence(ledger):
 def compare_with_authorized_repairs(original:Path, final:Path, bundle_path:Path):
     digests=[hashlib.sha256(p.read_bytes()).hexdigest() for p in (original,final)]
     bundle=_json(bundle_path)
-    if (not isinstance(bundle,dict) or set(bundle)-{'schemaVersion','navigationManifest','appendixManifest'}
-            or bundle.get('schemaVersion')!=1 or not any(bundle.get(k) for k in ('navigationManifest','appendixManifest'))):
+    keys=('navigationManifest','appendixManifest','ocrManifest','formLabelManifest','formOrderManifest')
+    if (not isinstance(bundle,dict) or set(bundle)-{'schemaVersion',*keys}
+            or bundle.get('schemaVersion')!=1 or not any(bundle.get(k) for k in keys)):
         raise ValueError('explicit_repair_bundle_required')
+    if any(k in bundle for k in ('ocrManifest','formLabelManifest','formOrderManifest')) and sum(k in bundle for k in keys)!=1:
+        raise ValueError('ocr_and_form_repairs_require_separate_explicit_bundle')
     ledgers={}
     ledger_hashes={bundle_path:hashlib.sha256(bundle_path.read_bytes()).hexdigest()}
-    for key in ('navigationManifest','appendixManifest'):
+    for key in keys:
         if key in bundle:
             if not isinstance(bundle[key],str) or not bundle[key]:raise ValueError('repair_ledger_path_required')
             path=(bundle_path.parent/bundle[key]).resolve()
             ledgers[key]=_json(path);ledger_hashes[path]=hashlib.sha256(path.read_bytes()).hexdigest()
     appendix=ledgers.get('appendixManifest');navigation=ledgers.get('navigationManifest')
-    if appendix is not None:
+    if 'ocrManifest' in ledgers:
+        from scan_ocr_validation import compare_with_authorized_ocr
+        report=compare_with_authorized_ocr(original,final,ledgers['ocrManifest'])
+    elif 'formLabelManifest' in ledgers:
+        from form_label_validation import compare_with_authorized_form_labels
+        report=compare_with_authorized_form_labels(original,final,ledgers['formLabelManifest'])
+    elif 'formOrderManifest' in ledgers:
+        from form_order_validation import compare_with_authorized_form_order
+        report=compare_with_authorized_form_order(original,final,ledgers['formOrderManifest'])
+    elif appendix is not None:
         if navigation is not None:
             # Bind the prior navigation output to the appendix's immutable input.
             # The appendix verifier then checks that exact baseline and every

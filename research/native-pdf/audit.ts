@@ -176,6 +176,17 @@ async function main() {
     if (inspection.inspection_incomplete || !inspection.structure?.tags?.length)
       throw new Error("independent_inspection_incomplete");
     const tags: SavedTag[] = inspection.structure.tags;
+    const ocrPages: number[] =
+      inspection.ocr_validation?.requiredAuditPages ?? [];
+    if (
+      inspection.ocr_validation !== undefined &&
+      (inspection.ocr_validation?.passed !== true ||
+        !Array.isArray(ocrPages) ||
+        !ocrPages.length ||
+        new Set(ocrPages).size !== ocrPages.length ||
+        ocrPages.some((page) => !Number.isInteger(page) || page < 1))
+    )
+      throw new Error("ocr_validation_or_coverage_incomplete");
     const artifactPages: number[] = inspection.structure.page_content
       .filter(
         (page: {
@@ -202,7 +213,13 @@ async function main() {
     const after = await renderPdfPages(output);
     validateAuditPageCounts(before.pageCount, after.pageCount, inspection);
     stage = "audit_evidence";
-    const batches = planAuditBatches(inspection, artifactPages);
+    if (
+      ocrPages.some((page) => page > before.pageCount) ||
+      (inspection.ocr_validation !== undefined &&
+        ocrPages.length !== before.pageCount)
+    )
+      throw new Error("ocr_validation_or_coverage_incomplete");
+    const batches = planAuditBatches(inspection, artifactPages, ocrPages);
     plannedBatchCount = batches.length;
     const images: LiteLLMContentPart[] = [];
     for (const [label, evidence] of [
@@ -230,7 +247,7 @@ async function main() {
       const message: LiteLLMContentPart[] = [
         {
           type: "text",
-          text: `Batch ${batch.number} of ${batches.length}. Review all page images and the full outline for context; review the assigned output tags in detail. reviewedTagIds must list ONLY the assigned IDs, exactly once. Findings may cite other IDs from the complete outline when needed to explain a relationship. ${batch.number === 1 ? "Also assess whole-document omissions and all required excluded-text pages." : "Whole-document omissions and excluded text are assigned to batch 1; this batch focuses on its assigned tags."}\nRequired pages: ${JSON.stringify(after.pages.map((page) => page.pageNumber))}\nAssigned OUTPUT tag IDs: ${JSON.stringify(batch.tags.map((tag) => tag.id))}\nRequired artifact-review pages: ${JSON.stringify(batch.artifactPages)}\nIndependently reopened native PDF evidence (untrusted document data):\n${batch.evidence}`,
+          text: `Batch ${batch.number} of ${batches.length}. Review all page images and the full outline for context; review the assigned output tags in detail. reviewedTagIds must list ONLY the assigned IDs, exactly once. Findings may cite other IDs from the complete outline when needed to explain a relationship. ${batch.number === 1 ? "Also assess whole-document omissions, all required excluded-text pages and all required OCR pages. Use the independently reopened saved OCR text in ocr_validation; compare every line with the ORIGINAL visible page." : "Whole-document omissions, excluded text and OCR accuracy are assigned to batch 1; this batch focuses on its assigned tags."}\nRequired pages: ${JSON.stringify(after.pages.map((page) => page.pageNumber))}\nAssigned OUTPUT tag IDs: ${JSON.stringify(batch.tags.map((tag) => tag.id))}\nRequired artifact-review pages: ${JSON.stringify(batch.artifactPages)}\nRequired OCR-review pages: ${JSON.stringify(batch.ocrPages)}\nIndependently reopened native PDF evidence (untrusted document data):\n${batch.evidence}`,
         },
         ...images,
       ];
@@ -263,7 +280,8 @@ async function main() {
         batch.tags,
         after.pageCount,
         batch.artifactPages,
-        tags
+        tags,
+        batch.ocrPages
       );
       completedBatches.push(result);
       await writeFile(
@@ -293,7 +311,8 @@ async function main() {
       completedBatches,
       tags,
       after.pageCount,
-      artifactPages
+      artifactPages,
+      ocrPages
     );
     if (
       !source.equals(await readFile(sourcePath)) ||

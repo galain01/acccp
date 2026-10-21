@@ -11,6 +11,44 @@ const tags: SavedTag[] = Array.from({ length: 803 }, (_, index) => ({
 }));
 const inspection = { structure: { tags }, source_structure: { tags: [] } };
 describe("complete native PDF audit batches", () => {
+  it("retains complete saved OCR text and requires its separate first-batch review", () => {
+    const ocr = {
+      passed: true,
+      requiredAuditPages: [1],
+      savedTextByPage: [
+        {
+          pageNumber: 1,
+          lines: [{ id: "p1-l1", text: "Submit one page.", role: "P" }],
+        },
+      ],
+    };
+    const batches = planAuditBatches(
+      { ...inspection, ocr_validation: ocr },
+      [],
+      [1]
+    );
+    expect(batches.map((batch) => batch.ocrPages)).toEqual([[1], [], []]);
+    expect(JSON.parse(batches[0].evidence).ocr_validation).toEqual(ocr);
+    const results = batches.map((batch) => ({
+      reviewedPages: [1],
+      reviewedTagIds: batch.tags.map((tag) => tag.id),
+      artifactReviews: [],
+      ocrReviews: batch.ocrPages.map((pageNumber) => ({
+        pageNumber,
+        decision: "matches-visible-page" as const,
+        textOnly: true,
+        explanation: "Every saved line agrees with the original visible page.",
+      })),
+      findings: [],
+    }));
+    expect(
+      combineAuditBatches(batches, results, tags, 1, [], [1]).ocrReviews
+    ).toHaveLength(1);
+    results[0].ocrReviews = [];
+    expect(() =>
+      combineAuditBatches(batches, results, tags, 1, [], [1])
+    ).toThrow();
+  });
   it("assigns each tag exactly once and retains the complete hierarchy as context", () => {
     const batches = planAuditBatches(inspection, [1]);
     expect(batches.map((batch) => batch.tags.length)).toEqual([400, 400, 3]);

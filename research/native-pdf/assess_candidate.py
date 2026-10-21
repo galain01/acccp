@@ -70,6 +70,13 @@ def assess_evidence(checks: dict, validation: dict, audit: dict | None, source_h
     unresolved_machine_findings = [finding for finding in machine_findings if not (finding.get("code") == "artifact_text_needs_semantic_review" and finding.get("severity") == "warning")]
     if checks.get("mechanical_checks_passed") is not True or unresolved_machine_findings:
         blockers.append("independent_machine_checks_not_passed")
+    for key in ('form_label_validation', 'form_order_validation'):
+        if key in checks:
+            form_check = checks[key]
+            if (not isinstance(form_check, dict) or form_check.get('passed') is not True
+                    or form_check.get('checksComplete') is not True or form_check.get('reviewItems')
+                    or form_check.get('findings')):
+                blockers.append(key + '_not_passed')
     if validation.get("complete") is not True:
         blockers.append("pdfua1_validation_incomplete")
     elif validation.get("passed") is not True:
@@ -98,6 +105,20 @@ def assess_evidence(checks: dict, validation: dict, audit: dict | None, source_h
     artifact_coverage = isinstance(artifact_reviews, list) and all(isinstance(review, dict) for review in artifact_reviews) and exact([review.get("pageNumber") for review in artifact_reviews], [page.get("pageNumber") for page in artifact_pages], allow_empty=True)
     if not artifact_evidence_covers_warnings or not artifact_coverage or any(page.get("artifactTextComplete") is not True for page in artifact_pages) or any(review.get("decision") != "decorative-or-redundant" or not isinstance(review.get("explanation"), str) or not review["explanation"].strip() for review in artifact_reviews):
         blockers.append("excluded_text_not_verified_as_decorative_or_redundant")
+    if 'ocr_validation' in checks:
+        ocr = checks.get('ocr_validation')
+        required = ocr.get('requiredAuditPages') if isinstance(ocr, dict) else None
+        reviews = audit.get('ocrReviews') if audit_complete else None
+        coverage = (isinstance(required, list) and bool(required)
+                    and all(type(p) is int and p in expected_pages for p in required)
+                    and len(set(required)) == len(required)
+                    and exact(required, expected_pages)
+                    and isinstance(reviews, list) and all(isinstance(r, dict) for r in reviews)
+                    and exact([r.get('pageNumber') for r in reviews], required))
+        if (not isinstance(ocr, dict) or ocr.get('passed') is not True or not coverage
+                or any(r.get('decision') != 'matches-visible-page' or r.get('textOnly') is not True
+                       or not isinstance(r.get('explanation'), str) or not r['explanation'].strip() for r in (reviews or []))):
+            blockers.append('ocr_text_and_image_meaning_not_independently_verified')
     return {
         "standard": STANDARD,
         "status": "blocked" if blockers else "automated_checks_passed_manual_review_required",
