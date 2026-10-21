@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { PDFDocument } from "pdf-lib";
+import { PDFDocument, PDFName } from "pdf-lib";
 import type { NativePdfState, NativePdfTag } from "../lib/native-pdf-worker";
 import type { LiteLLMContentPart } from "../lib/litellm";
 
@@ -462,6 +462,188 @@ describe("native PDF orchestration", () => {
       ).toBe(1);
     }
   });
+
+  it("audits current machine evidence without carrying resolved diagnostics into historical comparison", async () => {
+    const prepared = await makeState();
+    prepared.inventory.title = "";
+    prepared.inventory.forms = { fields: [{ name: "Course name" }] };
+    prepared.inventory.form_content = [{ artifactText: "Repeated heading" }];
+    prepared.findings = [
+      {
+        code: "metadata-missing",
+        severity: "error",
+        message: "The original PDF has no metadata container.",
+      },
+      {
+        code: "display-title-missing",
+        severity: "error",
+        message: "The original PDF does not display its title.",
+      },
+    ];
+    prepared.machineChecks.veraPdf.failedChecks = 3;
+    prepared.machineChecks.veraPdf.failedRules = 3;
+    const saved = await PDFDocument.load(prepared.pdf);
+    saved.setTitle("Synthetic PDF transport test");
+    saved.catalog.set(
+      PDFName.of("ViewerPreferences"),
+      saved.context.obj({ DisplayDocTitle: true })
+    );
+    saved.catalog.set(
+      PDFName.of("Metadata"),
+      saved.context.register(
+        saved.context.stream(
+          '<x:xmpmeta xmlns:x="adobe:ns:meta/">Saved title metadata</x:xmpmeta>',
+          { Type: "Metadata", Subtype: "XML" }
+        )
+      )
+    );
+    const savedBytes = Buffer.from(await saved.save());
+    const repaired: NativePdfState = {
+      ...prepared,
+      pdf: savedBytes,
+      candidateSha256: pdfSha256(savedBytes),
+      inventory: {
+        ...prepared.inventory,
+        title: "Synthetic PDF transport test",
+      },
+      findings: [
+        {
+          code: "ua-declaration-missing",
+          severity: "warning",
+          message: "A PDF/UA declaration has not been added.",
+        },
+      ],
+      machineChecks: {
+        ...prepared.machineChecks,
+        veraPdf: {
+          ...prepared.machineChecks.veraPdf,
+          failedRules: 1,
+          failedChecks: 1,
+        },
+      },
+      changes: [
+        { code: "title", message: "Added document title and viewer setting." },
+      ],
+    };
+    useState(prepared);
+    mocks.worker.mockResolvedValueOnce(prepared).mockResolvedValueOnce(repaired);
+    const result = await repairNativePdf(prepared.pdf, "lecture.pdf");
+    if ("error" in result) throw Error(result.error);
+
+    const repairParts = mocks.call.mock.calls[0][1] as LiteLLMContentPart[];
+    expect(scope(repairParts)).toMatchObject({ findings: prepared.findings });
+    const repairPrompt = mocks.call.mock.calls[0][0] as string;
+    expect(repairPrompt).toContain(
+      "with an existing or proposed title it sets the window to display that title and adds a missing XMP metadata container containing the title."
+    );
+    expect(repairPrompt).toContain(
+      "It preserves an existing metadata container."
+    );
+    expect(repairPrompt).toContain(
+      "The app independently reruns those checks on the saved output and displays all remaining failures."
+    );
+    expect(repairPrompt).toContain(
+      "Do not copy machine findings into your findings array"
+    );
+    expect(repairPrompt).toContain(
+      "Report additional semantic, ambiguous or unsupported concerns only."
+    );
+    expect(repairPrompt).toContain(
+      "Never add a PDF/UA declaration."
+    );
+    const auditParts = mocks.call.mock.calls[1][1] as LiteLLMContentPart[];
+    const evidence = auditParts.find((p) => p.type === "text");
+    if (!evidence || evidence.type !== "text") throw Error("Missing evidence");
+    const lines = evidence.text.split("\n");
+    const current = JSON.parse(lines[1]);
+    const historical = JSON.parse(lines[3]);
+    expect(current).toMatchObject({
+      evidenceRole: "current-saved-pdf",
+      candidateSha256: repaired.candidateSha256,
+      title: "Synthetic PDF transport test",
+      machineChecks: repaired.machineChecks,
+      findings: repaired.findings,
+    });
+    expect(historical).toMatchObject({
+      evidenceRole: "before-repair-comparison",
+      title: "",
+      tags: prepared.inventory.tags,
+      forms: prepared.inventory.forms,
+      nestedFormContent: prepared.inventory.form_content,
+      excludedTextAndPageChecks: prepared.inventory.page_content,
+    });
+    expect(historical.hierarchy).toHaveLength(prepared.inventory.tags.length);
+    for (const property of [
+      "machineChecks",
+      "findings",
+      "outstandingRepairFindings",
+    ])
+      expect(historical).not.toHaveProperty(property);
+    expect(evidence.text).not.toContain(prepared.findings[0].message);
+    expect(evidence.text).not.toContain(prepared.findings[1].message);
+    const auditPrompt = mocks.call.mock.calls[1][0] as string;
+    expect(auditPrompt).toContain(
+      "Only current-saved-pdf evidence establishes the delivered file's remaining machine defects."
+    );
+    expect(auditPrompt).toContain(
+      "before-repair-comparison inventory is historical evidence"
+    );
+    expect(auditPrompt).toContain(
+      "Never infer that the delivered PDF lacks those properties from an excerpt."
+    );
+    expect(auditPrompt).toContain(
+      "a missing declaration alone does not imply those other properties are absent."
+    );
+    expect(auditPrompt).toContain(
+      "Preserve actual current machine failures and unsupported-evidence findings"
+    );
+
+    // Copied pages really omit these catalog settings. Their absence must not
+    // be interpreted as evidence about the intact PDF returned to the user.
+    const file = auditParts.find(
+      (p) => p.type === "file" && p.file.filename === "repaired-excerpt.pdf"
+    );
+    if (!file || file.type !== "file") throw Error("Missing output excerpt");
+    const excerpt = await PDFDocument.load(
+      Buffer.from(file.file.file_data!.split(",")[1], "base64")
+    );
+    expect(excerpt.catalog.has(PDFName.of("ViewerPreferences"))).toBe(false);
+    expect(excerpt.catalog.has(PDFName.of("Metadata"))).toBe(false);
+    expect(saved.catalog.has(PDFName.of("ViewerPreferences"))).toBe(true);
+    expect(saved.catalog.has(PDFName.of("Metadata"))).toBe(true);
+    expect(result.pdf).toEqual(savedBytes);
+    expect(result.errors.map((f) => f.message)).toEqual([
+      repaired.findings[0].message,
+    ]);
+  });
+
+  it.each(["metadata-missing", "display-title-missing"])(
+    "retains an actual saved %s failure even when the semantic audit finds no additional problem",
+    async (code) => {
+      const state = await makeState();
+      state.findings = [
+        { code, severity: "error", message: `Current saved defect: ${code}` },
+      ];
+      state.machineChecks.veraPdf.failedRules = 1;
+      state.machineChecks.veraPdf.failedChecks = 1;
+      useState(state);
+      const result = await repairNativePdf(state.pdf, "lecture.pdf");
+      if ("error" in result) throw Error(result.error);
+      const auditParts = mocks.call.mock.calls[1][1] as LiteLLMContentPart[];
+      expect(scope(auditParts)).toMatchObject({ findings: state.findings });
+      expect(result.errors).toEqual([
+        expect.objectContaining({
+          severity: "error",
+          message: `Current saved defect: ${code}`,
+        }),
+      ]);
+      expect(result.nativePdfChecks).toMatchObject({
+        auditComplete: true,
+        conformanceClaim: false,
+        veraPdf: { failedChecks: 1 },
+      });
+    }
+  );
 
   it("rejects unsupported input before work and never returns raw worker diagnostics", async () => {
     expect(

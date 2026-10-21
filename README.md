@@ -61,6 +61,8 @@ project's technical reference for humans.
    its [layout-preserving repair and audit pipeline](docs/word-accessibility.md).
    Native PowerPoint
    uses its [dedicated repair and review pipeline](docs/powerpoint-accessibility.md).
+   Native PDF uses its [private repair worker and independent audit](docs/pdf-accessibility.md)
+   to preserve the pages and repair supported accessibility information.
    For Canvas HTML, Word documents are first rendered to PDF by the configured
    service. Word/PDF then enter the two-stage HTML pipeline:
    - **Stage 1 — conversion**: the server renders every PDF page and sends the configured
@@ -81,7 +83,9 @@ project's technical reference for humans.
    rendered result with the original even when conversion succeeds.
 4. Open a completed document to review its result. Native Word and PowerPoint
    provide an updated file, measured changes and review items. Run the matching
-   Office Accessibility Checker before sharing. HTML results provide
+   Office Accessibility Checker before sharing. Native PDF provides a repaired
+   PDF, changes and page-specific review findings, including remaining machine
+   failures; it does not certify PDF/UA conformance. HTML results provide
    formatted HTML, items labeled **Needs a fix** or **Please check**, and buttons
    to copy or download it for Canvas.
 5. Locking a document (padlock icon in the table) excludes it from the next
@@ -180,7 +184,8 @@ The following were used on the backend to build the API and database:
   provider. Original documents, rendered PDFs, and generated HTML outputs live
   in a private Supabase Storage bucket.
 - `Gotenberg / LibreOffice`: A separate worker renders Word uploads to PDF
-  before the existing AI pipeline. Direct PDF uploads need no worker.
+  before the existing AI pipeline. PDF-to-HTML needs no Word-rendering worker;
+  native PDF repair uses its own private worker.
 - `Drizzle ORM`: Type-safe database access and migration tooling
   (`drizzle-kit`).
 - `Better Auth`: The application's authentication provider. Instructors

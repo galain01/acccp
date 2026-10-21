@@ -403,9 +403,11 @@ function visuals(pages: RenderedPdfPage[]): LiteLLMContentPart[] {
 function scope(
   state: NativePdfState,
   batch: Batch,
-  outstandingRepairFindings: NativePdfFinding[] = []
+  outstandingRepairFindings: NativePdfFinding[] = [],
+  evidenceRole: "current-saved-pdf" | "before-repair-comparison" = "current-saved-pdf"
 ): string {
   const payload = {
+    evidenceRole,
     assignedPages: batch.pages,
     assignedTagIds: batch.tags.map((t) => t.id),
     companionPages: batch.visualPages,
@@ -427,13 +429,19 @@ function scope(
     ),
     nestedFormContent: state.inventory.form_content,
     forms: state.inventory.forms,
-    machineChecks: state.machineChecks,
-    findings: state.findings.filter(
-      (f) => !f.pageNumber || batch.visualPages.includes(f.pageNumber)
-    ),
-    outstandingRepairFindings: outstandingRepairFindings.filter(
-      (f) => !f.pageNumber || batch.visualPages.includes(f.pageNumber)
-    ),
+    // Earlier failures may already be repaired. Only checks reopened from the
+    // delivered output are evidence of its remaining machine defects.
+    ...(evidenceRole === "current-saved-pdf"
+      ? {
+          machineChecks: state.machineChecks,
+          findings: state.findings.filter(
+            (f) => !f.pageNumber || batch.visualPages.includes(f.pageNumber)
+          ),
+          outstandingRepairFindings: outstandingRepairFindings.filter(
+            (f) => !f.pageNumber || batch.visualPages.includes(f.pageNumber)
+          ),
+        }
+      : {}),
   };
   const value = JSON.stringify(payload);
   if (value.length > 900_000) throw new NativePdfError("pdf_complexity_limit");
@@ -578,7 +586,7 @@ export async function repairNativePdf(
           [
             {
               type: "text",
-              text: `Untrusted exact saved output evidence:\n${scope(repaired, batch, retained)}\nPrior inventory for comparison:\n${scope(prepared, { ...batch, tags: prepared.inventory.tags.filter((t) => batch.tags.some((a) => a.id === t.id)) })}\nRepairs: ${JSON.stringify(repaired.changes)}\nBoth excerpts map physical pages ${batch.visualPages.join(", ")} in that order.`,
+              text: `Untrusted exact saved output evidence:\n${scope(repaired, batch, retained)}\nPrior inventory for comparison:\n${scope(prepared, { ...batch, tags: prepared.inventory.tags.filter((t) => batch.tags.some((a) => a.id === t.id)) }, [], "before-repair-comparison")}\nRepairs: ${JSON.stringify(repaired.changes)}\nBoth excerpts map physical pages ${batch.visualPages.join(", ")} in that order.`,
             },
             ...excerpts.map(
               (pdf, i): LiteLLMContentPart => ({

@@ -132,11 +132,11 @@ Other approaches researched, but not selected:
 
 OpenDataLoader and veraPDF run locally in the research setup. No paid license or
 new provider account has been purchased. Semantic experiments use the existing
-institutional LiteLLM configuration. The branch now integrates a bounded
+institutional LiteLLM configuration. The app now integrates a bounded
 general repair path; the broader fixture-specific OCR, font, form and appendix
-experiments remain research tools. The production PDF repair destination has
-not been activated. The final manual interactive review was stopped at the
-user's request, so the app makes no claim that such testing has been completed
+experiments remain research tools. The production PDF repair destination was
+activated and its repair/download flow verified on 2026-10-21. The final manual
+interactive review was stopped at the user's request, so the app makes no claim that such testing has been completed
 for arbitrary uploaded documents.
 
 ### HTML

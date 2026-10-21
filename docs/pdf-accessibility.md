@@ -1,6 +1,6 @@
 # Native PDF accessibility repair
 
-This branch adds `accessible_pdf` (`pdf-v1`) to the app. An instructor can keep a
+The app supports `accessible_pdf` (`pdf-v1`). An instructor can keep a
 PDF as a PDF or choose the existing Canvas HTML output. The repair edits the
 PDF's native accessibility information while preserving the original page
 layout. It does not print HTML into a replacement PDF.
@@ -144,5 +144,25 @@ These results establish the implemented app path, not universal PDF coverage or
 PDF/UA conformance. Sixty-page orchestration was tested with mocks. The root
 `Dockerfile.native-pdf.vercel` runs an additional nonroot Linux HTTP test during
 every image build, exercising the installed tagger, validator and actual worker
-limits. Hosted upload/download verification remains a release gate. No further
-Acrobat/NVDA testing was run.
+limits. No further Acrobat/NVDA testing was run.
+
+## Hosted release verification, 2026-10-21
+
+The private worker and native PDF workflow are deployed in production. The
+Linux image build exercises the actual installed tagger, validator and worker.
+Signed-in browser tests repaired and downloaded the classroom guide and a
+synthetic PDF just below the 4 MiB limit. Independent checks confirmed preserved
+page pixels, content and authored descriptions. Both jobs' completed model calls,
+including the large file's initial failed attempt, were included in usage and
+cost totals; their original expiration times were unchanged.
+
+The large-file test exposed the hosted request-size limit. The signed transfer
+path above lets repair proceed without reducing image detail. Scoped checks
+confirmed that its temporary transfer objects and cleanup receipts were removed.
+Public requests cannot reach the worker endpoints or bypass app authentication.
+
+Saved-file findings distinguish pre-repair evidence from current machine checks.
+The repair prompt explains automatic document-property repairs, and the audit
+uses the reopened output's checks rather than inferring missing metadata from a
+rebuilt page excerpt. Remaining real defects stay visible. These release checks
+do not establish universal PDF coverage or PDF/UA conformance.
