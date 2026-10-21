@@ -72,8 +72,9 @@ of the file. They do not replace Word and assistive-technology testing.
 
 Migration `0015_native_word_outputs` adds the `docx_output` artifact and enables
 the `accessible_docx` target plus bounded Word failure categories. It must be
-applied to the intended database before releasing this code. Generation and
-local migration tests do not apply it to a hosted project.
+applied to the intended database before releasing this code. It was applied
+and verified on the ACCCP production database on 2026-10-21, including its
+Drizzle migration-history entry. Other databases still require the migration.
 
 The immutable source is `session/document/source.docx`. The updated file and
 review are `session/document/job/output.docx` and `review.json`. Rendered PDFs
