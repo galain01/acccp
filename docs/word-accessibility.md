@@ -24,10 +24,13 @@ repairs while preserving the document's existing appearance and content.
 5. Apply validated operations to the original package. Verify unchanged content
    and parts, reopen the result and check that requested properties were written.
 6. Render the repaired file and compare page count, extracted text and decoded
-   page pixels. Metadata repairs must preserve appearance. List and table
-   repairs may change their own measured regions; the surrounding pixels must
-   still match. Missing or ambiguous region evidence, changed pagination or
-   unrelated layout changes cause rollback and another verification.
+   page pixels. Metadata repairs must preserve appearance. Native list markers
+   may change within their measured prefix areas when a renderer substitutes
+   fonts; the list wording, text positions and body pixels must remain unchanged.
+   Table repairs may change their measured header regions; data rows and
+   surrounding pixels must still match. Missing or ambiguous region evidence,
+   changed pagination or unrelated layout changes cause rollback and another
+   verification.
    Unverifiable changes are not delivered as repairs; the result explains what
    was left unchanged.
 7. Independently audit the actual final file's native inventory and source/output
@@ -106,3 +109,5 @@ The native-list and simple-table approach follows Microsoft's
 [Word accessibility guidance](https://support.microsoft.com/en-us/accessibility/word/make-your-word-documents-accessible-to-people-with-disabilities).
 Local regression cases cover split-run list markers, ordered starts, rich text
 and hyperlinks, ambiguous merged tables, and already-correct documents.
+Release verification also uses PDFs from the hosted renderer, whose font
+fallbacks can differ from a local LibreOffice installation.

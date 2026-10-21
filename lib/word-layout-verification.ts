@@ -16,6 +16,9 @@ interface LocatedRegion {
   pageNumber: number;
   region: Region;
 }
+interface LocatedText extends LocatedRegion {
+  items: PdfTextRegion[];
+}
 const normalized = (text: string) =>
   text
     .normalize("NFKC")
@@ -25,13 +28,13 @@ const same = (a: unknown, b: unknown) =>
   JSON.stringify(a) === JSON.stringify(b);
 
 /** Require a unique exact text sequence and complete boundary items, not a model box. */
-export function matchWordTextRegion(
+function matchWordText(
   rendered: RenderedPdf,
   text: string
-): LocatedRegion | null {
+): LocatedText | null {
   const needle = normalized(text);
   if (!needle) return null;
-  const matches: LocatedRegion[] = [];
+  const matches: LocatedText[] = [];
   for (const page of rendered.pages) {
     if (!page.textRegions) return null;
     const entries: { item: PdfTextRegion; start: number; end: number }[] = [];
@@ -63,9 +66,20 @@ export function matchWordTextRegion(
     matches.push({
       pageNumber: page.pageNumber,
       region: { x, y, width: right - x, height: bottom - y },
+      items: selected.map(({ item }) => item),
     });
   }
   return matches.length === 1 ? matches[0] : null;
+}
+
+export function matchWordTextRegion(
+  rendered: RenderedPdf,
+  text: string
+): LocatedRegion | null {
+  const matched = matchWordText(rendered, text);
+  return matched
+    ? { pageNumber: matched.pageNumber, region: matched.region }
+    : null;
 }
 
 async function pixels(page: RenderedPdfPage): Promise<Buffer> {
@@ -103,24 +117,66 @@ const overlaps = (a: Region, b: Region) =>
   a.y < b.y + b.height &&
   a.y + a.height > b.y;
 
-function isolatedText(
+/** Native bullet fonts can have a different fallback on the hosted renderer.
+ * Only the measured prefix area may differ; the item words and their geometry
+ * stay unchanged and every body pixel remains outside the permitted region. */
+function listMarkerRegion(
   rendered: RenderedPdf,
-  located: LocatedRegion | null,
-  text: string,
-  padding: number
-): LocatedRegion | null {
-  if (!located) return null;
-  const page = rendered.pages.find(
-    (item) => item.pageNumber === located.pageNumber
-  )!;
-  const region = expanded(located.region, page, padding);
-  const entries = page.textRegions?.filter((item) => overlaps(item, region));
+  whole: LocatedText | null,
+  body: LocatedText | null,
+  prefix: string
+): LocatedText | null {
+  if (!whole || !body || whole.pageNumber !== body.pageNumber) return null;
+  const items = whole.items.filter((item) => !body.items.includes(item));
   if (
-    !entries ||
-    normalized(entries.map((item) => item.text).join(" ")) !== normalized(text)
+    !items.length ||
+    normalized(items.map((item) => item.text).join("")) !==
+      normalized(prefix) ||
+    items.some((item) => item.x + item.width > body.region.x)
   )
     return null;
-  return located;
+  const page = rendered.pages.find(
+    (item) => item.pageNumber === whole.pageNumber
+  )!;
+  const left = Math.max(
+    0,
+    Math.floor(Math.min(...items.map((item) => item.x)) - 2)
+  );
+  const right = Math.min(
+    Math.floor(body.region.x),
+    Math.ceil(Math.max(...items.map((item) => item.x + item.width)) + 2)
+  );
+  if (right <= left || right - left > Math.min(120, page.width * 0.12))
+    return null;
+  const y = Math.max(
+    0,
+    Math.floor(Math.min(...items.map((item) => item.y)) - 2)
+  );
+  const bottom = Math.min(
+    page.height,
+    Math.ceil(Math.max(...items.map((item) => item.y + item.height)) + 2)
+  );
+  return {
+    pageNumber: whole.pageNumber,
+    region: { x: left, y, width: right - left, height: bottom - y },
+    items,
+  };
+}
+
+function sameTextGeometry(
+  left: LocatedRegion | null,
+  right: LocatedRegion | null
+): boolean {
+  return (
+    !!left &&
+    !!right &&
+    left.pageNumber === right.pageNumber &&
+    (["x", "y", "width", "height"] as const).every(
+      (key) =>
+        Math.round(left.region[key] * 100) ===
+        Math.round(right.region[key] * 100)
+    )
+  );
 }
 
 /** Anchor a table by its exact data row, then verify every visible header word.
@@ -329,6 +385,7 @@ export async function verifyWordLayout(
       );
       if (!candidate || !same(candidate.paragraphIds, change.paragraphIds))
         return false;
+      const markers: { before: LocatedText; after: LocatedText }[] = [];
       for (let index = 0; index < candidate.paragraphIds.length; index++) {
         const paragraph = repaired.inspection.paragraphs.find(
           (item) => item.id === outputId(candidate.paragraphIds[index])
@@ -344,22 +401,53 @@ export async function verifyWordLayout(
         )
           return false;
         // The original visible marker is now supplied by native numbering.
-        const before = isolatedText(
-          sourcePages,
-          matchWordTextRegion(sourcePages, original),
-          original,
-          3
-        );
-        const after = isolatedText(
-          outputPages,
-          matchWordTextRegion(outputPages, original),
-          original,
-          3
-        );
-        // When line boxes overlap neighboring text, permit no visual change
-        // here at all. Pixel-identical native numbering can still be retained;
-        // the page comparison below protects these unmasked pixels exactly.
-        if (before && after && !add(before, after, 3)) return false;
+        const bodyText = original.slice(prefix.length);
+        const beforeBody = matchWordText(sourcePages, bodyText);
+        const afterBody = matchWordText(outputPages, bodyText);
+        if (sameTextGeometry(beforeBody, afterBody)) {
+          const before = listMarkerRegion(
+            sourcePages,
+            matchWordText(sourcePages, original),
+            beforeBody,
+            prefix
+          );
+          const after = listMarkerRegion(
+            outputPages,
+            matchWordText(outputPages, original),
+            afterBody,
+            prefix
+          );
+          if (before && after) markers.push({ before, after });
+        }
+        // Missing/ambiguous geometry authorizes no change. Pixel-identical
+        // native numbering can still pass the exact unmasked comparison below.
+      }
+      const originalMarkers = new Set(
+        markers.flatMap((marker) => marker.before.items)
+      );
+      const outputMarkers = new Set(
+        markers.flatMap((marker) => marker.after.items)
+      );
+      const owned = (
+        rendered: RenderedPdf,
+        located: LocatedText,
+        items: Set<PdfTextRegion>
+      ) =>
+        rendered.pages
+          .find((page) => page.pageNumber === located.pageNumber)!
+          .textRegions!.filter((item) => overlaps(item, located.region))
+          .every((item) => items.has(item));
+      for (const marker of markers) {
+        // Conservative PDF boxes can overlap adjacent lines. Only prefixes
+        // belonging to this verified list may overlap its marker-only strips.
+        if (
+          !owned(sourcePages, marker.before, originalMarkers) ||
+          !owned(outputPages, marker.before, outputMarkers) ||
+          !owned(sourcePages, marker.after, originalMarkers) ||
+          !owned(outputPages, marker.after, outputMarkers)
+        )
+          continue;
+        if (!add(marker.before, marker.after, 0)) return false;
       }
     } else {
       const table = source.tables.find((item) => item.id === change.id);
