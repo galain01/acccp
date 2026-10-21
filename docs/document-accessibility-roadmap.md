@@ -96,7 +96,16 @@ and existing alternatives. Include independent PDF/UA validation and semantic
 audit; machine checks alone cannot establish meaningful reading order or image
 descriptions.
 
-Candidate approaches, based on official documentation checked 2026-10-21:
+The user selected **open-source components only** on 2026-10-21. The local
+prototype now evaluates **OpenDataLoader PDF 2.5.14** as the native tag writer,
+with our own repair layer, independent veraPDF checks, preservation checks and
+model audit. The free Apache-2.0 core writes actual tagged PDFs; its enterprise
+PDF/UA export and editor are not used. See
+[`research/native-pdf/README.md`](../research/native-pdf/README.md) for measured
+results, reproducible tools and release gates. Existing vector figures and
+authored alternatives require further work before app integration.
+
+Other approaches researched, but not selected:
 
 - [PDFix SDK](https://pdfix.net/products/pdfix-sdk/): licensed tooling that can
   run on our worker and write/repair structure. Evaluate the actual selected
@@ -108,11 +117,10 @@ Candidate approaches, based on official documentation checked 2026-10-21:
   supported subset, but substantial engineering for arbitrary PDFs. Do not
   equate extraction tools with a remediated-PDF writer.
 
-The preference is to evaluate a self-hosted engine first given the existing
-privacy requirements. No engine/license/account has been purchased, installed,
-or connected, and no document has been sent to a new provider by this work.
-[veraPDF](https://docs.verapdf.org/validation/) is a candidate independent
-validator for machine-verifiable PDF/UA requirements.
+OpenDataLoader and veraPDF run locally in the research setup. No paid license or
+new provider account has been purchased. Semantic experiments use the existing
+institutional LiteLLM configuration. The production PDF repair destination
+remains unavailable until preservation and accessibility release gates pass.
 
 ### HTML
 
