@@ -6,11 +6,12 @@ The user chose open-source components only and preservation of the original
 page layout. Documents, model responses, generated PDFs, binaries and credentials
 stay outside Git.
 
-The latest local follow-up is [Scanned text and form repair results](SCAN_FORM_RESULTS.md).
-It adds bounded OCR for reviewed text-only scans, authored form-label restoration,
-and an audited label/control reading-order repair. Four scan candidates pass the
-automated checks. The form remains blocked by its original font and required-field
-issues. Native PDF output remains unavailable in the app.
+The latest local follow-up is [Form-font repair results](FORM_FONT_RESULTS.md).
+It resolves the registration form's missing fonts while preserving its existing
+layout and editable controls. The evaluation copy passes PDF/UA-1 machine checks;
+an ambiguous required checkbox remains a semantic review item. The earlier
+[scan and form work](SCAN_FORM_RESULTS.md) added bounded OCR, authored labels and
+label/control reading order. Native PDF output remains unavailable in the app.
 
 ## Engine decision
 

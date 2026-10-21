@@ -1,5 +1,9 @@
 # Scanned text and form repair results
 
+The later [form-font follow-up](FORM_FONT_RESULTS.md) resolves the font failures
+recorded below. The remaining checkbox requirement still needs author review.
+This report retains the earlier candidates and their original results.
+
 The 2026-10-21 follow-up fixes missing or incorrect hidden text in a bounded
 text-only scan workflow and restores authored form descriptions. It also repairs
 an audited form reading-order defect without changing visible pages or controls.

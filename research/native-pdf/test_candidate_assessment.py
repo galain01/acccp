@@ -61,7 +61,7 @@ class CandidateAssessmentTests(unittest.TestCase):
         self.assertFalse(self.assess()['automatedChecksPassed'])
 
     def test_clean_audit_cannot_override_incomplete_form_evidence(self):
-        for kind in ('form_label_validation','form_order_validation'):
+        for kind in ('form_label_validation','form_order_validation','form_font_validation'):
             for evidence in ({'passed':False,'checksComplete':True},
                              {'passed':True,'checksComplete':False},
                              {'passed':True,'checksComplete':True,'reviewItems':[{'code':'ambiguous_control'}]},

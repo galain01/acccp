@@ -41,11 +41,11 @@ def _appendix_source_evidence(ledger):
 def compare_with_authorized_repairs(original:Path, final:Path, bundle_path:Path):
     digests=[hashlib.sha256(p.read_bytes()).hexdigest() for p in (original,final)]
     bundle=_json(bundle_path)
-    keys=('navigationManifest','appendixManifest','ocrManifest','formLabelManifest','formOrderManifest')
+    keys=('navigationManifest','appendixManifest','ocrManifest','formLabelManifest','formOrderManifest','formFontManifest')
     if (not isinstance(bundle,dict) or set(bundle)-{'schemaVersion',*keys}
             or bundle.get('schemaVersion')!=1 or not any(bundle.get(k) for k in keys)):
         raise ValueError('explicit_repair_bundle_required')
-    if any(k in bundle for k in ('ocrManifest','formLabelManifest','formOrderManifest')) and sum(k in bundle for k in keys)!=1:
+    if any(k in bundle for k in ('ocrManifest','formLabelManifest','formOrderManifest','formFontManifest')) and sum(k in bundle for k in keys)!=1:
         raise ValueError('ocr_and_form_repairs_require_separate_explicit_bundle')
     ledgers={}
     ledger_hashes={bundle_path:hashlib.sha256(bundle_path.read_bytes()).hexdigest()}
@@ -64,6 +64,9 @@ def compare_with_authorized_repairs(original:Path, final:Path, bundle_path:Path)
     elif 'formOrderManifest' in ledgers:
         from form_order_validation import compare_with_authorized_form_order
         report=compare_with_authorized_form_order(original,final,ledgers['formOrderManifest'])
+    elif 'formFontManifest' in ledgers:
+        from form_font_validation import compare_with_authorized_form_fonts
+        report=compare_with_authorized_form_fonts(original,final,ledgers['formFontManifest'])
     elif appendix is not None:
         if navigation is not None:
             # Bind the prior navigation output to the appendix's immutable input.

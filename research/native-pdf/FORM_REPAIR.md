@@ -37,7 +37,11 @@ Tests generate their PDFs in temporary directories. They cover saved label evide
 
 From the repository root, the private registration experiment is under `../../outputs/native-pdf-form-labels-2026-10-21/`. It contains the exact ledgers, saved candidates, initialized-form screenshots, filling evidence, audit, and validator report. These PDFs stay outside Git.
 
-## Current result and remaining font work
+## Initial result and subsequent font work
+
+The separate [form-font repair](FORM_FONT_REPAIR.md) now supports this bounded
+appearance/default-resource case. [Its saved-file results](FORM_FONT_RESULTS.md)
+supersede the font failures below; the required-checkbox ambiguity remains.
 
 The registration experiment restores six generated descriptions from three existing tooltips. Programmatic filling still updates the participant name, session choice and checkbox; the filled source and repaired PDF render identically with form appearances enabled. The order repair pairs each visible label and control while retaining the original page.
 
