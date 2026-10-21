@@ -4,6 +4,7 @@ import {
   validateAudit,
   type SavedTag,
 } from "./audit-contract";
+import { planAuditBatches } from "./audit-batches";
 
 const tags: SavedTag[] = [
   { id: "tag-1", role: "Document", parentId: null, pageNumber: null, text: "" },
@@ -17,6 +18,80 @@ const complete = () => ({
   findings: [],
 });
 describe("native PDF experimental audit evidence", () => {
+  it("retains exact final requirement evidence and prior-stage identities in every audit batch", () => {
+    const requirement = {
+      passed: true,
+      checksComplete: true,
+      outputSha256: "b".repeat(64),
+      inputSha256: "a".repeat(64),
+      authorDecisionSha256: "c".repeat(64),
+      fieldPath: ["materials"],
+      tagId: "form-401",
+      beforeFlags: 2,
+      afterFlags: 0,
+      onlyRequiredBitCleared: true,
+      widgetEvidence: [
+        {
+          fieldPath: ["materials"],
+          tooltip: "Send workshop materials",
+          required: false,
+        },
+      ],
+      findings: [],
+    };
+    const prior = {
+      passed: true,
+      validatedIntermediateOutputSha256: requirement.inputSha256,
+      widgetEvidenceAppliesToOutputSha256: requirement.outputSha256,
+      widgetEvidence: requirement.widgetEvidence,
+    };
+    const report = {
+      form_requirement_validation: requirement,
+      form_font_validation: prior,
+      form_default_font_validation: {
+        passed: true,
+        checksComplete: true,
+        outputSha256: requirement.outputSha256,
+        staticAppearancesPreserved: true,
+        dynamicViewerBehaviorTested: false,
+      },
+      structure: {
+        tags: Array.from({ length: 401 }, (_, index) => ({
+          id: `form-${index + 1}`,
+          role: "Form",
+          parentId: null,
+          pageNumber: 1,
+          text: "",
+        })),
+      },
+    };
+    const compact = JSON.parse(compactAuditEvidence(report));
+    expect(compact.form_requirement_validation).toEqual(requirement);
+    const batches = planAuditBatches(report, []);
+    expect(batches).toHaveLength(2);
+    for (const batch of batches) {
+      const evidence = JSON.parse(batch.evidence);
+      expect(evidence.form_requirement_validation).toEqual(requirement);
+      expect(evidence.form_font_validation).toEqual(prior);
+      expect(evidence.form_default_font_validation).toEqual(
+        report.form_default_font_validation
+      );
+    }
+    const failure = {
+      ...requirement,
+      passed: false,
+      checksComplete: false,
+      findings: [{ code: "form_requirement_unlisted_native_change" }],
+    };
+    expect(
+      JSON.parse(
+        compactAuditEvidence({
+          ...report,
+          form_requirement_validation: failure,
+        })
+      ).form_requirement_validation
+    ).toEqual(failure);
+  });
   it("requires explicit saved OCR text and original-image agreement on every repaired page", () => {
     const base = complete();
     expect(() => validateAudit(base, tags, 2, [], tags, [1])).toThrow();

@@ -58,6 +58,7 @@ class ManualReviewTests(unittest.TestCase):
 
     def test_complete_record_does_not_establish_conformance_or_execution(self):
         pack = self.pack()
+        pack['screenReaderTestPerformed']=True
         for key in pack["session"]:
             pack["session"][key] = "Tester supplied value"
         for check in pack["checks"]:
@@ -67,10 +68,28 @@ class ManualReviewTests(unittest.TestCase):
         self.assertFalse(result["screenReaderExecutionVerifiedByCode"])
         self.assertFalse(result["standardConformanceEstablished"])
         self.assertFalse(result["readyForApp"])
+        self.assertTrue(result['screenReaderTestReportedPerformed'])
         for outcome in ("not_run", "unable", "fail"):
             edited = deepcopy(pack)
             edited["checks"][0]["status"] = outcome
             self.assertFalse(recorded_review_status(edited, edited["document"]["sha256"])["recordedChecksPassed"])
+
+    def test_actual_screen_reader_session_can_be_partial_without_full_manual_pass(self):
+        pack=self.pack();pack['screenReaderTestPerformed']=True
+        control=next(check for check in pack['checks'] if check['id']=='form-controls')
+        control.update(status='pass',observed='Tester heard the optional checkbox label and toggled it with Space.',
+                       pages=[1],evidence='Local speech transcript and filled-copy hash recorded by tester.')
+        result=recorded_review_status(pack,pack['document']['sha256'])
+        self.assertTrue(result['screenReaderTestReportedPerformed'])
+        self.assertFalse(result['manualScopeComplete']);self.assertFalse(result['recordedChecksPassed'])
+        self.assertFalse(result['screenReaderExecutionVerifiedByCode'])
+
+    def test_filled_checklist_does_not_infer_screen_reader_execution(self):
+        pack=self.pack()
+        for key in pack['session']:pack['session'][key]='Tester supplied value'
+        for check in pack['checks']:check.update(status='pass',observed='Recorded observation')
+        result=recorded_review_status(pack,pack['document']['sha256'])
+        self.assertFalse(result['screenReaderTestReportedPerformed']);self.assertFalse(result['manualScopeComplete'])
 
     def test_stale_identity_or_missing_checkpoint_refused(self):
         pack = self.pack()

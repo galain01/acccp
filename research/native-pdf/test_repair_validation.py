@@ -41,7 +41,9 @@ class RepairLedgerCompositionTests(unittest.TestCase):
         for key,target in [('ocrManifest','scan_ocr_validation.compare_with_authorized_ocr'),
                            ('formLabelManifest','form_label_validation.compare_with_authorized_form_labels'),
                            ('formOrderManifest','form_order_validation.compare_with_authorized_form_order'),
-                           ('formFontManifest','form_font_validation.compare_with_authorized_form_fonts')]:
+                           ('formFontManifest','form_font_validation.compare_with_authorized_form_fonts'),
+                           ('formRequirementManifest','form_requirement_validation.compare_with_authorized_form_requirement'),
+                           ('formDefaultFontManifest','form_default_font_validation.compare_with_authorized_form_default_font')]:
             with self.subTest(key=key):
                 self.bundle.write_text(json.dumps({'schemaVersion':1,key:'nav.json'}))
                 with patch(target,return_value={'passed':False,'findings':[{'code':'exact_check_failed'}]}) as verify:

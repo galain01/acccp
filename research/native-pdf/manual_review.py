@@ -29,6 +29,7 @@ CHECKPOINTS = (
     ("headings", "Navigate by headings", "Use heading navigation and the heading list. Confirm the title, section hierarchy and description appendix can be found and understood. A tag inventory is a reference; record what the screen reader actually exposes."),
     ("table-navigation", "Read table relationships", "Enter each table and navigate horizontally and vertically. Sample every header pattern and category, first/last rows, spanning headers and rows on both sides of page breaks. Record the value plus every spoken row, year, statistic and category label. Missing or misleading relationships are failures even if the table was announced."),
     ("links-and-focus", "Follow links using the keyboard", "Traverse focus forward and backward. Compare spoken link labels and targets with the source meaning; activate each distinct repaired destination and return to the PDF. Check wrapped URLs do not become confusing duplicate links, and that focus remains usable."),
+    ("form-controls", "Read and operate interactive form controls", "For every control, record the actual Tab and Shift+Tab order, spoken label, type, required/read-only state, current value and checkbox state. Enter text, change a choice, and toggle each checkbox using only the keyboard. Confirm an optional checkbox is not announced as required. Save a separate filled copy, reopen it, and verify values and states persist. Inspect any validation errors and focus recovery. Record screen-reader speech or accessibility-API evidence separately from native PDF tags; if the file has no forms, record that as not applicable."),
     ("figures-and-descriptions", "Understand every meaningful graphic", "Navigate to each graphic and listen to its alternative. Find the detailed description from the normal reading sequence and heading navigation. A reviewer should answer the same substantive questions using the description as using the graphic, including units, groups, missing data and uncertainty. Record any unsupported detail or omission."),
     ("lists-and-continuations", "Check lists and interrupted paragraphs", "Verify list boundaries and name-to-role associations. Listen across cross-page paragraphs and content interrupted visually by a table or figure. Words and ideas must remain complete; record the actual reading sequence rather than judging only raw extracted line breaks."),
     ("text-and-language", "Check text, symbols and pronunciation", "Inspect selected text word by word and, when ambiguous, character by character. Check names, soft hyphens, ligatures, mathematical signs, percentages and language changes. Separate a voice pronunciation choice from wrong characters or missing words; record the reader's exposed text when available."),
@@ -135,7 +136,12 @@ def recorded_review_status(pack: dict, current_sha256: str) -> dict:
     completed = completed and all(str(check.get("observed", "")).strip() for check in checks)
     session = pack.get("session", {})
     completed = completed and all(str(session.get(key, "")).strip() for key in ("tester", "date", "operatingSystem", "pdfViewerAndVersion", "screenReaderAndVersion", "readingPreferences"))
-    return {"status": "manual_record_complete" if completed else "manual_review_incomplete_or_failed", "recordedChecksPassed": bool(completed), "screenReaderExecutionVerifiedByCode": False, "standardConformanceEstablished": False, "readyForApp": False}
+    performed=pack.get('screenReaderTestPerformed') is True
+    completed=completed and performed
+    return {"status": "manual_record_complete" if completed else "manual_review_incomplete_or_failed",
+            "recordedChecksPassed": bool(completed),"manualScopeComplete":bool(completed),
+            "screenReaderTestReportedPerformed":performed,
+            "screenReaderExecutionVerifiedByCode": False, "standardConformanceEstablished": False, "readyForApp": False}
 
 
 def main() -> int:

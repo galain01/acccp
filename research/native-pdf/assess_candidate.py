@@ -70,7 +70,7 @@ def assess_evidence(checks: dict, validation: dict, audit: dict | None, source_h
     unresolved_machine_findings = [finding for finding in machine_findings if not (finding.get("code") == "artifact_text_needs_semantic_review" and finding.get("severity") == "warning")]
     if checks.get("mechanical_checks_passed") is not True or unresolved_machine_findings:
         blockers.append("independent_machine_checks_not_passed")
-    for key in ('form_label_validation', 'form_order_validation', 'form_font_validation'):
+    for key in ('form_label_validation', 'form_order_validation', 'form_font_validation', 'form_requirement_validation', 'form_default_font_validation'):
         if key in checks:
             form_check = checks[key]
             if (not isinstance(form_check, dict) or form_check.get('passed') is not True
