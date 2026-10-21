@@ -82,6 +82,356 @@ const i1 = "word/document.xml:i:1";
 const t1 = "word/document.xml:t:1";
 
 describe("native Word package repair", () => {
+  const typedItem = (marker: string, body: string) =>
+    `<w:p><w:pPr><w:spacing w:after="0"/><w:ind w:firstLine="360"/></w:pPr><w:r><w:rPr><w:rFonts w:ascii="Cascadia Mono"/></w:rPr><w:t>${marker}</w:t></w:r><w:r><w:rPr><w:rFonts w:ascii="Cascadia Mono"/></w:rPr><w:t xml:space="preserve"> </w:t></w:r><w:r><w:rPr><w:b/><w:sz w:val="22"/></w:rPr><w:t>${body}</w:t></w:r><w:hyperlink r:id="rLink"><w:r><w:rPr><w:i/></w:rPr><w:t xml:space="preserve"> linked text</w:t></w:r></w:hyperlink></w:p>`;
+  const groupedTable = () =>
+    `<w:tbl><w:tblPr><w:tblStyle w:val="TableGrid"/><w:tblW w:w="9000" w:type="dxa"/></w:tblPr><w:tblGrid><w:gridCol w:w="3000"/><w:gridCol w:w="3000"/><w:gridCol w:w="3000"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="3000" w:type="dxa"/><w:vMerge w:val="restart"/></w:tcPr>${paragraph("Type")}</w:tc><w:tc><w:tcPr><w:tcW w:w="6000" w:type="dxa"/><w:gridSpan w:val="2"/><w:shd w:val="clear" w:fill="002244"/></w:tcPr>${paragraph("Exams")}</w:tc></w:tr><w:tr><w:tc><w:tcPr><w:tcW w:w="3000" w:type="dxa"/><w:vMerge/></w:tcPr><w:p/></w:tc><w:tc><w:tcPr><w:tcW w:w="3000" w:type="dxa"/></w:tcPr>${paragraph("1")}</w:tc><w:tc><w:tcPr><w:tcW w:w="3000" w:type="dxa"/></w:tcPr>${paragraph("2")}</w:tc></w:tr><w:tr><w:tc>${paragraph("15%")}</w:tc><w:tc>${paragraph("20%")}</w:tc><w:tc>${paragraph("65%")}</w:tc></w:tr></w:tbl>`;
+  const listOp = (
+    inspection: Awaited<ReturnType<typeof inspectDocx>>,
+    index = 0
+  ): DocxRepairOperation => {
+    const candidate = inspection.listCandidates![index];
+    return {
+      type: "convertTypedList",
+      id: candidate.id,
+      items: candidate.paragraphIds.map((paragraphId, i) => ({
+        paragraphId,
+        sourceText: candidate.sourceTexts[i],
+      })),
+    };
+  };
+  it("turns split-run typed bullets into a native list without rewriting rich body text or existing paragraph formatting", async () => {
+    const parts = entries(
+      typedItem("●", "First item") + typedItem("●", "Second item")
+    );
+    parts["word/_rels/document.xml.rels"] = String(
+      parts["word/_rels/document.xml.rels"]
+    ).replace(
+      "</Relationships>",
+      `<Relationship Id="rLink" Type="${R}/hyperlink" Target="https://example.edu/" TargetMode="External"/></Relationships>`
+    );
+    const source = await zip(parts),
+      before = await inspectDocx(source);
+    expect(before.listCandidates).toMatchObject([
+      { kind: "bullet", marker: "●", prefixes: ["● ", "● "] },
+    ]);
+    const result = await repair(source, [listOp(before)]),
+      output = await unzip(result.buffer);
+    expect(result.inspection.paragraphs.map((p) => p.text)).toEqual([
+      "First item linked text",
+      "Second item linked text",
+    ]);
+    expect(
+      result.inspection.paragraphs.every(
+        (p) => p.list?.format === "bullet" && p.list.markerText === "●"
+      )
+    ).toBe(true);
+    expect(
+      new Set(result.inspection.paragraphs.map((p) => p.list?.numId)).size
+    ).toBe(1);
+    expect(result.changes[0].paragraphIds).toEqual(
+      before.paragraphs.map((p) => p.id)
+    );
+    expect(result.identityMap).toEqual({
+      [p1]: p1,
+      "word/document.xml:p:2": "word/document.xml:p:2",
+    });
+    const xml = output.get("word/document.xml")!.toString();
+    expect(xml.match(/<w:ind w:firstLine="360"\/>/g)).toHaveLength(2);
+    expect(xml.match(/<w:spacing w:after="0"\/>/g)).toHaveLength(2);
+    expect(xml).toContain(
+      '<w:r><w:rPr><w:b/><w:sz w:val="22"/></w:rPr><w:t>First item</w:t></w:r>'
+    );
+    expect(xml).toContain(
+      '<w:hyperlink r:id="rLink"><w:r><w:rPr><w:i/></w:rPr><w:t xml:space="preserve"> linked text</w:t></w:r></w:hyperlink>'
+    );
+    expect(output.get("word/numbering.xml")!.toString()).toContain(
+      '<w:suff w:val="space"/>'
+    );
+    expect(output.get("word/numbering.xml")!.toString()).toContain(
+      '<w:rFonts w:ascii="Cascadia Mono"/>'
+    );
+    expect(output.get("word/_rels/document.xml.rels")!.toString()).toContain(
+      'Target="https://example.edu/" TargetMode="External"'
+    );
+    for (const name of [
+      "word/styles.xml",
+      "word/media/picture.png",
+      "docProps/custom.xml",
+      "_rels/.rels",
+    ])
+      expect(output.get(name)).toEqual(Buffer.from(parts[name]));
+  });
+  it("preserves an ordered list's start and punctuation while appending definitions without editing existing numbering", async () => {
+    const parts = entries(
+      typedItem("3)", "Read") +
+        typedItem("4)", "Compare") +
+        typedItem("5)", "Explain")
+    );
+    const originalDefinition =
+      '<w:abstractNum w:abstractNumId="7"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="bullet"/><w:lvlText w:val="•"/></w:lvl></w:abstractNum><w:num w:numId="8"><w:abstractNumId w:val="7"/></w:num>';
+    parts["word/numbering.xml"] =
+      `<w:numbering xmlns:w="${W}">${originalDefinition}</w:numbering>`;
+    parts["word/_rels/document.xml.rels"] = String(
+      parts["word/_rels/document.xml.rels"]
+    ).replace(
+      "</Relationships>",
+      `<Relationship Id="rNums" Type="${R}/numbering" Target="numbering.xml"/></Relationships>`
+    );
+    const source = await zip(parts),
+      inspected = await inspectDocx(source);
+    expect(inspected.listCandidates?.[0]).toMatchObject({
+      kind: "decimal",
+      marker: ")",
+      start: 3,
+    });
+    const result = await repair(source, [listOp(inspected)]),
+      output = await unzip(result.buffer);
+    const numbering = output.get("word/numbering.xml")!.toString();
+    expect(numbering).toContain('<w:start w:val="3"/>');
+    expect(numbering).toContain('<w:lvlText w:val="%1)"/>');
+    expect(numbering).toContain(
+      originalDefinition.split("</w:abstractNum>")[0] + "</w:abstractNum>"
+    );
+    expect(numbering).toContain(
+      '<w:num w:numId="8"><w:abstractNumId w:val="7"/></w:num>'
+    );
+    expect(
+      result.inspection.paragraphs.every((p) => p.list?.numId === "9")
+    ).toBe(true);
+    expect(output.get("word/_rels/document.xml.rels")).toEqual(
+      Buffer.from(parts["word/_rels/document.xml.rels"])
+    );
+    expect(output.get("[Content_Types].xml")).toEqual(
+      Buffer.from(parts["[Content_Types].xml"])
+    );
+  });
+  it("separates adjacent bullet and decimal candidates, but never silently renumbers a numeric jump", async () => {
+    const source = await zip(
+      entries(
+        typedItem("●", "A") +
+          typedItem("●", "B") +
+          typedItem("3.", "C") +
+          typedItem("4.", "D") +
+          paragraph("Break") +
+          typedItem("3.", "E") +
+          typedItem("7.", "F") +
+          typedItem("8.", "G")
+      )
+    );
+    const inspection = await inspectDocx(source);
+    expect(inspection.listCandidates?.map((c) => [c.kind, c.start])).toEqual([
+      ["bullet", null],
+      ["decimal", 3],
+    ]);
+    const result = await repair(source, [
+      listOp(inspection),
+      listOp(inspection, 1),
+    ]);
+    expect(
+      result.inspection.paragraphs.slice(-3).map((p) => [p.text, p.list])
+    ).toEqual(inspection.paragraphs.slice(-3).map((p) => [p.text, p.list]));
+  });
+  it("rejects prefix-in-hyperlink, dosage prose, singleton and native list candidates", async () => {
+    const hyperlinkItem = (body: string) =>
+      `<w:p><w:hyperlink r:id="rLink"><w:r><w:t>● ${body}</w:t></w:r></w:hyperlink></w:p>`;
+    for (const body of [
+      hyperlinkItem("A") + hyperlinkItem("B"),
+      paragraph("1.5 mg daily") + paragraph("2.5 mg daily"),
+      typedItem("●", "One"),
+    ]) {
+      expect(
+        (await inspectDocx(await zip(entries(body)))).listCandidates
+      ).toEqual([]);
+    }
+    const source = await zip(
+      entries(typedItem("●", "A") + typedItem("●", "B"))
+    );
+    const inspection = await inspectDocx(source),
+      result = await repair(source, [listOp(inspection)]);
+    expect(result.inspection.listCandidates).toEqual([]);
+  });
+  it("requires exact complete list items and prevents conflicting changes to their paragraphs", async () => {
+    const source = await zip(
+      entries(typedItem("●", "A") + typedItem("●", "B") + typedItem("●", "C"))
+    );
+    const inspected = await inspectDocx(source),
+      operation = listOp(inspected);
+    if (operation.type !== "convertTypedList") throw Error("test operation");
+    for (const items of [
+      operation.items.slice(0, 2),
+      operation.items.map((p, i) =>
+        i ? p : { ...p, sourceText: "● Rewritten" }
+      ),
+      [...operation.items].reverse(),
+    ])
+      await expect(
+        repair(source, [{ ...operation, items }])
+      ).rejects.toHaveProperty("code", "docx_integrity");
+    await expect(
+      repair(source, [
+        operation,
+        {
+          type: "setHeading",
+          id: operation.items[1].paragraphId,
+          level: 1,
+          sourceText: operation.items[1].sourceText,
+        },
+      ])
+    ).rejects.toHaveProperty("code", "docx_integrity");
+    const reorderedKeys = {
+      ...operation,
+      items: operation.items.map((item) => ({
+        sourceText: item.sourceText,
+        paragraphId: item.paragraphId,
+      })),
+    };
+    expect((await repair(source, [reorderedKeys])).changes).toHaveLength(1);
+  });
+  it("derives explicit table labels from exact ancestry, preserves data rows, and maps later paragraph identities", async () => {
+    const sourceParts = entries(
+      paragraph("Before") + groupedTable() + paragraph("After")
+    );
+    sourceParts["word/styles.xml"] = String(
+      sourceParts["word/styles.xml"]
+    ).replace(
+      "</w:styles>",
+      '<w:style w:type="table" w:styleId="TableGrid"><w:name w:val="Table Grid"/><w:tblPr><w:tblBorders><w:insideH w:val="single" w:sz="4"/></w:tblBorders></w:tblPr></w:style></w:styles>'
+    );
+    const source = await zip(sourceParts),
+      inspected = await inspectDocx(source),
+      table = inspected.tables[0];
+    expect(table.headerCandidate).toMatchObject({
+      labels: ["Type", "Exams 1", "Exams 2"],
+      headerRows: 2,
+      gridWidthsTwips: [3000, 3000, 3000],
+      headerHeightsTwips: [null, null],
+    });
+    const result = await repair(source, [
+      { type: "simplifyTableHeaders", id: table.id, sourceCells: table.cells },
+      {
+        type: "setHeading",
+        id: inspected.paragraphs.at(-1)!.id,
+        sourceText: "After",
+        level: 1,
+      },
+    ]);
+    expect(result.inspection.tables[0]).toMatchObject({
+      complex: false,
+      firstRowHeader: true,
+      cells: [
+        ["Type", "Exams\n1", "Exams\n2"],
+        ["15%", "20%", "65%"],
+      ],
+    });
+    expect(result.inspection.paragraphs.at(-1)).toMatchObject({
+      text: "After",
+      headingLevel: 1,
+      id: "word/document.xml:p:8",
+    });
+    expect(result.identityMap?.["word/document.xml:p:10"]).toBe(
+      "word/document.xml:p:8"
+    );
+    expect(result.identityMap?.["word/document.xml:p:3"]).toBeNull();
+    expect(result.identityMap?.["word/document.xml:p:4"]).toBeNull();
+    expect(result.identityMap?.["word/document.xml:p:5"]).toBe(
+      "word/document.xml:p:3"
+    );
+    const output = await unzip(result.buffer),
+      xml = output.get("word/document.xml")!.toString();
+    const sourceDataRow = groupedTable()
+      .match(/<w:tr>[\s\S]*?<\/w:tr>/g)!
+      .at(-1)!;
+    expect(xml).toContain(sourceDataRow);
+    expect(xml).toContain('<w:bottom w:w="10" w:type="dxa"/>');
+    expect(xml).not.toContain("<w:vMerge");
+    expect(xml).not.toContain("<w:gridSpan");
+    expect(xml).toContain('<w:tblW w:w="9000" w:type="dxa"/>');
+    expect(xml).toContain("<w:tblHeader/>");
+    for (const [name, value] of Object.entries(sourceParts))
+      if (name !== "word/document.xml")
+        expect(output.get(name)).toEqual(Buffer.from(value));
+  });
+  it("leaves ambiguous headers and merged data cells ineligible, and rejects fabricated table data or overlapping header edits", async () => {
+    for (const sourceTable of [
+      groupedTable().replace('w:val="restart"', 'w:val="continue"'),
+      groupedTable().replace("<w:t>2</w:t>", "<w:t>1</w:t>"),
+      groupedTable()
+        .replace("<w:t>65%</w:t>", "<w:t></w:t>")
+        .replace(
+          "<w:tc><w:p>",
+          '<w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p>'
+        ),
+    ]) {
+      const inspection = await inspectDocx(await zip(entries(sourceTable)));
+      expect(inspection.tables[0].headerCandidate).toBeUndefined();
+    }
+    const source = await zip(entries(groupedTable())),
+      inspection = await inspectDocx(source),
+      table = inspection.tables[0];
+    const op: DocxRepairOperation = {
+      type: "simplifyTableHeaders",
+      id: table.id,
+      sourceCells: table.cells,
+    };
+    await expect(
+      repair(source, [
+        {
+          ...op,
+          sourceCells: table.cells.map((r, i) =>
+            i === 2 ? r.map(() => "100%") : r
+          ),
+        },
+      ])
+    ).rejects.toHaveProperty("code", "docx_integrity");
+    await expect(
+      repair(source, [
+        op,
+        {
+          type: "setLanguage",
+          id: table.headerCandidate!.headerParagraphIds[1],
+          tag: "en-US",
+          sourceText: "Exams",
+        },
+      ])
+    ).rejects.toHaveProperty("code", "docx_integrity");
+    await expect(
+      repair(source, [
+        op,
+        { type: "setTableHeader", id: table.id, headerTexts: table.cells[0] },
+      ])
+    ).rejects.toHaveProperty("code", "docx_integrity");
+  });
+  it("does not simplify headers containing annotation references or mixed mathematical character formatting", async () => {
+    const annotations = [
+      '<w:commentRangeStart w:id="1"/>',
+      '<w:commentRangeEnd w:id="1"/>',
+      '<w:commentReference w:id="1"/>',
+      '<w:footnoteReference w:id="2"/>',
+      '<w:endnoteReference w:id="2"/>',
+    ];
+    for (const marker of annotations) {
+      const inspection = await inspectDocx(
+        await zip(
+          entries(
+            groupedTable().replace(
+              "<w:t>Exams</w:t>",
+              `${marker}<w:t>Exams</w:t>`
+            )
+          )
+        )
+      );
+      expect(inspection.tables[0].headerCandidate).toBeUndefined();
+    }
+    const mixedLabel = groupedTable().replace(
+      paragraph("Exams"),
+      '<w:p><w:r><w:t>CO</w:t></w:r><w:r><w:rPr><w:vertAlign w:val="subscript"/></w:rPr><w:t>2</w:t></w:r></w:p>'
+    );
+    expect(
+      (await inspectDocx(await zip(entries(mixedLabel)))).tables[0]
+        .headerCandidate
+    ).toBeUndefined();
+  });
   it("inventories stable paragraphs, tables and image anchors with inherited language", async () => {
     const inspection = await inspectDocx(await zip(entries()));
     expect(inspection.paragraphs).toHaveLength(7);
@@ -351,6 +701,19 @@ describe("native Word package repair", () => {
     );
     const source = await zip(parts);
     expect((await repair(source, [])).buffer).toBe(source);
+  });
+  it("rejects external assets disguised as hyperlink relationships", async () => {
+    const parts = entries();
+    parts["word/_rels/document.xml.rels"] = String(
+      parts["word/_rels/document.xml.rels"]
+    ).replace(
+      `Type="${R}/image" Target="media/picture.png"`,
+      `Type="${R}/hyperlink" Target="https://untrusted.invalid/image.png" TargetMode="External"`
+    );
+    await expect(inspectDocx(await zip(parts))).rejects.toHaveProperty(
+      "code",
+      "docx_unsupported"
+    );
   });
   it("does not flag ordinary page-number fields but identifies unsupported fields precisely", async () => {
     const page = `<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> PAGE </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>1</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>`;

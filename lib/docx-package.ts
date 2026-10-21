@@ -20,6 +20,7 @@ import type {
   DocxFinding,
   DocxImage,
   DocxInspection,
+  DocxListCandidate,
   DocxParagraph,
   DocxRepairPlan,
   DocxRepairResult,
@@ -433,6 +434,422 @@ const unsafeContext = (node: Element) =>
     "rPrChange",
   ].some((name) => descendants(node, W, name).length > 0);
 
+const elementXml = (node: Element) =>
+  new XMLSerializer().serializeToString(node);
+function typedPrefix(text: string) {
+  const bullet = text.match(/^([•●▪◦‣▫○■□–-])([ \t]{1,8})(\S[\s\S]*)$/);
+  if (bullet)
+    return {
+      kind: "bullet" as const,
+      marker: bullet[1],
+      separator: bullet[2],
+      prefix: bullet[1] + bullet[2],
+      number: null,
+    };
+  const decimal = text.match(/^([1-9]\d{0,2})([.)])([ \t]{1,8})(\S[\s\S]*)$/);
+  if (decimal)
+    return {
+      kind: "decimal" as const,
+      marker: decimal[2],
+      separator: decimal[3],
+      prefix: decimal[1] + decimal[2] + decimal[3],
+      number: Number(decimal[1]),
+    };
+  return null;
+}
+function prefixNodes(paragraph: Element, prefix: string): Element[] | null {
+  let remaining = prefix;
+  const nodes: Element[] = [];
+  for (const node of Array.from(paragraph.getElementsByTagNameNS(W, "*"))) {
+    if (
+      ancestor(node, W, "p") !== paragraph ||
+      !["t", "tab", "br", "cr", "sym"].includes(node.localName ?? "")
+    )
+      continue;
+    if (!remaining) break;
+    const run = node.parentNode as Element | null;
+    if (
+      ancestor(node, W, "hyperlink") ||
+      run?.namespaceURI !== W ||
+      run.localName !== "r" ||
+      run.parentNode !== paragraph
+    )
+      return null;
+    const text =
+      node.localName === "t"
+        ? (node.textContent ?? "")
+        : node.localName === "tab"
+          ? "\t"
+          : "\n";
+    if (!text || !remaining.startsWith(text.slice(0, remaining.length)))
+      return null;
+    nodes.push(node);
+    remaining = remaining.slice(Math.min(text.length, remaining.length));
+  }
+  return remaining ? null : nodes;
+}
+function collectListCandidates(pkg: Package): DocxListCandidate[] {
+  const paragraphs = pkg.inspection.paragraphs.filter(
+    (p) => p.partName === pkg.main && !p.inTable
+  );
+  const candidates: DocxListCandidate[] = [];
+  let index = 0;
+  const eligible = (p: DocxParagraph) =>
+    p.editable &&
+    !p.list &&
+    !p.headingLevel &&
+    !!typedPrefix(p.text) &&
+    !descendants(pkg.elements.get(p.id)!, W, "drawing").length;
+  while (index < paragraphs.length) {
+    if (!eligible(paragraphs[index])) {
+      index++;
+      continue;
+    }
+    const group = [paragraphs[index++]];
+    const groupPrefix = typedPrefix(group[0].text)!;
+    while (index < paragraphs.length && eligible(paragraphs[index])) {
+      const prev = pkg.elements.get(group.at(-1)!.id)!;
+      const next = pkg.elements.get(paragraphs[index].id)!;
+      const nextPrefix = typedPrefix(paragraphs[index].text)!;
+      if (
+        nextPrefix.kind !== groupPrefix.kind ||
+        nextPrefix.marker !== groupPrefix.marker ||
+        nextPrefix.separator !== groupPrefix.separator ||
+        paragraphs[index].styleId !== group[0].styleId ||
+        prev.parentNode !== next.parentNode ||
+        children(prev.parentNode!).indexOf(next) !==
+          children(prev.parentNode!).indexOf(prev) + 1
+      )
+        break;
+      group.push(paragraphs[index++]);
+    }
+    if (group.length < 2 || group.length > 100) continue;
+    const prefixes = group.map((p) => typedPrefix(p.text)!);
+    const first = prefixes[0];
+    if (
+      prefixes.some(
+        (prefix, i) =>
+          prefix.kind !== first.kind ||
+          prefix.marker !== first.marker ||
+          prefix.separator !== first.separator ||
+          (first.kind === "decimal" && prefix.number !== first.number! + i)
+      )
+    )
+      continue;
+    const nodes = group.map((p, i) =>
+      prefixNodes(pkg.elements.get(p.id)!, prefixes[i].prefix)
+    );
+    if (nodes.some((items) => !items)) continue;
+    const markerFormatting = nodes.map((items) => {
+      const props = direct(items![0].parentNode!, W, "rPr");
+      return props ? elementXml(props) : "";
+    });
+    if (
+      markerFormatting.some((format) => format !== markerFormatting[0]) ||
+      group.some((p) => p.styleId !== group[0].styleId)
+    )
+      continue;
+    candidates.push({
+      id: group[0].id,
+      paragraphIds: group.map((p) => p.id),
+      sourceTexts: group.map((p) => p.text),
+      prefixes: prefixes.map((prefix) => prefix.prefix),
+      kind: first.kind,
+      marker: first.marker,
+      start: first.number,
+    });
+  }
+  return candidates;
+}
+interface HeaderLayout {
+  rows: Element[];
+  labels: string[];
+  selectedCells: Element[];
+  parentCells: Element[];
+  childLabels: string[];
+  headerParagraphs: Element[];
+  gridWidthsTwips: number[];
+  headerHeightsTwips: (number | null)[];
+  indentTwips: number | null;
+  alignment: string | null;
+  bottomPaddingTwips: number[];
+}
+function tableStyleChain(pkg: Package, table: Element): Element[] {
+  const props = direct(table, W, "tblPr");
+  let id = props && value(direct(props, W, "tblStyle"));
+  const name = relationships(pkg, pkg.main).find(
+    (r) => r.type === `${R}/styles`
+  )?.target;
+  const styles = name && pkg.xml.get(name);
+  const result: Element[] = [];
+  const seen = new Set<string>();
+  while (id && styles) {
+    if (seen.has(id) || result.length > 32) integrity();
+    seen.add(id);
+    const style = descendants(styles, W, "style").find(
+      (el) => el.getAttributeNS(W, "styleId") === id
+    );
+    if (!style) break;
+    result.push(style);
+    id = value(direct(style, W, "basedOn"));
+  }
+  return result;
+}
+function headerLayout(table: Element, pkg: Package): HeaderLayout | null {
+  if (
+    unsafeContext(table) ||
+    ancestor(table, W, "tbl") ||
+    descendants(table, W, "tbl").length ||
+    [
+      "drawing",
+      "pict",
+      "object",
+      "hyperlink",
+      "bookmarkStart",
+      "bookmarkEnd",
+      "commentRangeStart",
+      "commentRangeEnd",
+      "commentReference",
+      "footnoteReference",
+      "endnoteReference",
+      "sym",
+      "numPr",
+      "hMerge",
+      "gridBefore",
+      "gridAfter",
+    ].some((name) => descendants(table, W, name).length)
+  )
+    return null;
+  const grid = direct(table, W, "tblGrid");
+  const width = grid
+    ? children(grid).filter(
+        (n) => n.namespaceURI === W && n.localName === "gridCol"
+      ).length
+    : 0;
+  const rows = children(table).filter(
+    (node) => node.namespaceURI === W && node.localName === "tr"
+  );
+  if (width < 2 || width > 20 || rows.length < 3 || rows.length > 100)
+    return null;
+  const cells = rows.map((row) =>
+    children(row).filter(
+      (node) => node.namespaceURI === W && node.localName === "tc"
+    )
+  );
+  if (
+    cells[1].length !== width ||
+    cells
+      .slice(2)
+      .some(
+        (row) =>
+          row.length !== width ||
+          row.some((cell) =>
+            ["gridSpan", "vMerge"].some(
+              (name) => descendants(cell, W, name).length
+            )
+          )
+      )
+  )
+    return null;
+  if (cells[0].length >= width || cells[0].length < 2) return null;
+  const simpleText = (cell: Element) => {
+    const ps = children(cell).filter(
+      (node) => node.namespaceURI === W && node.localName === "p"
+    );
+    return ps.length === 1 &&
+      descendants(ps[0], W, "t").length > 0 &&
+      !/[\r\n\t]/.test(textOf(ps[0]))
+      ? textOf(ps[0])
+      : null;
+  };
+  const labels: string[] = [],
+    childLabels: string[] = [];
+  const selectedCells: Element[] = [],
+    parentCells: Element[] = [];
+  let column = 0;
+  for (const parent of cells[0]) {
+    const text = simpleText(parent);
+    if (!text?.trim() || text !== text.trim() || text.length > 120) return null;
+    const props = direct(parent, W, "tcPr");
+    const spanText = props && value(direct(props, W, "gridSpan"));
+    const span = spanText ? Number(spanText) : 1;
+    const merge = props && direct(props, W, "vMerge");
+    if (
+      !Number.isInteger(span) ||
+      span < 1 ||
+      span > width ||
+      column + span > width
+    )
+      return null;
+    // Parent labels are repeated in each child column. Only uniform plain runs
+    // can be combined without losing emphasis, superscripts or character styles.
+    const labelRuns = descendants(parent, W, "r").filter((run) =>
+      descendants(run, W, "t").some((node) => !!node.textContent)
+    );
+    const labelFormats = labelRuns.map((run) => {
+      const properties = direct(run, W, "rPr");
+      return properties ? elementXml(properties) : "";
+    });
+    if (
+      labelFormats.some((format) => format !== labelFormats[0]) ||
+      labelRuns.some((run) =>
+        children(run).some(
+          (node) =>
+            node.namespaceURI !== W ||
+            !["rPr", "t", "noBreakHyphen", "softHyphen"].includes(
+              node.localName ?? ""
+            )
+        )
+      )
+    )
+      return null;
+    if (span === 1) {
+      const continuation = cells[1][column];
+      const childProps = direct(continuation, W, "tcPr");
+      const childMerge = childProps && direct(childProps, W, "vMerge");
+      if (
+        !merge ||
+        value(merge) !== "restart" ||
+        !childMerge ||
+        ![null, "continue"].includes(value(childMerge)) ||
+        descendants(continuation, W, "p").map(textOf).join("") !== "" ||
+        descendants(continuation, W, "gridSpan").length
+      )
+        return null;
+      labels.push(text);
+      childLabels.push("");
+      selectedCells.push(parent);
+      parentCells.push(parent);
+    } else {
+      if (merge) return null;
+      for (let j = 0; j < span; j++) {
+        const child = cells[1][column + j];
+        const sub = simpleText(child);
+        if (
+          !sub?.trim() ||
+          sub !== sub.trim() ||
+          sub.length > 80 ||
+          descendants(child, W, "gridSpan").length ||
+          descendants(child, W, "vMerge").length
+        )
+          return null;
+        labels.push(`${text} ${sub}`);
+        childLabels.push(sub);
+        selectedCells.push(child);
+        parentCells.push(parent);
+      }
+    }
+    column += span;
+  }
+  if (column !== width || new Set(labels).size !== labels.length) return null;
+  const gridWidthsTwips = children(grid!).map((column) =>
+    Number(column.getAttributeNS(W, "w"))
+  );
+  if (
+    gridWidthsTwips.length !== width ||
+    gridWidthsTwips.some((n) => !Number.isInteger(n) || n <= 0 || n > 31680)
+  )
+    return null;
+  const tableProps = direct(table, W, "tblPr");
+  const styleChain = tableStyleChain(pkg, table);
+  const tableProperties = [
+    tableProps,
+    ...styleChain.map((style) => direct(style, W, "tblPr")),
+  ].filter((p): p is Element => !!p);
+  const border = tableProperties
+    .map((props) => {
+      const borders = direct(props, W, "tblBorders");
+      return borders && direct(borders, W, "insideH");
+    })
+    .find(Boolean);
+  const borderWidth = (el: Element | undefined): number | null => {
+    if (!el || ["nil", "none"].includes(value(el) ?? "")) return 0;
+    const size = Number(el.getAttributeNS(W, "sz"));
+    return Number.isInteger(size) && size >= 0 && size <= 96
+      ? Math.round(size * 2.5)
+      : null;
+  };
+  const margin = (cell: Element, edge: string): number | null => {
+    const props = direct(cell, W, "tcPr");
+    const margins = [
+      props && direct(props, W, "tcMar"),
+      ...tableProperties.map((p) => direct(p, W, "tblCellMar")),
+      ...styleChain.map((s) => {
+        const p = direct(s, W, "tcPr");
+        return p && direct(p, W, "tcMar");
+      }),
+    ];
+    const element = margins.map((m) => m && direct(m, W, edge)).find(Boolean);
+    if (!element || element.getAttributeNS(W, "type") === "nil") return 0;
+    const raw = element.getAttributeNS(W, "w");
+    return (!element.getAttributeNS(W, "type") ||
+      element.getAttributeNS(W, "type") === "dxa") &&
+      /^\d+$/.test(raw ?? "") &&
+      Number(raw) <= 31680
+      ? Number(raw)
+      : null;
+  };
+  const bottomPaddingTwips: number[] = [];
+  for (const [index, cell] of selectedCells.entries()) {
+    const parent = parentCells[index];
+    const parentProps = direct(parent, W, "tcPr"),
+      childProps = direct(cell, W, "tcPr");
+    const parentBorders = parentProps && direct(parentProps, W, "tcBorders"),
+      childBorders = childProps && direct(childProps, W, "tcBorders");
+    const widths = [
+      borderWidth(border),
+      borderWidth(parentBorders && direct(parentBorders, W, "bottom")),
+      borderWidth(childBorders && direct(childBorders, W, "top")),
+    ];
+    const bottom = margin(cell, "bottom"),
+      removedTop = margin(parent, "top"),
+      removedBottom = margin(parent, "bottom");
+    if (
+      widths.some((n) => n === null) ||
+      bottom === null ||
+      removedTop === null ||
+      removedBottom === null
+    )
+      return null;
+    // The line break replaces two text lines. Retain the removed row's cell
+    // padding and shared border as padding so following content does not shift.
+    bottomPaddingTwips.push(
+      cell === parent
+        ? bottom
+        : bottom +
+            removedTop +
+            removedBottom +
+            Math.max(...(widths as number[]))
+    );
+  }
+  const indent = tableProps && direct(tableProps, W, "tblInd");
+  const indentValue = indent?.getAttributeNS(W, "w");
+  const indentTwips =
+    indent?.getAttributeNS(W, "type") === "dxa" &&
+    /^-?\d+$/.test(indentValue ?? "")
+      ? Number(indentValue)
+      : null;
+  return {
+    rows,
+    labels,
+    selectedCells,
+    parentCells,
+    childLabels,
+    headerParagraphs: rows
+      .slice(0, 2)
+      .flatMap((row) => descendants(row, W, "p")),
+    gridWidthsTwips,
+    headerHeightsTwips: rows.slice(0, 2).map((row) => {
+      const props = direct(row, W, "trPr");
+      const raw = props && value(direct(props, W, "trHeight"));
+      return raw && /^\d+$/.test(raw) ? Number(raw) : null;
+    }),
+    indentTwips,
+    alignment: tableProps ? value(direct(tableProps, W, "jc")) : null,
+    bottomPaddingTwips,
+  };
+}
+
 async function openPackage(
   buffer: Buffer,
   maxBytes = LIMITS.input
@@ -490,6 +907,23 @@ async function openPackage(
           ? ""
           : name.replace(/(^|\/)\_rels\/([^/]+)\.rels$/, "$1$2");
       if (source === name || (source && !parts.has(source))) fail();
+      const externalContentReferences = new Set<string>();
+      const sourceXml = xml.get(source);
+      for (const element of sourceXml ? descendants(sourceXml, "*", "*") : [])
+        for (const attribute of Array.from(element.attributes))
+          if (
+            attribute.namespaceURI === R &&
+            !(
+              attribute.localName === "id" &&
+              ((element.namespaceURI === W &&
+                element.localName === "hyperlink") ||
+                (element.namespaceURI === A &&
+                  ["hlinkClick", "hlinkHover"].includes(
+                    element.localName ?? ""
+                  )))
+            )
+          )
+            externalContentReferences.add(attribute.value);
       for (const relationship of relationships(pkg, source)) {
         if (/digital-signature/i.test(relationship.type))
           throw new DocxPackageError(
@@ -506,6 +940,15 @@ async function openPackage(
             "docx_unsupported",
             "This Word file links to an external image, template, or embedded file. Embed that content in Word and upload the saved copy."
           );
+        if (relationship.external) {
+          // A hyperlink relationship must not be reused as a linked image or
+          // embedded object; renderers may follow the target despite its type.
+          if (externalContentReferences.has(relationship.id))
+            throw new DocxPackageError(
+              "docx_unsupported",
+              "This Word file uses an external link as embedded content. Embed that content in Word before uploading."
+            );
+        }
       }
     }
   const mains = relationships(pkg, "").filter(
@@ -783,6 +1226,20 @@ async function openPackage(
         complex,
         editable: story === "document" && !complex && !unsafeContext(table),
       };
+      const candidate = story === "document" ? headerLayout(table, pkg) : null;
+      if (candidate)
+        info.headerCandidate = {
+          headerRows: 2,
+          labels: candidate.labels,
+          sourceCells: cells.map((row) => [...row]),
+          headerParagraphIds: candidate.headerParagraphs
+            .map((paragraph) => paragraphIds.get(paragraph)!)
+            .filter(Boolean),
+          gridWidthsTwips: candidate.gridWidthsTwips,
+          headerHeightsTwips: candidate.headerHeightsTwips,
+          indentTwips: candidate.indentTwips,
+          alignment: candidate.alignment,
+        };
       pkg.inspection.tables.push(info);
       pkg.elements.set(id, table);
     }
@@ -913,6 +1370,7 @@ async function openPackage(
     }
   }
   if (pkg.elements.size > LIMITS.objects) complex();
+  pkg.inspection.listCandidates = collectListCandidates(pkg);
   return pkg;
 }
 function flagAttr(node: Element, name: string): boolean {
@@ -1123,6 +1581,43 @@ export function validateDocxRepairPlan(value: unknown): DocxRepairPlan {
         )
           integrity();
         break;
+      case "convertTypedList":
+        keys(op, ["type", "id", "items"]);
+        if (
+          !Array.isArray(op.items) ||
+          op.items.length < 2 ||
+          op.items.length > 100
+        )
+          integrity();
+        for (const item of op.items) {
+          if (!record(item)) integrity();
+          keys(item, ["paragraphId", "sourceText"]);
+          if (!validId(item.paragraphId) || !boundedText(item.sourceText))
+            integrity();
+        }
+        if (
+          new Set(op.items.map((item) => item.paragraphId)).size !==
+            op.items.length ||
+          op.items[0].paragraphId !== op.id
+        )
+          integrity();
+        break;
+      case "simplifyTableHeaders":
+        keys(op, ["type", "id", "sourceCells"]);
+        if (
+          !Array.isArray(op.sourceCells) ||
+          op.sourceCells.length < 3 ||
+          op.sourceCells.length > 100 ||
+          op.sourceCells.some(
+            (row) =>
+              !Array.isArray(row) ||
+              !row.length ||
+              row.length > 20 ||
+              row.some((text) => !boundedText(text, 0))
+          )
+        )
+          integrity();
+        break;
       default:
         integrity();
     }
@@ -1249,6 +1744,28 @@ function ensureProperty(parent: Element, name: string, first = false): Element {
       "del",
       "trPrChange",
     ],
+    tcPr: [
+      "cnfStyle",
+      "tcW",
+      "gridSpan",
+      "hMerge",
+      "vMerge",
+      "tcBorders",
+      "shd",
+      "noWrap",
+      "tcMar",
+      "textDirection",
+      "tcFitText",
+      "vAlign",
+      "hideMark",
+      "headers",
+      "cellIns",
+      "cellDel",
+      "cellMerge",
+      "tcPrChange",
+    ],
+    tcMar: ["top", "left", "start", "bottom", "right", "end"],
+    numPr: ["ilvl", "numId", "numberingChange", "ins"],
   };
   const order = orders[parent.localName ?? ""];
   const rank = order?.indexOf(name) ?? -1;
@@ -1272,6 +1789,244 @@ function ensureProperty(parent: Element, name: string, first = false): Element {
 }
 function setWordValue(element: Element, value: string) {
   element.setAttributeNS(W, "w:val", value);
+}
+
+function stripTypedPrefix(paragraph: Element, prefix: string): void {
+  const nodes = prefixNodes(paragraph, prefix);
+  if (!nodes) integrity();
+  const original = textOf(paragraph);
+  let remaining = prefix.length;
+  for (const node of nodes) {
+    const text = node.localName === "t" ? (node.textContent ?? "") : "\t";
+    const remove = Math.min(remaining, text.length);
+    if (node.localName === "t") {
+      node.textContent = text.slice(remove);
+      // Existing xml:space is retained; a remaining leading space also needs it.
+      if (/^\s|\s$/.test(text.slice(remove)))
+        node.setAttributeNS(
+          "http://www.w3.org/XML/1998/namespace",
+          "xml:space",
+          "preserve"
+        );
+    } else node.parentNode!.removeChild(node);
+    remaining -= remove;
+  }
+  if (remaining || textOf(paragraph) !== original.slice(prefix.length))
+    integrity();
+}
+
+/** Append one independent native numbering definition. Existing lists retain
+ * every definition and relationship. No model-supplied XML or numbering is used. */
+function addListNumbering(
+  pkg: Package,
+  candidate: DocxListCandidate,
+  touched: Set<string>
+): string {
+  const rels = relationships(pkg, pkg.main).filter(
+    (rel) => rel.type === `${R}/numbering`
+  );
+  if (rels.length > 1) integrity();
+  let name = rels[0]?.target;
+  if (!name) {
+    name = "word/numbering.xml";
+    if (pkg.parts.has(name)) integrity();
+    const document = new DOMParser().parseFromString(
+      `<w:numbering xmlns:w="${W}"/>`,
+      "application/xml"
+    );
+    pkg.xml.set(name, document);
+    pkg.parts.set(name, Buffer.alloc(0));
+    const relName = "word/_rels/document.xml.rels";
+    let relDoc = pkg.xml.get(relName);
+    if (!relDoc) {
+      relDoc = new DOMParser().parseFromString(
+        `<Relationships xmlns="${REL}"/>`,
+        "application/xml"
+      );
+      pkg.xml.set(relName, relDoc);
+      pkg.parts.set(relName, Buffer.alloc(0));
+    }
+    const ids = new Set(
+      children(relDoc.documentElement!).map((el) => el.getAttribute("Id"))
+    );
+    let suffix = 1;
+    while (ids.has(`rDocxList${suffix}`)) suffix++;
+    const relationship = relDoc.createElementNS(REL, "Relationship");
+    relationship.setAttribute("Id", `rDocxList${suffix}`);
+    relationship.setAttribute("Type", `${R}/numbering`);
+    relationship.setAttribute("Target", "numbering.xml");
+    relDoc.documentElement!.appendChild(relationship);
+    touched.add(relName);
+    const types = pkg.xml.get("[Content_Types].xml")!;
+    if (
+      children(types.documentElement!).some(
+        (el) => el.getAttribute("PartName") === `/${name}`
+      )
+    )
+      integrity();
+    const override = types.createElementNS(CT, "Override");
+    override.setAttribute("PartName", `/${name}`);
+    override.setAttribute(
+      "ContentType",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"
+    );
+    types.documentElement!.appendChild(override);
+    touched.add("[Content_Types].xml");
+  }
+  const document = pkg.xml.get(name)!;
+  const root = document.documentElement!;
+  const nextId = (tag: string, attr: string) => {
+    const ids = descendants(root, W, tag).map((el) =>
+      Number(el.getAttributeNS(W, attr))
+    );
+    if (
+      ids.some(
+        (id) => !Number.isSafeInteger(id) || id < 0 || id >= 2_000_000_000
+      )
+    )
+      integrity();
+    return String(Math.max(0, ...ids) + 1);
+  };
+  const abstractId = nextId("abstractNum", "abstractNumId"),
+    numId = nextId("num", "numId");
+  const make = (tag: string, val?: string) => {
+    const el = document.createElementNS(W, `w:${tag}`);
+    if (val !== undefined) setWordValue(el, val);
+    return el;
+  };
+  const abstract = make("abstractNum");
+  abstract.setAttributeNS(W, "w:abstractNumId", abstractId);
+  abstract.appendChild(make("multiLevelType", "singleLevel"));
+  const level = make("lvl");
+  level.setAttributeNS(W, "w:ilvl", "0");
+  const prefix = typedPrefix(candidate.sourceTexts[0])!;
+  level.appendChild(make("start", String(candidate.start ?? 1)));
+  level.appendChild(make("numFmt", candidate.kind));
+  const suffix =
+    prefix.separator === " "
+      ? "space"
+      : prefix.separator === "\t"
+        ? "tab"
+        : "nothing";
+  level.appendChild(make("suff", suffix));
+  level.appendChild(
+    make(
+      "lvlText",
+      (candidate.kind === "bullet"
+        ? candidate.marker
+        : `%1${candidate.marker}`) +
+        (suffix === "nothing" ? prefix.separator : "")
+    )
+  );
+  level.appendChild(make("lvlJc", "left"));
+  const markerNode = prefixNodes(
+    pkg.elements.get(candidate.id)!,
+    candidate.prefixes[0]
+  )![0];
+  const markerProperties = direct(markerNode.parentNode!, W, "rPr");
+  if (markerProperties)
+    level.appendChild(document.importNode(markerProperties, true));
+  abstract.appendChild(level);
+  const firstNum = children(root).find(
+    (node) =>
+      node.namespaceURI === W &&
+      ["num", "numIdMacAtCleanup"].includes(node.localName ?? "")
+  );
+  root.insertBefore(abstract, firstNum ?? null);
+  const num = make("num");
+  num.setAttributeNS(W, "w:numId", numId);
+  num.appendChild(make("abstractNumId", abstractId));
+  root.insertBefore(num, direct(root, W, "numIdMacAtCleanup") ?? null);
+  touched.add(name);
+  return numId;
+}
+
+function simplifyHeaders(element: Element, layout: HeaderLayout): void {
+  const beforeRows = layout.rows.slice(2).map(elementXml);
+  const gridBefore = elementXml(direct(element, W, "tblGrid")!);
+  for (const [index, cell] of layout.selectedCells.entries()) {
+    const props = ensureProperty(cell, "tcPr", true);
+    for (const name of ["vMerge", "gridSpan"]) {
+      const merge = direct(props, W, name);
+      if (merge) props.removeChild(merge);
+    }
+    const parent = layout.parentCells[index];
+    if (cell !== parent) {
+      const paragraph = direct(cell, W, "p")!;
+      const parentParagraph = direct(parent, W, "p")!;
+      const parentLabel = textOf(parentParagraph);
+      const run = element.ownerDocument!.createElementNS(W, "w:r");
+      const parentRun = descendants(parentParagraph, W, "r").find((r) =>
+        descendants(r, W, "t").some((node) => !!node.textContent)
+      );
+      const parentProperties = parentRun && direct(parentRun, W, "rPr");
+      if (parentProperties) run.appendChild(parentProperties.cloneNode(true));
+      const text = element.ownerDocument!.createElementNS(W, "w:t");
+      text.textContent = parentLabel;
+      run.appendChild(text);
+      run.appendChild(element.ownerDocument!.createElementNS(W, "w:br"));
+      paragraph.insertBefore(
+        run,
+        children(paragraph).find(
+          (n) => n.namespaceURI !== W || n.localName !== "pPr"
+        ) ?? null
+      );
+      const parentProps = direct(parent, W, "tcPr");
+      const shading = parentProps && direct(parentProps, W, "shd");
+      if (shading) {
+        const destination = ensureProperty(props, "shd");
+        props.replaceChild(shading.cloneNode(true), destination);
+      }
+      // A copied dark header background needs the original header text color.
+      const color = parentProperties && direct(parentProperties, W, "color");
+      if (color)
+        for (const childRun of descendants(paragraph, W, "r")) {
+          const rp = ensureProperty(childRun, "rPr", true);
+          const dest = ensureProperty(rp, "color");
+          rp.replaceChild(color.cloneNode(true), dest);
+        }
+      const margin = ensureProperty(ensureProperty(props, "tcMar"), "bottom");
+      margin.setAttributeNS(W, "w:w", String(layout.bottomPaddingTwips[index]));
+      margin.setAttributeNS(W, "w:type", "dxa");
+      if (textOf(paragraph) !== `${parentLabel}\n${layout.childLabels[index]}`)
+        integrity();
+    }
+  }
+  const row = layout.rows[0];
+  for (const cell of children(row).filter(
+    (n) => n.namespaceURI === W && n.localName === "tc"
+  ))
+    row.removeChild(cell);
+  for (const cell of layout.selectedCells) row.appendChild(cell);
+  element.removeChild(layout.rows[1]);
+  ensureProperty(
+    ensureProperty(row, "trPr", true),
+    "tblHeader"
+  ).removeAttributeNS(W, "val");
+  if (
+    beforeRows.some((xml, i) => elementXml(layout.rows[i + 2]) !== xml) ||
+    elementXml(direct(element, W, "tblGrid")!) !== gridBefore
+  )
+    integrity();
+}
+
+function outputIdentityMap(pkg: Package): Record<string, string | null> {
+  const current = new Map<Element, string>();
+  const stories = new Set(pkg.inspection.paragraphs.map((p) => p.partName));
+  for (const part of stories) {
+    const document = pkg.xml.get(part)!;
+    for (const [ns, tag, kind] of [
+      [W, "p", "p"],
+      [W, "tbl", "t"],
+      [WP, "docPr", "i"],
+    ])
+      descendants(document, ns, tag).forEach((el, i) =>
+        current.set(el, `${part}:${kind}:${i + 1}`)
+      );
+  }
+  return Object.fromEntries(
+    Array.from(pkg.elements, ([id, el]) => [id, current.get(el) ?? null])
+  );
 }
 async function writeParts(parts: Map<string, Buffer>): Promise<Buffer> {
   const zip = new ZipFile();
@@ -1307,6 +2062,7 @@ export async function applyDocxRepairs(
   const plan = validateDocxRepairPlan(rawPlan);
   const pkg = await openPackage(buffer);
   const before = pkg.inspection;
+  const originalParts = new Map(pkg.parts);
   for (const [reviewed, actual] of [
     [plan.reviewedParagraphIds, before.paragraphs.map((p) => p.id)],
     [plan.reviewedTableIds, before.tables.map((t) => t.id)],
@@ -1319,6 +2075,53 @@ export async function applyDocxRepairs(
       integrity();
   const changes: DocxChange[] = [];
   const touched = new Set<string>();
+  const expectedTexts = new Map(before.paragraphs.map((p) => [p.id, p.text]));
+  const removedParagraphs = new Set<string>();
+  const listParagraphs = new Set<string>();
+  const headerParagraphs = new Set<string>();
+  const expectedTables = new Map(before.tables.map((t) => [t.id, t.cells]));
+  // Structural operations own their entire exact source region. A simultaneous
+  // paragraph edit would otherwise depend on which operation happened first.
+  for (const op of plan.operations) {
+    let ids: string[] = [];
+    if (op.type === "convertTypedList") {
+      const candidate = before.listCandidates?.find((c) => c.id === op.id);
+      if (
+        !candidate ||
+        op.items.length !== candidate.paragraphIds.length ||
+        op.items.some(
+          (item, index) =>
+            item.paragraphId !== candidate.paragraphIds[index] ||
+            item.sourceText !== candidate.sourceTexts[index]
+        )
+      )
+        integrity();
+      ids = candidate.paragraphIds;
+    } else if (op.type === "simplifyTableHeaders") {
+      const candidate = before.tables.find(
+        (t) => t.id === op.id
+      )?.headerCandidate;
+      if (
+        !candidate ||
+        JSON.stringify(op.sourceCells) !== JSON.stringify(candidate.sourceCells)
+      )
+        integrity();
+      ids = candidate.headerParagraphIds;
+      if (plan.operations.some((other) => other !== op && other.id === op.id))
+        integrity();
+    }
+    for (const id of ids) {
+      if (
+        listParagraphs.has(id) ||
+        headerParagraphs.has(id) ||
+        plan.operations.some((other) => other !== op && other.id === id)
+      )
+        integrity();
+      (op.type === "convertTypedList" ? listParagraphs : headerParagraphs).add(
+        id
+      );
+    }
+  }
   for (const op of plan.operations) {
     const element = pkg.elements.get(op.id);
     if (!element) integrity();
@@ -1326,11 +2129,73 @@ export async function applyDocxRepairs(
     const table = before.tables.find((t) => t.id === op.id);
     const image = before.images.find((i) => i.id === op.id);
     const object = paragraph ?? table ?? image;
-    if (!object?.editable) integrity();
+    if (
+      !object ||
+      (!object.editable &&
+        !(op.type === "simplifyTableHeaders" && table?.headerCandidate))
+    )
+      integrity();
     let prior = "";
     let after = "";
     let message = "";
-    if (op.type === "setHeading") {
+    if (op.type === "convertTypedList") {
+      const candidate = before.listCandidates!.find((c) => c.id === op.id)!;
+      const numId = addListNumbering(pkg, candidate, touched);
+      for (const [index, id] of candidate.paragraphIds.entries()) {
+        const target = pkg.elements.get(id)!;
+        // Only the verified prefix is removed. Every remaining run, hyperlink,
+        // and paragraph formatting node keeps its original representation.
+        stripTypedPrefix(target, candidate.prefixes[index]);
+        const bodyBeforeNumbering = children(target)
+          .filter((n) => n.namespaceURI !== W || n.localName !== "pPr")
+          .map(elementXml);
+        const pPr = ensureProperty(target, "pPr", true);
+        const numPr = ensureProperty(pPr, "numPr");
+        setWordValue(ensureProperty(numPr, "ilvl"), "0");
+        setWordValue(ensureProperty(numPr, "numId"), numId);
+        if (
+          JSON.stringify(bodyBeforeNumbering) !==
+          JSON.stringify(
+            children(target)
+              .filter((n) => n.namespaceURI !== W || n.localName !== "pPr")
+              .map(elementXml)
+          )
+        )
+          integrity();
+        expectedTexts.set(
+          id,
+          candidate.sourceTexts[index].slice(candidate.prefixes[index].length)
+        );
+      }
+      prior = candidate.sourceTexts.join("\n");
+      after = "Native Word list with the original markers and item wording";
+      message =
+        "Converted the existing typed list into a native Word list, preserving its item wording and numbering.";
+    } else if (op.type === "simplifyTableHeaders") {
+      const layout = headerLayout(element, pkg);
+      if (!layout || !table?.headerCandidate) integrity();
+      const selected = new Set(
+        layout.selectedCells.flatMap((cell) => descendants(cell, W, "p"))
+      );
+      for (const id of table.headerCandidate.headerParagraphIds) {
+        if (!selected.has(pkg.elements.get(id)!)) removedParagraphs.add(id);
+      }
+      simplifyHeaders(element, layout);
+      for (const id of table.headerCandidate.headerParagraphIds)
+        if (!removedParagraphs.has(id))
+          expectedTexts.set(id, textOf(pkg.elements.get(id)!));
+      expectedTables.set(table.id, [
+        layout.selectedCells.map((cell) => textOf(direct(cell, W, "p")!)),
+        ...table.cells.slice(2),
+      ]);
+      prior = table.cells
+        .slice(0, 2)
+        .map((row) => row.join(" | "))
+        .join("\n");
+      after = layout.labels.join(" | ");
+      message =
+        "Combined the existing grouped column labels into one explicit, unmerged header row, preserving all table data.";
+    } else if (op.type === "setHeading") {
       if (
         !paragraph ||
         paragraph.inTable ||
@@ -1434,6 +2299,11 @@ export async function applyDocxRepairs(
       message,
       before: prior,
       after,
+      ...(op.type === "convertTypedList"
+        ? { paragraphIds: op.items.map((item) => item.paragraphId) }
+        : op.type === "simplifyTableHeaders"
+          ? { paragraphIds: table!.headerCandidate!.headerParagraphIds }
+          : {}),
     });
   }
   if (!changes.length)
@@ -1447,35 +2317,59 @@ export async function applyDocxRepairs(
   for (const name of touched)
     changedParts.set(name, serialize(pkg.xml.get(name)!, pkg.parts.get(name)!));
   const output = await writeParts(changedParts);
+  const identityMap = outputIdentityMap(pkg);
   const reopened = await openPackage(output, LIMITS.output);
   if (reopened.parts.size !== pkg.parts.size) integrity();
-  for (const [name, bytes] of pkg.parts)
+  for (const [name, bytes] of originalParts)
     if (!touched.has(name) && hash(reopened.parts.get(name)!) !== hash(bytes))
       integrity();
-  // No operation can alter source text, images, links, relationships, layout, or IDs.
+  // Every paragraph keeps its source identity, except explicitly removed header
+  // paragraphs. Only declared marker removal and derived header labels may alter
+  // text; structural edits cannot authorize changes elsewhere in the document.
+  if (
+    reopened.inspection.paragraphs.length !==
+    before.paragraphs.length - removedParagraphs.size
+  )
+    integrity();
+  for (const original of before.paragraphs) {
+    const id = identityMap[original.id];
+    if (removedParagraphs.has(original.id)) {
+      if (id !== null) integrity();
+      continue;
+    }
+    const current = reopened.inspection.paragraphs.find((p) => p.id === id);
+    if (
+      !current ||
+      current.text !== expectedTexts.get(original.id) ||
+      current.styleId !== original.styleId ||
+      (!listParagraphs.has(original.id) &&
+        JSON.stringify(current.list) !== JSON.stringify(original.list)) ||
+      (!listParagraphs.has(original.id) &&
+        !headerParagraphs.has(original.id) &&
+        JSON.stringify(current.formatting) !==
+          JSON.stringify(original.formatting))
+    )
+      integrity();
+    if (
+      listParagraphs.has(original.id) &&
+      (!current.list ||
+        current.list.level !== 0 ||
+        current.list.format !== typedPrefix(original.text)?.kind)
+    )
+      integrity();
+  }
   if (
     JSON.stringify(
-      before.paragraphs.map((p) => [
-        p.id,
-        p.text,
-        p.styleId,
-        p.formatting,
-        p.list,
-      ])
+      before.tables.map((t) => [identityMap[t.id], expectedTables.get(t.id)])
     ) !==
-      JSON.stringify(
-        reopened.inspection.paragraphs.map((p) => [
-          p.id,
-          p.text,
-          p.styleId,
-          p.formatting,
-          p.list,
-        ])
-      ) ||
-    JSON.stringify(before.tables.map((t) => [t.id, t.cells])) !==
       JSON.stringify(reopened.inspection.tables.map((t) => [t.id, t.cells])) ||
     JSON.stringify(
-      before.images.map((i) => [i.id, i.name, i.functional, i.title])
+      before.images.map((i) => [
+        identityMap[i.id],
+        i.name,
+        i.functional,
+        i.title,
+      ])
     ) !==
       JSON.stringify(
         reopened.inspection.images.map((i) => [
@@ -1492,14 +2386,20 @@ export async function applyDocxRepairs(
       (item) => item.type === change.type && item.id === change.id
     )!;
     const p = reopened.inspection.paragraphs.find(
-      (item) => item.id === change.id
+      (item) => item.id === identityMap[change.id]
     );
-    const i = reopened.inspection.images.find((item) => item.id === change.id);
-    const t = reopened.inspection.tables.find((item) => item.id === change.id);
+    const i = reopened.inspection.images.find(
+      (item) => item.id === identityMap[change.id]
+    );
+    const t = reopened.inspection.tables.find(
+      (item) => item.id === identityMap[change.id]
+    );
     if (
       (op.type === "setHeading" && p?.headingLevel !== op.level) ||
       (op.type === "setLanguage" && p?.language !== op.tag) ||
       (op.type === "setTableHeader" && !t?.firstRowHeader) ||
+      (op.type === "simplifyTableHeaders" &&
+        (!t?.firstRowHeader || t.complex)) ||
       (op.type === "setImageDescription" && i?.description !== op.text) ||
       (op.type === "setDecorative" && !i?.decorative)
     )
@@ -1510,5 +2410,6 @@ export async function applyDocxRepairs(
     inspection: reopened.inspection,
     findings: checkDocxAccessibility(reopened.inspection),
     changes,
+    identityMap,
   };
 }

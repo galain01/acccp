@@ -14,16 +14,22 @@ repairs while preserving the document's existing appearance and content.
 3. Render the source with the existing private Word rendering service. Use page
    images and native properties as evidence for the model; source content never
    becomes an instruction. The PDF is a preview, not the downloadable result.
-4. Request a complete repair plan for exact source object IDs. The permitted
-   operations are heading outline levels, paragraph language, simple first-row
-   table headers, missing image descriptions and decorative-image metadata.
-   Changes cannot rewrite words, links, table data, styles, media or layouts.
+4. Request a complete repair plan for exact source object IDs. Supported repairs
+   include heading outline levels, paragraph language, table headers, missing
+   image descriptions, decorative-image metadata, typed lists and clear merged
+   header structures. List repairs replace only verified typed markers with
+   native numbering. Table repairs combine existing parent/child labels into
+   explicit column headers while preserving data and column relationships.
+   The model cannot supply arbitrary replacement text, XML, styles or layouts.
 5. Apply validated operations to the original package. Verify unchanged content
    and parts, reopen the result and check that requested properties were written.
 6. Render the repaired file and compare page count, extracted text and decoded
-   page pixels. If a candidate changes layout, undo the potentially visible
-   repairs and verify again. Unverifiable changes are not delivered as repairs;
-   the result explains what was left unchanged.
+   page pixels. Metadata repairs must preserve appearance. List and table
+   repairs may change their own measured regions; the surrounding pixels must
+   still match. Missing or ambiguous region evidence, changed pagination or
+   unrelated layout changes cause rollback and another verification.
+   Unverifiable changes are not delivered as repairs; the result explains what
+   was left unchanged.
 7. Independently audit the actual final file's native inventory and source/output
    page images. Every page and assigned object must be accounted for. Invalid,
    incomplete or failed audits remain visible as review warnings. They cannot
@@ -43,12 +49,15 @@ route's 300-second limit.
 - Existing image descriptions are preserved. Functional images cannot be
   marked decorative. An image needs reliable source evidence before a new
   description is written.
-- Complex/merged tables, manually typed lists, inaccessible linked labels,
-  complex figures needing a long explanation, tracked changes, legacy drawings,
-  text boxes and embedded objects may require human review. Unsupported content
-  is preserved and described at its source location.
-- The app does not rebuild the document from HTML, replace images, simplify
-  tables, redesign pages, or add an automatic repair loop after the audit.
+- Supported typed bullet/numbered lists become native Word lists. Clear grouped
+  column headers become a simple header row with explicit labels. Both repairs
+  are checked against their exact source content and actual rendered output.
+- Ambiguous or unsupported lists/tables, inaccessible linked labels, complex
+  figures needing a long explanation, tracked changes, legacy drawings, text
+  boxes and embedded objects may require human review. Unsupported content is
+  preserved and described at its source location.
+- The app does not rebuild the document from HTML, replace images, redesign
+  pages, or add an automatic repair loop after the audit.
 - Locations use stable paragraph/table/image IDs and nearby words. Preview page
   numbers are shown only when supported by evidence. Word can paginate
   differently with a different font set, printer configuration or application.
@@ -91,3 +100,8 @@ Unit/integration tests cover unsafe packages, source preservation, repair
 contracts, missing audit coverage, layout rollback, failed-call accounting,
 destination dispatch, downloads, and retention. The separate in-memory
 PostgreSQL suite verifies the actual migration and purge without hosted data.
+
+The native-list and simple-table approach follows Microsoft's
+[Word accessibility guidance](https://support.microsoft.com/en-us/accessibility/word/make-your-word-documents-accessible-to-people-with-disabilities).
+Local regression cases cover split-run list markers, ordered starts, rich text
+and hyperlinks, ambiguous merged tables, and already-correct documents.

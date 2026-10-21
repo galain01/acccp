@@ -240,9 +240,10 @@ export default function ConversionResultDialog({
                 Review your updated Word document
               </span>{" "}
               before sharing it. Run Word’s Accessibility Checker and review the
-              changes and remaining questions below. The tool checks that its
-              repairs preserve the rendered layout. Page references use the
-              app’s preview; Word may paginate differently on your computer.
+              changes and remaining questions below. Lists and table headings
+              may have small formatting changes to improve navigation while
+              keeping the surrounding layout. Page references use the app’s
+              preview; Word may paginate differently on your computer.
             </p>
           ) : (
             <p>

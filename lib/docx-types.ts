@@ -40,6 +40,28 @@ export interface DocxTable {
   firstRowHeader: boolean;
   complex: boolean;
   editable: boolean;
+  /** A proven two-row header hierarchy that can become explicit unmerged labels. */
+  headerCandidate?: {
+    headerRows: 2;
+    labels: string[];
+    sourceCells: string[][];
+    headerParagraphIds: string[];
+    gridWidthsTwips: number[];
+    /** null means Word chooses the height from the content. */
+    headerHeightsTwips: (number | null)[];
+    indentTwips: number | null;
+    alignment: string | null;
+  };
+}
+
+export interface DocxListCandidate {
+  id: string;
+  paragraphIds: string[];
+  sourceTexts: string[];
+  prefixes: string[];
+  kind: "bullet" | "decimal";
+  marker: string;
+  start: number | null;
 }
 
 export interface DocxImage {
@@ -65,6 +87,7 @@ export interface DocxInspection {
   images: DocxImage[];
   /** Structural/coverage limitations that a model cannot dismiss. */
   findings: DocxFinding[];
+  listCandidates?: DocxListCandidate[];
 }
 
 export type DocxRepairOperation =
@@ -72,6 +95,12 @@ export type DocxRepairOperation =
   | { type: "setImageDescription"; id: string; text: string }
   | { type: "setDecorative"; id: string; decorative: true }
   | { type: "setTableHeader"; id: string; headerTexts: string[] }
+  | {
+      type: "convertTypedList";
+      id: string;
+      items: { paragraphId: string; sourceText: string }[];
+    }
+  | { type: "simplifyTableHeaders"; id: string; sourceCells: string[][] }
   | { type: "setLanguage"; id: string; tag: string; sourceText: string };
 
 export interface DocxRepairPlan {
@@ -88,6 +117,8 @@ export interface DocxChange {
   message: string;
   before: string;
   after: string;
+  /** Original paragraph IDs for an explicitly authorized structural repair. */
+  paragraphIds?: string[];
 }
 
 export interface DocxRepairResult {
@@ -95,4 +126,6 @@ export interface DocxRepairResult {
   inspection: DocxInspection;
   findings: DocxFinding[];
   changes: DocxChange[];
+  /** Original IDs to actual output IDs; null identifies removed header paragraphs. */
+  identityMap?: Record<string, string | null>;
 }

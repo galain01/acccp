@@ -13,7 +13,12 @@ import type {
   DocxRepairPlan,
   DocxFinding,
   DocxChange,
+  DocxRepairResult,
 } from "./docx-types";
+import {
+  matchWordTextRegion,
+  verifyWordLayout,
+} from "./word-layout-verification";
 import { renderWordToPdf, WordToPdfError } from "./word-to-pdf";
 import {
   renderPdfPages,
@@ -125,9 +130,41 @@ export function completeWordPlan(
         plan.reviewedImageIds,
         inspection.images.map((i) => i.id)
       ) &&
-      plan.operations.every((op) =>
-        allObjects(inspection).some((object) => object.id === op.id)
-      )
+      plan.operations.every((op) => {
+        if (!allObjects(inspection).some((object) => object.id === op.id))
+          return false;
+        if (op.type === "convertTypedList") {
+          const candidate = inspection.listCandidates?.find(
+            (item) => item.id === op.id
+          );
+          return (
+            !!candidate &&
+            candidate.paragraphIds.every((id) =>
+              inspection.paragraphs.some((p) => p.id === id)
+            ) &&
+            op.items.length === candidate.paragraphIds.length &&
+            op.items.every(
+              (item, index) =>
+                item.paragraphId === candidate.paragraphIds[index] &&
+                item.sourceText === candidate.sourceTexts[index]
+            )
+          );
+        }
+        if (op.type === "simplifyTableHeaders") {
+          const candidate = inspection.tables.find(
+            (table) => table.id === op.id
+          )?.headerCandidate;
+          return (
+            !!candidate &&
+            candidate.headerParagraphIds.every((id) =>
+              inspection.paragraphs.some((p) => p.id === id)
+            ) &&
+            JSON.stringify(op.sourceCells) ===
+              JSON.stringify(candidate.sourceCells)
+          );
+        }
+        return true;
+      })
     );
   } catch {
     return false;
@@ -187,7 +224,24 @@ export function wordObjectPages(
   for (const paragraph of inspection.paragraphs)
     result.set(paragraph.id, match(paragraph.text));
   for (const table of inspection.tables)
-    result.set(table.id, match(table.cells.flat().join(" ")));
+    result.set(
+      table.id,
+      rendered.pageCount === 1 && table.partName === "word/document.xml"
+        ? [1]
+        : match(table.cells.flat().join(" "))
+    );
+  for (const table of inspection.tables) {
+    if (!table.headerCandidate) continue;
+    const located = matchWordTextRegion(
+      rendered,
+      table.headerCandidate.sourceCells.slice(0, 2).flat().join(" ")
+    );
+    if (located) {
+      result.set(table.id, [located.pageNumber]);
+      for (const id of table.headerCandidate.headerParagraphIds)
+        result.set(id, [located.pageNumber]);
+    }
+  }
   for (const image of inspection.images) {
     // A main-story drawing in a completely rendered one-page document cannot
     // belong to a different page, even when Word uses a floating anchor. Its
@@ -241,25 +295,60 @@ function batches(
   locations: Map<string, number[]>
 ): WordBatch[] {
   const result: WordBatch[] = [];
-  for (
-    let start = 0;
-    start < rendered.pageCount;
-    start += WORD_MODEL_BATCH_SIZE
-  ) {
-    const pages = rendered.pages.slice(start, start + WORD_MODEL_BATCH_SIZE);
+  const groups = [
+    ...(inspection.listCandidates ?? []).map((item) => item.paragraphIds),
+    ...inspection.tables.flatMap((table) =>
+      table.headerCandidate ? [table.headerCandidate.headerParagraphIds] : []
+    ),
+  ];
+  const spans = groups.flatMap((ids) => {
+    const values = ids.map((id) => locations.get(id) ?? []);
+    if (values.some((pages) => pages.length !== 1)) return [];
+    const first = Math.min(...values.flat());
+    const last = Math.max(...values.flat());
+    return last - first < WORD_MODEL_BATCH_SIZE ? [{ first, last }] : [];
+  });
+  for (let start = 0; start < rendered.pageCount; ) {
+    let end = Math.min(start + WORD_MODEL_BATCH_SIZE, rendered.pageCount);
+    // A supported group is offered only when every affected object and page
+    // fits together in one request. Never split a native structural operation.
+    for (;;) {
+      const crossing = spans.filter(
+        (span) => span.first > start + 1 && span.first <= end && span.last > end
+      );
+      if (!crossing.length) break;
+      end = Math.min(...crossing.map((span) => span.first - 1));
+    }
+    const pages = rendered.pages.slice(start, end);
+    const pageNumbers = new Set(pages.map((page) => page.pageNumber));
     const assigned = (id: string) =>
-      Math.floor(
-        ((locations.get(id)?.[0] ?? 1) - 1) / WORD_MODEL_BATCH_SIZE
-      ) === result.length;
+      pageNumbers.has(locations.get(id)?.[0] ?? 1);
+    const whollyAssigned = (ids: string[]) =>
+      ids.every((id) => (locations.get(id)?.length ?? 0) === 1 && assigned(id));
     result.push({
       pages,
       inspection: {
         paragraphs: inspection.paragraphs.filter((p) => assigned(p.id)),
-        tables: inspection.tables.filter((t) => assigned(t.id)),
+        tables: inspection.tables
+          .filter((t) => assigned(t.id))
+          .map((table) => {
+            if (
+              !table.headerCandidate ||
+              whollyAssigned(table.headerCandidate.headerParagraphIds)
+            )
+              return table;
+            const withoutCandidate = { ...table };
+            delete withoutCandidate.headerCandidate;
+            return withoutCandidate;
+          }),
         images: inspection.images.filter((i) => assigned(i.id)),
         findings: [],
+        listCandidates: inspection.listCandidates?.filter((list) =>
+          whollyAssigned(list.paragraphIds)
+        ),
       },
     });
+    start = end;
   }
   return result;
 }
@@ -497,6 +586,91 @@ export function mergeWordFindings(...stages: WordFinding[][]): WordFinding[] {
 function unique(findings: WordFinding[]): WordFinding[] {
   return mergeWordFindings(findings);
 }
+function mappedId(
+  id: string,
+  source: DocxInspection,
+  repaired: DocxRepairResult
+): string | null {
+  if (!repaired.identityMap) return id;
+  const actual = repaired.identityMap[id];
+  if (actual) return actual;
+  // A removed parent header is represented by the table's combined labels.
+  const table = source.tables.find((item) =>
+    item.headerCandidate?.headerParagraphIds.includes(id)
+  );
+  return table ? (repaired.identityMap[table.id] ?? null) : null;
+}
+export function remapWordFindings(
+  findings: WordFinding[],
+  source: DocxInspection,
+  repaired: DocxRepairResult
+): WordFinding[] {
+  return findings.map((finding) => {
+    if (!finding.objectId) return finding;
+    const id = mappedId(finding.objectId, source, repaired);
+    const object = allObjects(repaired.inspection).find(
+      (item) => item.id === id
+    );
+    const rest = { ...finding };
+    delete rest.objectId;
+    delete rest.pageNumber;
+    return {
+      ...rest,
+      ...(object ? { objectId: object.id, location: object.location } : {}),
+    };
+  });
+}
+/** Clear only pre-repair concerns proven repaired and independently reviewed.
+ * Actual reopened machine findings and final audit findings bypass this filter. */
+export function unresolvedWordProposals(
+  findings: WordFinding[],
+  source: DocxInspection,
+  repaired: DocxRepairResult,
+  audited: Set<string>
+): WordFinding[] {
+  return findings.filter((finding) => {
+    if (!finding.objectId) return true;
+    const target = mappedId(finding.objectId, source, repaired);
+    if (!target || !audited.has(target)) return true;
+    const code = WORD_MACHINE_FINDING_CODES[finding.code] ?? finding.code;
+    return !repaired.changes.some((change) => {
+      if (change.before === change.after) return false;
+      if (
+        change.type === "convertTypedList" &&
+        code === "list-structure" &&
+        change.paragraphIds?.includes(finding.objectId!)
+      ) {
+        return !!repaired.inspection.paragraphs.find((p) => p.id === target)
+          ?.list;
+      }
+      if (
+        change.type === "simplifyTableHeaders" &&
+        ["complex-table", "table-headers"].includes(code) &&
+        (change.id === finding.objectId ||
+          change.paragraphIds?.includes(finding.objectId!))
+      ) {
+        const tableId = mappedId(change.id, source, repaired);
+        const table = repaired.inspection.tables.find(
+          (item) => item.id === tableId
+        );
+        return (
+          !!table &&
+          audited.has(table.id) &&
+          !table.complex &&
+          table.firstRowHeader
+        );
+      }
+      if (change.id !== finding.objectId) return false;
+      return (
+        (change.type === "setTableHeader" && code === "table-headers") ||
+        (change.type === "setImageDescription" && code === "missing-alt") ||
+        (change.type === "setDecorative" && code === "missing-alt") ||
+        (change.type === "setHeading" && code === "heading-hierarchy") ||
+        (change.type === "setLanguage" && code === "language")
+      );
+    });
+  });
+}
 function forUi(
   finding: WordFinding,
   inspection: DocxInspection,
@@ -575,6 +749,12 @@ export function describeWordChange(
     case "setDecorative":
       detail = `Marked “${summaryText(image?.name || "this image", 100)}” as decorative so reading software skips it.`;
       break;
+    case "convertTypedList":
+      detail = `Made the ${change.paragraphIds?.length ?? ""} items beginning ${quotedParagraph} a native Word list so reading software recognizes the items and their order.`;
+      break;
+    case "simplifyTableHeaders":
+      detail = `Replaced the merged header with individual column labels “${summaryText(change.after, 240)}”, preserving the table's data.`;
+      break;
   }
   return summaryText(`${location}: ${detail}`, 500);
 }
@@ -603,6 +783,7 @@ export async function repairWord(
     needTime(6000);
     const images = await renderPdfPages(pdf, {
       timeoutMs: Math.min(90_000, remaining()),
+      includeTextRegions: true,
     });
     if (
       !images.pageCount ||
@@ -709,11 +890,76 @@ export async function repairWord(
     stage = "docx_prepare";
     let repaired = await applyDocxRepairs(buffer, plan);
     let outputEvidence = sourceEvidence;
+    const layoutVerified = async () =>
+      repaired.changes.some(
+        (change) =>
+          change.type === "convertTypedList" ||
+          change.type === "simplifyTableHeaders"
+      )
+        ? await verifyWordLayout(
+            sourceEvidence.images,
+            outputEvidence.images,
+            source,
+            repaired
+          )
+        : await sameWordLayout(sourceEvidence.images, outputEvidence.images);
+    const reverted = (operations: DocxRepairPlan["operations"]) => {
+      for (const op of operations)
+        retained.push({
+          code: "layout-repair-reverted",
+          severity: "warning",
+          objectId: op.id,
+          location:
+            allObjects(source).find((o) => o.id === op.id)?.location ??
+            "Document",
+          message:
+            "This proposed repair was undone because its visible changes could not be confined to the intended list or table, or it changed the original page layout.",
+          suggestion:
+            "Review this item in Word and apply the accessibility fix while checking its layout.",
+        });
+    };
     try {
       outputEvidence = await render(repaired.buffer);
+      let layoutOkay = await layoutVerified();
       if (
-        !(await sameWordLayout(sourceEvidence.images, outputEvidence.images))
+        !layoutOkay &&
+        plan.operations.some((op) => op.type === "simplifyTableHeaders") &&
+        plan.operations.some((op) => op.type === "convertTypedList")
       ) {
+        // A table's layout failure must not discard an independently safe list.
+        // Each retry remains inside the existing rendering/workflow deadline.
+        const tables = plan.operations.filter(
+          (op) => op.type === "simplifyTableHeaders"
+        );
+        reverted(tables);
+        plan.operations = plan.operations.filter(
+          (op) => op.type !== "simplifyTableHeaders"
+        );
+        repaired = await applyDocxRepairs(buffer, plan);
+        outputEvidence = await render(repaired.buffer);
+        layoutOkay = await layoutVerified();
+      }
+      if (
+        !layoutOkay &&
+        plan.operations.some(
+          (op) =>
+            op.type === "convertTypedList" || op.type === "simplifyTableHeaders"
+        )
+      ) {
+        const structural = plan.operations.filter(
+          (op) =>
+            op.type === "convertTypedList" || op.type === "simplifyTableHeaders"
+        );
+        reverted(structural);
+        plan.operations = plan.operations.filter(
+          (op) =>
+            op.type !== "convertTypedList" && op.type !== "simplifyTableHeaders"
+        );
+        repaired = await applyDocxRepairs(buffer, plan);
+        outputEvidence = await render(repaired.buffer);
+        layoutOkay = await layoutVerified();
+      }
+      if (!layoutOkay) {
         const metadataPlan = {
           ...plan,
           operations: plan.operations.filter(
@@ -721,22 +967,12 @@ export async function repairWord(
               op.type === "setImageDescription" || op.type === "setDecorative"
           ),
         };
-        for (const op of plan.operations.filter(
-          (op) =>
-            op.type !== "setImageDescription" && op.type !== "setDecorative"
-        ))
-          retained.push({
-            code: "layout-repair-reverted",
-            severity: "warning",
-            objectId: op.id,
-            location:
-              allObjects(source).find((o) => o.id === op.id)?.location ??
-              "Document",
-            message:
-              "This proposed repair was undone because the repaired document changed the original page appearance or pagination.",
-            suggestion:
-              "Review this item in Word and apply the accessibility fix while checking its layout.",
-          });
+        reverted(
+          plan.operations.filter(
+            (op) =>
+              op.type !== "setImageDescription" && op.type !== "setDecorative"
+          )
+        );
         repaired = await applyDocxRepairs(buffer, metadataPlan);
         outputEvidence = await render(repaired.buffer);
         if (
@@ -785,16 +1021,57 @@ export async function repairWord(
       ...repaired,
       inspection: await inspectDocx(repaired.buffer, { generated: true }),
     };
+    const outputLocations = wordObjectPages(
+      repaired.inspection,
+      outputEvidence.images
+    );
+    for (const change of repaired.changes) {
+      if (change.type !== "simplifyTableHeaders") continue;
+      const tableId = mappedId(change.id, source, repaired);
+      const actualTable = repaired.inspection.tables.find(
+        (table) => table.id === tableId
+      );
+      if (!actualTable) continue;
+      // Structural verification already proved this table stays on one page.
+      // Its exact unchanged body is unique measured output evidence even when
+      // the new column labels are extracted in visual row order.
+      const located = matchWordTextRegion(
+        outputEvidence.images,
+        actualTable.cells.slice(1).flat().join(" ")
+      );
+      if (located) outputLocations.set(actualTable.id, [located.pageNumber]);
+    }
+    // Header cells can render row-wise even though their native text is stored
+    // cell-wise. Use verified package lineage and the ACTUAL table location,
+    // never an original positional paragraph ID or stale source page mapping.
+    for (const table of source.tables) {
+      if (!table.headerCandidate) continue;
+      const tableId = mappedId(table.id, source, repaired);
+      const pages = tableId ? outputLocations.get(tableId) : undefined;
+      if (pages?.length !== 1) continue;
+      for (const originalId of table.headerCandidate.headerParagraphIds) {
+        const actualId = repaired.identityMap
+          ? repaired.identityMap[originalId]
+          : originalId;
+        if (
+          actualId &&
+          repaired.inspection.paragraphs.some(
+            (p) => p.id === actualId && p.inTable
+          )
+        )
+          outputLocations.set(actualId, pages);
+      }
+    }
     const machine = unique([
       ...repaired.inspection.findings,
       ...checkDocxAccessibility(repaired.inspection),
-      ...retained,
+      ...remapWordFindings(retained, source, repaired),
     ]);
     stage = "docx_audit";
     const outputBatches = batches(
       repaired.inspection,
       outputEvidence.images,
-      locations
+      outputLocations
     );
     const auditUsage: ModelCallUsage[] = [];
     const audits = await pool(
@@ -806,16 +1083,42 @@ export async function repairWord(
           allObjects(batch.inspection).map((o) => o.id)
         );
         const sourceInventory = {
-          paragraphs: source.paragraphs.filter((p) => sourceIds.has(p.id)),
-          tables: source.tables.filter((t) => sourceIds.has(t.id)),
-          images: source.images.filter((i) => sourceIds.has(i.id)),
+          paragraphs: source.paragraphs
+            .filter((p) =>
+              sourceIds.has(mappedId(p.id, source, repaired) ?? "")
+            )
+            .map((p) => ({
+              ...p,
+              sourceId: p.id,
+              outputId:
+                repaired.identityMap?.[p.id] ??
+                (repaired.identityMap ? null : p.id),
+            })),
+          tables: source.tables
+            .filter((t) =>
+              sourceIds.has(mappedId(t.id, source, repaired) ?? "")
+            )
+            .map((t) => ({
+              ...t,
+              sourceId: t.id,
+              outputId: mappedId(t.id, source, repaired),
+            })),
+          images: source.images
+            .filter((i) =>
+              sourceIds.has(mappedId(i.id, source, repaired) ?? "")
+            )
+            .map((i) => ({
+              ...i,
+              sourceId: i.id,
+              outputId: mappedId(i.id, source, repaired),
+            })),
         };
         const call = await callLiteLLM(
           WORD_AUDIT_PROMPT,
           [
             {
               type: "text",
-              text: `${scope(batch, locations)}\nOriginal native inventory (untrusted source):\n${JSON.stringify(sourceInventory)}\nActual reopened output heading context:\n${context(repaired.inspection)}\nApp-retained machine findings (cannot be dismissed):\n${JSON.stringify(machine.filter((f) => !f.objectId || sourceIds.has(f.objectId)))}`,
+              text: `${scope(batch, outputLocations)}\nOriginal native inventory (untrusted source; sourceId/outputId pair identities, null outputId means a header paragraph incorporated into its table):\n${JSON.stringify(sourceInventory)}\nActual reopened output heading context:\n${context(repaired.inspection)}\nApp-retained machine findings (cannot be dismissed):\n${JSON.stringify(machine.filter((f) => !f.objectId || sourceIds.has(f.objectId)))}`,
             },
             ...visual(
               sourceEvidence.images.pages.filter((p) =>
@@ -865,7 +1168,11 @@ export async function repairWord(
           )
         )
           throw new WordPlanError();
-        const findings = parseWordFindings(response.findings, batch, locations);
+        const findings = parseWordFindings(
+          response.findings,
+          batch,
+          outputLocations
+        );
         if (!findings) throw new WordPlanError();
         return findings;
       },
@@ -873,9 +1180,13 @@ export async function repairWord(
     );
     calls.push(...auditUsage.filter(Boolean));
     const finalFindings: WordFinding[] = [];
+    const audited = new Set<string>();
     audits.forEach((audit, index) => {
-      if (audit.status === "fulfilled") finalFindings.push(...audit.value);
-      else
+      if (audit.status === "fulfilled") {
+        finalFindings.push(...audit.value);
+        for (const object of allObjects(outputBatches[index].inspection))
+          audited.add(object.id);
+      } else
         finalFindings.push({
           code: "audit-incomplete",
           severity: "warning",
@@ -887,9 +1198,16 @@ export async function repairWord(
             "Review these pages with Word's Accessibility Checker and check the remaining findings before sharing, or try the document again.",
         });
     });
-    const errors = mergeWordFindings(machine, proposed, finalFindings).map(
-      (finding) => forUi(finding, repaired.inspection, locations)
+    const remainingProposals = remapWordFindings(
+      unresolvedWordProposals(proposed, source, repaired, audited),
+      source,
+      repaired
     );
+    const errors = mergeWordFindings(
+      machine,
+      remainingProposals,
+      finalFindings
+    ).map((finding) => forUi(finding, repaired.inspection, outputLocations));
     return {
       docx: repaired.buffer,
       errors,

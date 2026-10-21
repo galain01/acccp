@@ -33,6 +33,16 @@ export interface RenderedPdfPage {
   /** Null means optional text extraction was unavailable or exceeded its bounds. */
   text: string | null;
   imageAlternatives: PdfImageAlternatives;
+  /** Optional bounded physical text boxes for native Word layout verification. */
+  textRegions?: PdfTextRegion[] | null;
+}
+
+export interface PdfTextRegion {
+  text: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 }
 
 export interface RenderedPdf {
@@ -55,6 +65,8 @@ export const PDF_RENDERING_LIMITS = Object.freeze({
   maxTotalPngBytes: 24 * 1024 * 1024,
   maxPageTextChars: 100_000,
   maxTotalTextChars: 500_000,
+  maxPageTextRegions: 5000,
+  maxTotalTextRegions: 20_000,
   maxFiguresPerPage: 100,
   maxFigures: 500,
   maxAltChars: 8_000,
@@ -207,10 +219,66 @@ const MAX_STDOUT_BYTES =
   PDF_RENDERING_LIMITS.maxTotalAltChars * 6 +
   PDF_RENDERING_LIMITS.maxFigures * 256 +
   64 * 1024;
+const MAX_TEXT_REGION_BYTES =
+  PDF_RENDERING_LIMITS.maxTotalTextChars * 6 +
+  PDF_RENDERING_LIMITS.maxTotalTextRegions * 256;
 const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseTextRegions(
+  value: unknown,
+  width: number,
+  height: number,
+  budget: { count: number; chars: number }
+): PdfTextRegion[] | null {
+  if (
+    !Array.isArray(value) ||
+    value.length > PDF_RENDERING_LIMITS.maxPageTextRegions ||
+    budget.count + value.length > PDF_RENDERING_LIMITS.maxTotalTextRegions
+  )
+    return null;
+  const regions: PdfTextRegion[] = [];
+  let chars = 0;
+  for (const item of value) {
+    if (
+      !isRecord(item) ||
+      Object.keys(item).some(
+        (key) => !["text", "x", "y", "width", "height"].includes(key)
+      ) ||
+      typeof item.text !== "string" ||
+      !item.text.trim() ||
+      item.text.length > PDF_RENDERING_LIMITS.maxPageTextChars ||
+      ![item.x, item.y, item.width, item.height].every(
+        (n) => typeof n === "number" && Number.isFinite(n)
+      ) ||
+      Number(item.x) < 0 ||
+      Number(item.y) < 0 ||
+      Number(item.width) <= 0 ||
+      Number(item.height) <= 0 ||
+      Number(item.x) + Number(item.width) > width + 0.001 ||
+      Number(item.y) + Number(item.height) > height + 0.001
+    )
+      return null;
+    chars += item.text.length;
+    if (
+      chars > PDF_RENDERING_LIMITS.maxPageTextChars ||
+      budget.chars + chars > PDF_RENDERING_LIMITS.maxTotalTextChars
+    )
+      return null;
+    regions.push({
+      text: item.text,
+      x: Number(item.x),
+      y: Number(item.y),
+      width: Number(item.width),
+      height: Number(item.height),
+    });
+  }
+  budget.count += regions.length;
+  budget.chars += chars;
+  return regions;
 }
 
 function parseFailure(value: Record<string, unknown>): JobDiagnostic {
@@ -314,6 +382,7 @@ function parseResult(value: unknown): RenderedPdf {
   let totalBytes = 0;
   let totalPixels = 0;
   let totalTextChars = 0;
+  const regionBudget = { count: 0, chars: 0 };
   const alternativeBudget = { figures: 0, chars: 0 };
   const pages = value.pages.map((page: unknown, index): RenderedPdfPage => {
     if (!isRecord(page)) throw renderingError("pdf_protocol_error");
@@ -358,7 +427,19 @@ function parseResult(value: unknown): RenderedPdf {
       pageNumber,
       alternativeBudget
     );
-    return { pageNumber, width, height, png, text, imageAlternatives };
+    const textRegions =
+      page.textRegions === undefined
+        ? undefined
+        : parseTextRegions(page.textRegions, width, height, regionBudget);
+    return {
+      pageNumber,
+      width,
+      height,
+      png,
+      text,
+      imageAlternatives,
+      ...(textRegions === undefined ? {} : { textRegions }),
+    };
   });
   return { pageCount: value.pageCount, pages };
 }
@@ -374,11 +455,17 @@ export async function renderPdfPages(
     timeoutMs?: number;
     /** Server-selected origin; never accept this option from upload metadata. */
     inputKind?: "uploaded-pdf" | "powerpoint-preview";
+    includeTextRegions?: boolean;
   } = {}
 ): Promise<RenderedPdf> {
   const started = performance.now();
   const elapsed = () => Math.max(0, Math.round(performance.now() - started));
   const timeout = options.timeoutMs;
+  if (
+    options.includeTextRegions !== undefined &&
+    typeof options.includeTextRegions !== "boolean"
+  )
+    throw new RangeError("Text region evidence must be a boolean option.");
   if (
     timeout !== undefined &&
     (!Number.isFinite(timeout) ||
@@ -417,7 +504,10 @@ export async function renderPdfPages(
     if (requestDeadline !== undefined && performance.now() >= requestDeadline)
       throw renderingError("pdf_timeout", undefined, elapsed());
     // Queued requests retain only their original bytes, not another base64 copy.
-    const request = JSON.stringify({ pdf: buffer.toString("base64") });
+    const request = JSON.stringify({
+      pdf: buffer.toString("base64"),
+      ...(options.includeTextRegions ? { includeTextRegions: true } : {}),
+    });
     if (Buffer.byteLength(request) > maxStdinBytes)
       throw renderingError("pdf_invalid", undefined, elapsed());
     const root = process.cwd();
@@ -481,7 +571,12 @@ export async function renderPdfPages(
       );
       child.stdout?.on("data", (chunk: Buffer) => {
         stdoutBytes += chunk.length;
-        if (stdoutBytes > MAX_STDOUT_BYTES) stop("pdf_output_limit");
+        if (
+          stdoutBytes >
+          MAX_STDOUT_BYTES +
+            (options.includeTextRegions ? MAX_TEXT_REGION_BYTES : 0)
+        )
+          stop("pdf_output_limit");
         else if (!failureCode) chunks.push(chunk);
       });
       child.stderr?.on("data", (chunk: Buffer) => {

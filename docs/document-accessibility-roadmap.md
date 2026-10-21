@@ -72,10 +72,11 @@ Office repairs; they are not the editable output.
 See [native Word repair](word-accessibility.md) for the pipeline, supported
 operations, limits, storage and migration. The engine patches original OOXML,
 checks content/parts, reopens and renders the actual output, and independently
-audits its metadata and pages. Its strict preservation mode rolls back repairs
-that change rendered pixels or pagination. Complex structures remain review
-items. The result offers a native download, change summary and actionable
-findings; per-change keep/restore is future work.
+audits its metadata and pages. Metadata repairs preserve rendered appearance;
+typed-list and clear table-header repairs permit changes inside their measured
+regions while preserving surrounding layout and pagination. Unsupported or
+ambiguous structures remain review items. The result offers a native download,
+change summary and actionable findings; per-change keep/restore is future work.
 
 Local evaluation uses controlled and instructor files with independent OpenXML
 SDK, package-preservation and visual comparisons. Word Accessibility Checker

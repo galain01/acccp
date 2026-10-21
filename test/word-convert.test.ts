@@ -49,6 +49,8 @@ import {
   wordObjectPages,
   mergeWordFindings,
   describeWordChange,
+  remapWordFindings,
+  unresolvedWordProposals,
 } from "../lib/word-convert";
 import { LiteLLMError } from "../lib/litellm";
 import { WORD_AUDIT_PROMPT } from "../lib/prompts/word-accessibility";
@@ -171,6 +173,368 @@ beforeEach(() => {
 });
 
 describe("native Word repair and independent audit", () => {
+  it("keeps a verified native list when a separate table repair cannot preserve its layout", async () => {
+    const paragraphs = [
+      paragraph(1, "• First item"),
+      paragraph(2, "• Second item"),
+      { ...paragraph(3, "Parent Other"), inTable: true },
+      { ...paragraph(4, "First Second"), inTable: true },
+    ];
+    const table = {
+      id: "word/document.xml:t:1",
+      partName: "word/document.xml",
+      index: 1,
+      location: "Table 1",
+      cells: [
+        ["Parent", "Other"],
+        ["First", "Second"],
+        ["15", "85"],
+      ],
+      firstRowHeader: false,
+      complex: true,
+      editable: false,
+      headerCandidate: {
+        headerRows: 2 as const,
+        labels: ["Parent First", "Other Second"],
+        sourceCells: [
+          ["Parent", "Other"],
+          ["First", "Second"],
+          ["15", "85"],
+        ],
+        headerParagraphIds: [paragraphs[2].id, paragraphs[3].id],
+        gridWidthsTwips: [2000, 2000],
+        headerHeightsTwips: [null, null],
+        indentTwips: null,
+        alignment: null,
+      },
+    };
+    const original: DocxInspection = {
+      ...source,
+      paragraphs,
+      tables: [table],
+      listCandidates: [
+        {
+          id: paragraphs[0].id,
+          paragraphIds: paragraphs.slice(0, 2).map((p) => p.id),
+          sourceTexts: paragraphs.slice(0, 2).map((p) => p.text),
+          prefixes: ["• ", "• "],
+          kind: "bullet",
+          marker: "•",
+          start: null,
+        },
+      ],
+    };
+    const actual: DocxInspection = {
+      ...original,
+      paragraphs: paragraphs.map((p, i) =>
+        i < 2
+          ? {
+              ...p,
+              text: p.text.slice(2),
+              list: { numId: "1", level: 0, format: "bullet", markerText: "•" },
+            }
+          : p
+      ),
+      listCandidates: [],
+    };
+    const listChange: DocxChange = {
+      type: "convertTypedList",
+      id: paragraphs[0].id,
+      paragraphIds: paragraphs.slice(0, 2).map((p) => p.id),
+      location: "Paragraph 1",
+      message: "Converted list.",
+      before: "Typed list",
+      after: "Native list",
+    };
+    const tableChange: DocxChange = {
+      type: "simplifyTableHeaders",
+      id: table.id,
+      paragraphIds: table.headerCandidate.headerParagraphIds,
+      location: table.location,
+      message: "Combined headers.",
+      before: "Merged headers",
+      after: "Individual labels",
+    };
+    mocks.inspect.mockResolvedValueOnce(original).mockResolvedValue(actual);
+    mocks.apply
+      .mockResolvedValueOnce({
+        buffer: Buffer.from("PK\x03\x04unverified"),
+        inspection: {
+          ...actual,
+          tables: [
+            {
+              ...table,
+              complex: false,
+              firstRowHeader: true,
+              cells: [table.headerCandidate.labels, table.cells[2]],
+            },
+          ],
+        },
+        findings: [],
+        changes: [listChange, tableChange],
+      })
+      .mockResolvedValue({
+        buffer: output,
+        inspection: actual,
+        findings: [],
+        changes: [listChange],
+      });
+    const evidence = pages();
+    evidence.pages[0].text = paragraphs.map((p) => p.text).join("\n");
+    mocks.pages.mockResolvedValue(evidence);
+    mocks.call.mockImplementation((prompt, parts) => {
+      const value = JSON.parse(goodCall(prompt, parts).content);
+      if (prompt !== WORD_AUDIT_PROMPT)
+        value.operations = [
+          {
+            type: "convertTypedList",
+            id: paragraphs[0].id,
+            items: paragraphs
+              .slice(0, 2)
+              .map((p) => ({ paragraphId: p.id, sourceText: p.text })),
+          },
+          {
+            type: "simplifyTableHeaders",
+            id: table.id,
+            sourceCells: table.cells,
+          },
+        ];
+      return response(value);
+    });
+    const result = await repairWord(input, "course.docx");
+    if ("error" in result) throw Error(result.error);
+    expect(mocks.apply).toHaveBeenCalledTimes(2);
+    expect(
+      mocks.apply.mock.calls[1][1].operations.map(
+        (op: { type: string }) => op.type
+      )
+    ).toEqual(["convertTypedList"]);
+    expect(result.changes).toHaveLength(1);
+    expect(result.changes[0]).toContain("native Word list");
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0].message).toContain("undone");
+  });
+  it("keeps an entire candidate list together across the normal eighth-page boundary", async () => {
+    const inspection: DocxInspection = {
+      ...source,
+      paragraphs: Array.from({ length: 9 }, (_, i) => paragraph(i + 1)),
+      listCandidates: [
+        {
+          id: paragraph(8).id,
+          paragraphIds: [paragraph(8).id, paragraph(9).id],
+          sourceTexts: [paragraph(8).text, paragraph(9).text],
+          prefixes: ["", ""],
+          kind: "bullet",
+          marker: "•",
+          start: null,
+        },
+      ],
+    };
+    mocks.inspect.mockResolvedValue(inspection);
+    mocks.pages.mockResolvedValue(pages(9));
+    mocks.apply.mockResolvedValue({
+      buffer: output,
+      inspection,
+      findings: [],
+      changes: [],
+    });
+    const result = await repairWord(input, "course.docx");
+    expect(result).toHaveProperty("docx");
+    const requests = mocks.call.mock.calls
+      .filter(([prompt]) => prompt !== WORD_AUDIT_PROMPT)
+      .map(([, parts]) => assigned(parts));
+    expect(requests.map((r) => r.pages)).toEqual([
+      [1, 2, 3, 4, 5, 6, 7],
+      [8, 9],
+    ]);
+    expect(requests[0].inspection.listCandidates).toEqual([]);
+    expect(requests[1].inspection.listCandidates?.[0].paragraphIds).toEqual([
+      paragraph(8).id,
+      paragraph(9).id,
+    ]);
+  });
+  it("requires the full exact candidate and all affected IDs before accepting a typed-list plan", () => {
+    const first = { ...paragraph(1), text: "• First" };
+    const second = { ...paragraph(2), text: "• Second" };
+    const inspection: DocxInspection = {
+      ...source,
+      paragraphs: [first, second],
+      listCandidates: [
+        {
+          id: first.id,
+          paragraphIds: [first.id, second.id],
+          sourceTexts: [first.text, second.text],
+          prefixes: ["• ", "• "],
+          kind: "bullet",
+          marker: "•",
+          start: null,
+        },
+      ],
+    };
+    const plan: DocxRepairPlan = {
+      ...planFor(inspection),
+      operations: [
+        {
+          type: "convertTypedList",
+          id: first.id,
+          items: inspection.paragraphs.map((p) => ({
+            paragraphId: p.id,
+            sourceText: p.text,
+          })),
+        },
+      ],
+    };
+    expect(completeWordPlan(plan, inspection)).toBe(true);
+    const reordered = structuredClone(plan);
+    if (reordered.operations[0].type !== "convertTypedList") throw Error();
+    reordered.operations[0].items = reordered.operations[0].items.map(
+      ({ paragraphId, sourceText }) => ({ sourceText, paragraphId })
+    );
+    expect(completeWordPlan(reordered, inspection)).toBe(true);
+    const partial = structuredClone(plan);
+    if (partial.operations[0].type !== "convertTypedList") throw Error();
+    partial.operations[0].items.pop();
+    expect(completeWordPlan(partial, inspection)).toBe(false);
+    expect(
+      completeWordPlan(
+        { ...plan, reviewedParagraphIds: [first.id] },
+        { ...inspection, paragraphs: [first] }
+      )
+    ).toBe(false);
+  });
+  it("uses output identities, recomputed locations and source identity pairs in the independent audit", async () => {
+    const original: DocxInspection = {
+      ...source,
+      paragraphs: [
+        paragraph(1, "Removed header"),
+        paragraph(2, "Bonjour classe"),
+      ],
+    };
+    const actual: DocxInspection = {
+      ...source,
+      paragraphs: [paragraph(1, "Bonjour classe")],
+    };
+    const repaired = {
+      buffer: output,
+      inspection: actual,
+      findings: [],
+      changes: [],
+      identityMap: {
+        [paragraph(1).id]: null,
+        [paragraph(2).id]: paragraph(1).id,
+      },
+    };
+    mocks.inspect.mockResolvedValueOnce(original).mockResolvedValue(actual);
+    mocks.apply.mockResolvedValue(repaired);
+    const evidence = pages();
+    evidence.pages[0].text = "Removed header\nBonjour classe";
+    mocks.pages.mockResolvedValue(evidence);
+    mocks.call.mockImplementation((prompt, parts) => {
+      if (prompt !== WORD_AUDIT_PROMPT) return goodCall(prompt, parts);
+      const text = parts.find(
+        (p: LiteLLMContentPart) => p.type === "text"
+      ).text;
+      expect(text).toContain(
+        `"sourceId":"${paragraph(2).id}","outputId":"${paragraph(1).id}"`
+      );
+      expect(assigned(parts).inspection.paragraphs.map((p) => p.id)).toEqual([
+        paragraph(1).id,
+      ]);
+      const value = JSON.parse(goodCall(prompt, parts).content);
+      value.findings = [
+        {
+          code: "language",
+          severity: "warning",
+          objectId: paragraph(1).id,
+          pageNumber: 1,
+          location: "Paragraph 1",
+          message: "Check pronunciation.",
+          suggestion: "Check the French text in Word.",
+        },
+      ];
+      return response(value);
+    });
+    const result = await repairWord(input, "course.docx");
+    if ("error" in result) throw Error(result.error);
+    expect(result.errors[0].location).toMatchObject({
+      sourcePages: [1],
+      quote: "Bonjour classe",
+    });
+  });
+  it("clears only verified and audited pre-repair issues while preserving distinct or unaudited concerns", () => {
+    const p = paragraph(1, "• Read");
+    const original: DocxInspection = { ...source, paragraphs: [p] };
+    const native = {
+      ...p,
+      text: "Read",
+      list: { numId: "1", level: 0, format: "bullet", markerText: "•" },
+    };
+    const repaired = {
+      buffer: output,
+      inspection: { ...original, paragraphs: [native] },
+      findings: [],
+      changes: [
+        {
+          type: "convertTypedList" as const,
+          id: p.id,
+          paragraphIds: [p.id],
+          location: p.location,
+          message: "Native list",
+          before: p.text,
+          after: "Native list",
+        },
+      ],
+    };
+    const findings = [
+      {
+        code: "list-structure",
+        severity: "warning" as const,
+        objectId: p.id,
+        location: p.location,
+        message: "Make a list.",
+        suggestion: "Use Word numbering.",
+      },
+      {
+        code: "contrast",
+        severity: "warning" as const,
+        objectId: p.id,
+        location: p.location,
+        message: "Check color.",
+        suggestion: "Choose darker text.",
+      },
+    ];
+    expect(
+      unresolvedWordProposals(
+        findings,
+        original,
+        repaired,
+        new Set([p.id])
+      ).map((f) => f.code)
+    ).toEqual(["contrast"]);
+    expect(
+      unresolvedWordProposals(findings, original, repaired, new Set())
+    ).toHaveLength(2);
+    expect(
+      unresolvedWordProposals(
+        findings,
+        original,
+        { ...repaired, changes: [] },
+        new Set([p.id])
+      )
+    ).toHaveLength(2);
+    const mapped = remapWordFindings(findings, original, {
+      ...repaired,
+      inspection: { ...original, paragraphs: [{ ...native, id: "saved-p" }] },
+      identityMap: { [p.id]: "saved-p" },
+    });
+    expect(mapped.every((f) => f.objectId === "saved-p")).toBe(true);
+    expect(
+      mergeWordFindings(
+        unresolvedWordProposals(findings, original, repaired, new Set([p.id])),
+        [findings[0]]
+      ).map((f) => f.code)
+    ).toEqual(["contrast", "list-structure"]);
+  });
   it("checks the source first, reopens actual output and audits source/output page images", async () => {
     const result = await repairWord(input, "course.docx");
     expect(result).toMatchObject({

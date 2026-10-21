@@ -11,6 +11,7 @@ import {
   PDFStream,
   StandardFonts,
   rgb,
+  degrees,
 } from "pdf-lib";
 import { createCanvas, loadImage } from "@napi-rs/canvas";
 import {
@@ -34,6 +35,94 @@ beforeEach(async () => {
       "node:child_process"
     );
   vi.mocked(childProcess.spawn).mockReset().mockImplementation(actual.spawn);
+});
+
+describe("optional native Word text-region evidence", () => {
+  it("returns bounded measured text boxes only when requested", async () => {
+    const pdf = await makePdf();
+    const ordinary = await renderPdfPages(pdf);
+    expect(ordinary.pages[0]).not.toHaveProperty("textRegions");
+    const measured = await renderPdfPages(pdf, { includeTextRegions: true });
+    const page = measured.pages[0];
+    expect(
+      page.textRegions?.some((region) => region.text === "Physical page 1")
+    ).toBe(true);
+    expect(
+      page.textRegions?.every(
+        (region) =>
+          region.x >= 0 &&
+          region.y >= 0 &&
+          region.width > 0 &&
+          region.height > 0 &&
+          region.x + region.width <= page.width &&
+          region.y + region.height <= page.height
+      )
+    ).toBe(true);
+    expect(page.png.equals(ordinary.pages[0].png)).toBe(true);
+    expect(page.text).toBe(ordinary.pages[0].text);
+  });
+
+  it("withholds region evidence for rotated text without losing rendered content", async () => {
+    const pdf = await PDFDocument.create();
+    pdf.addPage([300, 300]).drawText("Rotated teaching text", {
+      x: 60,
+      y: 60,
+      size: 12,
+      rotate: degrees(25),
+    });
+    const rendered = await renderPdfPages(Buffer.from(await pdf.save()), {
+      includeTextRegions: true,
+    });
+    expect(rendered.pages[0].textRegions).toBeNull();
+    expect(rendered.pages[0].text).toContain("Rotated teaching text");
+  });
+
+  it.each([
+    [{ text: "A", x: -1, y: 0, width: 1, height: 1 }],
+    [{ text: "A", x: 0, y: 0, width: 2, height: 1 }],
+    [{ text: "A", x: 0, y: 0, width: 1, height: 1, untrusted: true }],
+    Array.from({ length: 5001 }, () => ({
+      text: "A",
+      x: 0,
+      y: 0,
+      width: 1,
+      height: 1,
+    })),
+  ])(
+    "discards invalid or excessive region metadata while preserving the valid page",
+    async (...args) => {
+      const regions =
+        args.length === 1 && Array.isArray(args[0]) ? args[0] : args;
+      const png = await createCanvas(1, 1).encode("png");
+      const child = fakeChild();
+      const pending = renderPdfPages(Buffer.from("%PDF-test"), {
+        includeTextRegions: true,
+      });
+      child.stdout.emit(
+        "data",
+        Buffer.from(
+          JSON.stringify({
+            ok: true,
+            pageCount: 1,
+            pages: [
+              {
+                pageNumber: 1,
+                width: 1,
+                height: 1,
+                png: png.toString("base64"),
+                text: "A",
+                textRegions: regions,
+              },
+            ],
+          })
+        )
+      );
+      child.emit("close", 0);
+      const result = await pending;
+      expect(result.pages[0].textRegions).toBeNull();
+      expect(result.pages[0].png).toEqual(png);
+    }
+  );
 });
 
 async function makePdf(pageCount = 1, size: [number, number] = [300, 300]) {
