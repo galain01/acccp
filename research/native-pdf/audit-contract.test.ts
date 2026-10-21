@@ -23,6 +23,8 @@ describe("native PDF experimental audit evidence", () => {
         {
           id: "tag-1",
           alt: "A  > B & C\nD",
+          actualText: "\u00ad\n\t\u00a0",
+          effectiveLanguage: "en-GB",
           text: "Value\n \n\n >= 12",
           contentSequence: [
             { kind: "markedContent", mcid: 4, text: "Value\n \n\n >= 12" },
@@ -33,6 +35,8 @@ describe("native PDF experimental audit evidence", () => {
     };
     const actual = JSON.parse(compactAuditEvidence(evidence));
     expect(actual.tags[0].alt).toBe(evidence.tags[0].alt);
+    expect(actual.tags[0].actualText).toBe(evidence.tags[0].actualText);
+    expect(actual.tags[0].effectiveLanguage).toBe("en-GB");
     expect(actual.tags[0].id).toBe("tag-1");
     expect(actual.tags[0].contentSequence[0]).toEqual({
       kind: "markedContent",

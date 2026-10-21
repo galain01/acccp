@@ -29,6 +29,15 @@ class CandidateAssessmentTests(unittest.TestCase):
         self.audit["outputSha256"] = "old output"
         self.assertIn("semantic_audit_missing_stale_or_incomplete", self.assess()["blockers"])
 
+    def test_verified_appendix_still_needs_every_new_page_reviewed(self):
+        self.checks['appendix_validation']={'passed':True}
+        self.checks['structure']['page_content']=[{'pageNumber':1},{'pageNumber':2}]
+        self.assertIn('semantic_audit_missing_stale_or_incomplete',self.assess()['blockers'])
+        self.audit['reviewedPages']=[1,2]
+        self.assertTrue(self.assess()['automatedChecksPassed'])
+        self.checks['structure']['page_content']=[{'pageNumber':1},{'pageNumber':3}]
+        self.assertIn('appendix_page_coverage_incomplete',self.assess()['blockers'])
+
     def test_different_original_invalidates_audit(self):
         self.audit["sourceSha256"] = "another source"
         self.assertFalse(self.assess()["automatedChecksPassed"])

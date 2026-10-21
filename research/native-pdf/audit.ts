@@ -26,6 +26,7 @@ import {
   type SavedTag,
 } from "./audit-contract";
 import { combineAuditBatches, planAuditBatches } from "./audit-batches";
+import { validateAuditPageCounts } from "./audit-page-policy";
 
 const execute = promisify(execFile);
 const directory = path.dirname(fileURLToPath(import.meta.url));
@@ -38,8 +39,23 @@ async function main() {
     outputArgument,
     reportArgument,
     toolchainArgument,
-    fontManifestArgument,
+    ...options
   ] = process.argv.slice(2);
+  let fontManifestArgument: string | undefined;
+  let repairsManifestArgument: string | undefined;
+  for (let index = 0; index < options.length; index++) {
+    if (
+      options[index] === "--repairs" &&
+      !repairsManifestArgument &&
+      options[index + 1]
+    )
+      repairsManifestArgument = options[++index];
+    else if (!fontManifestArgument && !options[index].startsWith("--"))
+      fontManifestArgument = options[index];
+    else throw new Error("invalid_audit_options");
+  }
+  if (fontManifestArgument && repairsManifestArgument)
+    throw new Error("combined_font_and_repairs_not_supported");
   if (
     !sourceArgument ||
     !outputArgument ||
@@ -125,12 +141,21 @@ async function main() {
         [
           path.join(
             directory,
-            fontManifestArgument ? "font_validation.py" : "verify_pdf.py"
+            repairsManifestArgument
+              ? "repair_validation.py"
+              : fontManifestArgument
+                ? "font_validation.py"
+                : "verify_pdf.py"
           ),
           sourcePath,
           outputPath,
-          ...(fontManifestArgument
-            ? ["--manifest", await realpath(fontManifestArgument)]
+          ...(fontManifestArgument || repairsManifestArgument
+            ? [
+                "--manifest",
+                await realpath(
+                  (repairsManifestArgument ?? fontManifestArgument)!
+                ),
+              ]
             : []),
           "--report",
           inspectionPath,
@@ -175,8 +200,7 @@ async function main() {
     stage = "rendering";
     const before = await renderPdfPages(source);
     const after = await renderPdfPages(output);
-    if (before.pageCount !== after.pageCount || after.pageCount > 8)
-      throw new Error("local_audit_supports_at_most_eight_pages");
+    validateAuditPageCounts(before.pageCount, after.pageCount, inspection);
     stage = "audit_evidence";
     const batches = planAuditBatches(inspection, artifactPages);
     plannedBatchCount = batches.length;

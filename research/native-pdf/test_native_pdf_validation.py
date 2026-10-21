@@ -3,6 +3,7 @@ import io
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import ArrayObject, BooleanObject, DecodedStreamObject, DictionaryObject, FloatObject, IndirectObject, NameObject, NullObject, NumberObject, TextStringObject
@@ -379,7 +380,16 @@ class SavedStructureEvidence(unittest.TestCase):
             tag[NameObject("/S")] = NameObject("/TH")
             tag[NameObject("/ID")] = TextStringObject("header-a")
             cell = DictionaryObject({NameObject("/Type"): NameObject("/StructElem"), NameObject("/S"): NameObject("/TD"), NameObject("/P"): document.indirect_reference, NameObject("/K"): ArrayObject(), NameObject("/A"): DictionaryObject({NameObject("/O"): NameObject("/Table"), NameObject("/Headers"): ArrayObject([TextStringObject("header-a")])})})
-            document["/K"].append(writer._add_object(cell))
+            cell_ref = writer._add_object(cell)
+            table = DictionaryObject({NameObject('/Type'): NameObject('/StructElem'), NameObject('/S'): NameObject('/Table'), NameObject('/P'): document.indirect_reference})
+            table_ref = writer._add_object(table)
+            row = DictionaryObject({NameObject('/Type'): NameObject('/StructElem'), NameObject('/S'): NameObject('/TR'), NameObject('/P'): table_ref, NameObject('/K'): ArrayObject([ref, cell_ref])})
+            row_ref = writer._add_object(row)
+            table[NameObject('/K')] = ArrayObject([row_ref])
+            tag[NameObject('/P')] = row_ref
+            cell[NameObject('/P')] = row_ref
+            document[NameObject('/K')] = ArrayObject([table_ref if child == ref else child for child in document['/K']])
+            root[NameObject('/IDTree')] = DictionaryObject({NameObject('/Names'): ArrayObject([TextStringObject('header-a'), ref])})
         info = v.structure_inventory(edited_reader(edit))
         header = next(tag for tag in info["tags"] if tag["role"] == "TH")
         cell = next(tag for tag in info["tags"] if tag["role"] == "TD")
@@ -541,6 +551,157 @@ class AuthoredFigureAssociation(unittest.TestCase):
         result = self.compare(source, source)
         self.assertFalse(result["passed"])
         self.assertIn("internal_form_mcid_unsupported", result["comparisons"][0]["gaps"])
+
+
+def replacement_reader(values=('\u00ad','Other & <word>'), *, hide_first=False, wrong_owner=False):
+    def change(writer,page,root,document,refs,stream,asset):
+        bodies=[]
+        for index,ref in enumerate(refs):
+            node=ref.get_object();node[NameObject('/S')]=NameObject('/Span');node.pop('/Alt',None)
+            if values[index] is not None:node[NameObject('/ActualText')]=TextStringObject(values[index])
+            prefix='/Artifact BMC' if hide_first and index==0 else f'/Span << /MCID {index} >> BDC'
+            bodies.append(prefix+f' BT /F1 12 Tf {20+index*70} 40 Td (-) Tj ET EMC')
+        stream.set_data(' '.join(bodies).encode('ascii'))
+        if wrong_owner:root['/ParentTree']['/Nums'][1][0]=refs[1]
+    return figure_reader(kind='text',callback=change)
+
+
+def inline_replacement_reader(values=('\t','\u00a0'), *, nested=False, artifact=False, painted_space=False):
+    writer=PdfWriter(clone_from=replacement_reader((None,None)))
+    page=writer.pages[0];stream=page.get_contents();changed=[];index=0
+    for args,operator in stream.operations:
+        if operator==b'Tj':
+            if painted_space:args=[TextStringObject(' ')]
+            value=values[index]
+            if artifact and index==0:changed.append(([NameObject('/Artifact')],b'BMC'))
+            if value is not None:
+                entry=([NameObject('/Span'),DictionaryObject({NameObject('/ActualText'):TextStringObject(value)})],b'BDC')
+                changed.append(entry)
+                if nested and index==0:changed.append(entry)
+            changed.append((args,operator))
+            if value is not None:
+                if nested and index==0:changed.append(([],b'EMC'))
+                changed.append(([],b'EMC'))
+            if artifact and index==0:changed.append(([],b'EMC'))
+            index+=1
+        else:changed.append((args,operator))
+    stream.operations=changed;page.replace_contents(stream)
+    data=io.BytesIO();writer.write(data);return PdfReader(io.BytesIO(data.getvalue()),strict=True)
+
+
+class ActualTextAssociationChecks(unittest.TestCase):
+    def test_exact_authored_soft_hyphen_and_escaped_text_stay_on_same_paint(self):
+        result=v.compare_actual_text_associations(replacement_reader(),replacement_reader())
+        self.assertTrue(result['passed']);self.assertEqual(result['sourceReplacementCount'],2)
+    def test_plain_hyphen_cannot_replace_authored_soft_hyphen(self):
+        result=v.compare_actual_text_associations(replacement_reader(),replacement_reader(('-', 'Other & <word>')))
+        self.assertFalse(result['passed']);self.assertEqual(result['comparisons'][0]['failureCode'],'authored_actual_text_changed')
+    def test_lost_actual_text_fails_even_when_all_painted_bytes_are_unchanged(self):
+        source=replacement_reader();output=replacement_reader((None,None))
+        with tempfile.TemporaryDirectory() as directory:
+            before=Path(directory)/'source.pdf';after=Path(directory)/'output.pdf'
+            before.write_bytes(source.stream.getvalue());after.write_bytes(output.stream.getvalue())
+            result=v.compare_pdfs(before,after)
+        self.assertTrue(result['preservation']['pages'][0]['pixels_identical'])
+        self.assertTrue(result['preservation']['pages'][0]['drawing_operators_identical'])
+        self.assertFalse(result['preservation']['passed'])
+        self.assertIn('authored_actual_text_membership_lost',[f['code'] for f in result['findings']])
+    def test_same_strings_swapped_between_identical_glyphs_do_not_pass(self):
+        result=v.compare_actual_text_associations(replacement_reader(),replacement_reader(('Other & <word>','\u00ad')))
+        self.assertFalse(result['passed']);self.assertTrue(all(r['failureCode']=='authored_actual_text_changed' for r in result['comparisons']))
+    def test_copying_missing_span_value_elsewhere_does_not_restore_original_membership(self):
+        result=v.compare_actual_text_associations(replacement_reader(('\u00ad','\u00ad')),replacement_reader((None,'\u00ad')))
+        self.assertFalse(result['passed']);self.assertEqual(result['comparisons'][0]['candidateCount'],0)
+    def test_hidden_span_is_explicitly_reported(self):
+        result=v.compare_actual_text_associations(replacement_reader(),replacement_reader(hide_first=True))
+        self.assertFalse(result['passed']);self.assertEqual(result['comparisons'][0]['failureCode'],'authored_actual_text_hidden_as_artifact')
+    def test_wrong_native_owner_is_not_proof_of_retained_replacement(self):
+        result=v.compare_actual_text_associations(replacement_reader(),replacement_reader(wrong_owner=True))
+        self.assertFalse(result['passed']);self.assertEqual(result['comparisons'][0]['candidateCount'],0)
+    def test_internal_form_replacement_remains_explicitly_unverified(self):
+        reader=native_form_reader();writer=PdfWriter(clone_from=reader)
+        writer.root_object['/StructTreeRoot']['/K'][0].get_object()['/K'][0].get_object()[NameObject('/ActualText')]=TextStringObject('Form replacement')
+        out=io.BytesIO();writer.write(out);source=PdfReader(io.BytesIO(out.getvalue()))
+        result=v.compare_actual_text_associations(source,source)
+        self.assertFalse(result['passed']);self.assertFalse(result['checksComplete'])
+        self.assertIn('internal_form_mcid_unsupported',result['comparisons'][0]['gaps'])
+    def test_authorized_change_wrapper_cannot_hide_missing_actual_text(self):
+        from font_validation import verify_other_content
+        self.assertTrue(verify_other_content(replacement_reader(),replacement_reader())['actualTextAssociations']['passed'])
+        with self.assertRaisesRegex(v.InspectionError,'authored_actual_text_association_changed'):
+            verify_other_content(replacement_reader(),replacement_reader((None,None)))
+    def test_marked_content_property_override_is_not_silently_stripped(self):
+        source=replacement_reader();writer=PdfWriter(clone_from=source);page=writer.pages[0]
+        stream=DecodedStreamObject();stream.set_data(page.get_contents().get_data().replace(b'/MCID 0',b'/MCID 0 /ActualText (Different hidden text)'))
+        page[NameObject('/Contents')]=writer._add_object(stream);out=io.BytesIO();writer.write(out)
+        result=v.compare_actual_text_associations(source,PdfReader(io.BytesIO(out.getvalue())))
+        self.assertFalse(result['passed']);self.assertFalse(result['checksComplete'])
+        self.assertEqual(len(result['unexpectedOutputInlineReplacements']),1)
+    def test_inline_authored_whitespace_keeps_exact_occurrence_and_value(self):
+        result=v.compare_actual_text_associations(inline_replacement_reader(),inline_replacement_reader())
+        self.assertTrue(result['passed']);self.assertTrue(result['checksComplete'])
+        self.assertEqual(result['sourceInlineReplacementCount'],2)
+        self.assertTrue(all(row['membershipVerified'] for row in result['markedContentComparisons']))
+    def test_inline_replacements_cannot_be_dropped_or_swapped(self):
+        source=inline_replacement_reader()
+        for output in (inline_replacement_reader((None,'\u00a0')),inline_replacement_reader(('\u00a0','\t'))):
+            self.assertFalse(v.compare_actual_text_associations(source,output)['passed'])
+    def test_extra_inline_replacement_is_not_authorized_by_a_matching_native_span(self):
+        result=v.compare_actual_text_associations(inline_replacement_reader((None,None)),inline_replacement_reader())
+        self.assertFalse(result['passed']);self.assertFalse(result['checksComplete'])
+        self.assertEqual(len(result['unexpectedOutputInlineReplacements']),2)
+    def test_nested_inline_replacement_scopes_are_explicitly_unsupported(self):
+        result=v.compare_actual_text_associations(inline_replacement_reader(nested=True),inline_replacement_reader(nested=True))
+        self.assertFalse(result['passed']);self.assertFalse(result['checksComplete'])
+        self.assertEqual(result['unsupportedMarkedContentActualText']['sourcePages'],[1])
+    def test_inline_replacement_cannot_be_silently_hidden_as_artifact(self):
+        result=v.compare_actual_text_associations(inline_replacement_reader(),inline_replacement_reader(artifact=True))
+        self.assertFalse(result['passed'])
+        self.assertEqual(result['markedContentComparisons'][0]['failureCode'],'authored_inline_actual_text_artifact_membership_changed')
+    def test_same_inline_replacement_in_original_artifact_stays_verified(self):
+        result=v.compare_actual_text_associations(inline_replacement_reader(artifact=True),inline_replacement_reader(artifact=True))
+        self.assertTrue(result['passed'])
+    def test_only_reviewed_source_bound_spacing_can_change_artifact_ancestry(self):
+        source=inline_replacement_reader(painted_space=True);output=inline_replacement_reader(artifact=True,painted_space=True)
+        scope=v.figure_association_inventory(source)['inlineReplacementTexts'][0]
+        policy={v.digest(source.stream.getvalue()):{scope['membershipHash']:'reviewed blank paragraph'}}
+        self.assertFalse(v.compare_actual_text_associations(source,output)['passed'])
+        with patch.object(v,'REVIEWED_WHITESPACE_ARTIFACTS',policy):
+            result=v.compare_actual_text_associations(source,output)
+            self.assertTrue(result['passed'])
+            self.assertTrue(result['markedContentComparisons'][0]['reviewedWhitespaceArtifactChange']['allowed'])
+        with patch.object(v,'REVIEWED_WHITESPACE_ARTIFACTS',{'0'*64:policy[next(iter(policy))]}):
+            self.assertFalse(v.compare_actual_text_associations(source,output)['passed'])
+    def test_reviewed_spacing_rule_never_allows_hidden_meaningful_replacement_or_glyph(self):
+        for values,painted_space in [(('meaningful word','\u00a0'),True),(('\t','\u00a0'),False)]:
+            source=inline_replacement_reader(values,painted_space=painted_space)
+            output=inline_replacement_reader(values,artifact=True,painted_space=painted_space)
+            scope=v.figure_association_inventory(source)['inlineReplacementTexts'][0]
+            policy={v.digest(source.stream.getvalue()):{scope['membershipHash']:'reviewed blank paragraph'}}
+            with patch.object(v,'REVIEWED_WHITESPACE_ARTIFACTS',policy):
+                self.assertFalse(v.compare_actual_text_associations(source,output)['passed'])
+    def test_native_replacement_language_must_stay_the_same(self):
+        source=replacement_reader();writer=PdfWriter(clone_from=source)
+        node=writer.root_object['/StructTreeRoot']['/K'][0].get_object()['/K'][0].get_object()
+        node[NameObject('/Lang')]=TextStringObject('fr')
+        data=io.BytesIO();writer.write(data)
+        result=v.compare_actual_text_associations(source,PdfReader(io.BytesIO(data.getvalue()),strict=True))
+        self.assertFalse(result['passed'])
+        self.assertEqual(result['comparisons'][0]['failureCode'],'authored_actual_text_language_changed')
+    def test_inline_scopes_are_checked_even_without_a_native_structure_tree(self):
+        def untag(reader):
+            writer=PdfWriter(clone_from=reader);writer.root_object.pop('/StructTreeRoot')
+            data=io.BytesIO();writer.write(data);return PdfReader(io.BytesIO(data.getvalue()),strict=True)
+        source=untag(inline_replacement_reader())
+        self.assertEqual(v.compare_actual_text_associations(source,source)['sourceInlineReplacementCount'],2)
+        self.assertFalse(v.compare_actual_text_associations(source,untag(inline_replacement_reader((None,None))))['passed'])
+    def test_incomplete_semantic_inspection_cannot_leave_preservation_true(self):
+        with tempfile.TemporaryDirectory() as root:
+            source=Path(root)/'source.pdf';source.write_bytes(pdf_bytes(tagged=True))
+            with patch.object(v,'compare_actual_text_associations',side_effect=v.InspectionError('bounded_association_failure')):
+                report=v.compare_pdfs(source,source)
+            self.assertTrue(report['inspection_incomplete'])
+            self.assertFalse(report['preservation']['passed']);self.assertFalse(report['mechanical_checks_passed'])
 
 
 if __name__ == "__main__":

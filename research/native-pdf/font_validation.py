@@ -48,6 +48,7 @@ FONT_CHANGE_FINDINGS = {
     "fonts_changed", "resources_changed", "catalog_behavior_changed",
     "page_properties_changed", "page_pixels_changed",
     "source_figure_membership_changed", "source_figure_hidden_as_artifact",
+    "authored_actual_text_membership_lost", "authored_actual_text_hidden_as_artifact",
 }
 
 
@@ -219,7 +220,9 @@ def verify_other_content(before: PdfReader, after: PdfReader) -> dict[str, Any]:
         require(v.drawing_fingerprint(v.operations(left), canonical[0]) == v.drawing_fingerprint(v.operations(right), canonical[1]), "unauthorized_drawing_change")
     figures = v.compare_figure_associations(before, after)
     require(figures["passed"], "authored_figure_association_changed")
-    return {"nonFontResourcesUnchanged": True, "drawingProgramsUnchanged": True, "pageAndDocumentBehaviorUnchanged": True, "figureAssociations": figures}
+    actual_text = v.compare_actual_text_associations(before, after)
+    require(actual_text['passed'], 'authored_actual_text_association_changed')
+    return {"nonFontResourcesUnchanged": True, "drawingProgramsUnchanged": True, "pageAndDocumentBehaviorUnchanged": True, "figureAssociations": figures, 'actualTextAssociations': actual_text}
 
 
 def char_inventory(textpage: Any) -> list[dict[str, Any]]:
@@ -397,6 +400,7 @@ def compare_with_authorized_fonts(source: Path, output: Path, manifest: dict[str
         report["findings"] = retained
         evidence["strictFindingsExplainedByAuthorizedFonts"] = allowed
         report["figure_associations"] = unchanged["figureAssociations"]
+        report['actual_text_associations'] = unchanged['actualTextAssociations']
         nonfigure_alts = any("alt" in tag and tag["role"] != "Figure" for tag in report["source_structure"]["tags"])
         report["structure"]["authored_alternative_associations_verified"] = not nonfigure_alts
         report["preservation"]["authorized_font_changes_verified"] = True

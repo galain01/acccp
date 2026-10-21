@@ -75,6 +75,10 @@ def assess_evidence(checks: dict, validation: dict, audit: dict | None, source_h
     elif validation.get("passed") is not True:
         blockers.append("pdfua1_machine_requirements_not_met")
     expected_pages = list(range(1, len(checks.get("preservation", {}).get("pages", [])) + 1))
+    if checks.get("appendix_validation", {}).get("passed") is True:
+        expected_pages = [page.get("pageNumber") for page in structure.get("page_content", [])]
+        if (not expected_pages or expected_pages != list(range(1, len(expected_pages) + 1))):
+            blockers.append("appendix_page_coverage_incomplete")
     expected_tags = [tag.get("id") for tag in structure.get("tags", [])]
 
     def exact(actual, expected, allow_empty=False):
@@ -109,13 +113,18 @@ def assess_evidence(checks: dict, validation: dict, audit: dict | None, source_h
     }
 
 
-def assess_candidate(source: Path, candidate: Path, toolchain: dict, folder: Path, audit_path: Path | None = None, font_manifest_path: Path | None = None) -> dict:
+def assess_candidate(source: Path, candidate: Path, toolchain: dict, folder: Path, audit_path: Path | None = None, font_manifest_path: Path | None = None, repairs_manifest_path: Path | None = None) -> dict:
     source, candidate, folder = source.resolve(strict=True), candidate.resolve(strict=True), folder.resolve()
     if source == candidate or folder.exists() or folder.is_relative_to(REPO):
         raise ValueError("immutable_inputs_and_new_external_report_directory_required")
     folder.mkdir(parents=True)
     source_hash, output_hash = sha256(source), sha256(candidate)
-    if font_manifest_path is None:
+    if repairs_manifest_path is not None:
+        if font_manifest_path is not None:
+            raise ValueError("combined_font_and_repairs_not_supported")
+        from repair_validation import compare_with_authorized_repairs
+        checks = compare_with_authorized_repairs(source, candidate, repairs_manifest_path)
+    elif font_manifest_path is None:
         checks = compare_pdfs(source, candidate)
     else:
         from font_validation import compare_with_authorized_fonts, MAX_MANIFEST_BYTES
@@ -158,8 +167,9 @@ def main() -> int:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--audit", type=Path)
     parser.add_argument("--font-manifest", type=Path)
+    parser.add_argument("--repairs", type=Path)
     args = parser.parse_args()
-    result = assess_candidate(args.source, args.candidate, json.loads(args.toolchain.read_text(encoding="utf-8-sig")), args.output, args.audit, args.font_manifest)
+    result = assess_candidate(args.source, args.candidate, json.loads(args.toolchain.read_text(encoding="utf-8-sig")), args.output, args.audit, args.font_manifest, args.repairs)
     print(json.dumps({"status": result["status"], "blockers": result["blockers"], "standardConformanceEstablished": False}))
     return 0 if result["automatedChecksPassed"] else 1
 

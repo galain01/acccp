@@ -34,6 +34,9 @@ def fixture(original,candidate,*,changed=False,wrong_owner=False,layout_class=Fa
     if changed:content=content.replace(b'425,417',b'999,999')
     if extra_scope:
         content+=b'\n/Artifact <</Type /Pagination>> BDC 0 0 m 5 5 l S EMC'
+        source=PdfWriter(clone_from=original);stream=DecodedStreamObject();stream.set_data(source.pages[1].get_contents().get_data()+b'\n/Artifact BMC 0 0 m 5 5 l S EMC')
+        source.pages[1][NameObject('/Contents')]=source._add_object(stream)
+        with original.open('wb') as handle:source.write(handle)
     if wrong_owner:
         other=DictionaryObject({NameObject('/Type'):NameObject('/StructElem'),NameObject('/S'):NameObject('/P'),NameObject('/P'):writer.root_object['/StructTreeRoot'].indirect_reference,NameObject('/Pg'):writer.pages[1].indirect_reference,NameObject('/K'):NumberObject(0)})
         other_ref=writer._add_object(other);writer.root_object['/StructTreeRoot'][NameObject('/K')]=ArrayObject([tag.indirect_reference,other_ref]);nums[3]=ArrayObject([other_ref]);content=content.replace(b'/Artifact BMC',b'/P <</MCID 0>> BDC')
@@ -44,6 +47,28 @@ def fixture(original,candidate,*,changed=False,wrong_owner=False,layout_class=Fa
         with original.open('wb') as handle:source.write(handle)
     stream=DecodedStreamObject();stream.set_data(content);writer.pages[1][NameObject('/Contents')]=writer._add_object(stream)
     with candidate.open('xb') as stream:writer.write(stream)
+
+
+def add_complete_anchor_with_figure_metadata(original,candidate,*,scope_language=None):
+    """The candidate anchor is complete; its continuation alone was omitted."""
+    for path in (original,candidate):
+        writer=PdfWriter(clone_from=path);root=writer.root_object['/StructTreeRoot'];tag=_tag_nodes(writer)[0]
+        if path==candidate:
+            tag[NameObject('/K')]=ArrayObject([NumberObject(0)])
+            root['/ParentTree']['/Nums'][1]=ArrayObject([tag.indirect_reference])
+        if scope_language:
+            writer.root_object[NameObject('/Lang')]=TextStringObject('en')
+            if path==original:
+                for page in writer.pages:
+                    stream=DecodedStreamObject();stream.set_data(page.get_contents().get_data().replace(b'/MCID 0>>',f'/MCID 0 /Lang ({scope_language})>>'.encode()))
+                    page[NameObject('/Contents')]=writer._add_object(stream)
+        metadata=DecodedStreamObject();metadata.set_data(b'<metadata>authored Figure provenance</metadata>')
+        writer.pages[0]['/Resources'][NameObject('/Properties')]=DictionaryObject({NameObject('/FigureMetadata'):DictionaryObject({NameObject('/Metadata'):writer._add_object(metadata)})})
+        figure=DictionaryObject({NameObject('/Type'):NameObject('/StructElem'),NameObject('/S'):NameObject('/Figure'),NameObject('/P'):root.indirect_reference,NameObject('/Pg'):writer.pages[0].indirect_reference,NameObject('/K'):NumberObject(1),NameObject('/Alt'):TextStringObject('A short ascending line.')})
+        figure_ref=writer._add_object(figure);root[NameObject('/K')]=ArrayObject([tag.indirect_reference,figure_ref]);root['/ParentTree']['/Nums'][1].append(figure_ref)
+        stream=DecodedStreamObject();stream.set_data(writer.pages[0].get_contents().get_data()+b'\n/Figure <</MCID 1>> BDC /PlacedPDF /FigureMetadata BDC 10 10 m 20 20 l S EMC EMC')
+        writer.pages[0][NameObject('/Contents')]=writer._add_object(stream)
+        with path.open('wb') as handle:writer.write(handle)
 
 
 class CrossPageRepairsTests(unittest.TestCase):
@@ -122,6 +147,45 @@ class CrossPageRepairsTests(unittest.TestCase):
         with self.candidate.open('wb') as handle:candidate.write(handle)
         with self.assertRaisesRegex(ValueError,'source_paragraph_scoped_properties_unsupported'):self.repair()
         self.assertFalse(self.output.exists())
+    def test_keeps_complete_anchor_stream_and_figure_metadata_unchanged(self):
+        fixture(self.original,self.candidate);add_complete_anchor_with_figure_metadata(self.original,self.candidate)
+        before=PdfReader(self.candidate);source_bytes=self.original.read_bytes();candidate_bytes=self.candidate.read_bytes()
+        result=self.repair();after=PdfReader(self.output)
+        self.assertEqual([1],result['unchangedAnchorPageNumbers']);self.assertEqual([2],result['rewrittenPageNumbers'])
+        self.assertEqual(before.pages[0].get_contents().get_data(),after.pages[0].get_contents().get_data())
+        self.assertEqual(b'<metadata>authored Figure provenance</metadata>',after.pages[0]['/Resources']['/Properties']['/FigureMetadata']['/Metadata'].get_data())
+        self.assertTrue(compare_pdfs(self.original,self.output)['preservation']['passed'])
+        self.assertIn('425,417',structure_inventory(after)['tags'][0]['text'])
+        self.assertEqual(source_bytes,self.original.read_bytes());self.assertEqual(candidate_bytes,self.candidate.read_bytes())
+    def test_uniform_source_line_language_preserved_on_untouched_anchor(self):
+        fixture(self.original,self.candidate);add_complete_anchor_with_figure_metadata(self.original,self.candidate,scope_language='en-GB')
+        before=PdfReader(self.candidate).pages[0].get_contents().get_data();result=self.repair();after=PdfReader(self.output)
+        self.assertEqual([1],result['unchangedAnchorPageNumbers']);self.assertEqual('en-GB',_tag_nodes(after)[0]['/Lang'])
+        self.assertEqual(before,after.pages[0].get_contents().get_data())
+        self.assertEqual('en-GB',result['outputParagraphLanguage'])
+    def test_incomplete_anchor_cannot_skip_unsupported_metadata(self):
+        fixture(self.original,self.candidate);add_complete_anchor_with_figure_metadata(self.original,self.candidate)
+        writer=PdfWriter(clone_from=self.candidate);tag=_tag_nodes(writer)[0]
+        tag['/K'].append(NumberObject(2));writer.root_object['/StructTreeRoot']['/ParentTree']['/Nums'][1].append(tag.indirect_reference)
+        with self.candidate.open('wb') as handle:writer.write(handle)
+        with self.assertRaisesRegex(ValueError,'candidate_marked_properties_unsupported'):self.repair()
+        self.assertFalse(self.output.exists())
+    def test_language_conflict_cannot_authorize_untouched_anchor(self):
+        fixture(self.original,self.candidate);add_complete_anchor_with_figure_metadata(self.original,self.candidate,scope_language='en-GB')
+        writer=PdfWriter(clone_from=self.candidate);stream=DecodedStreamObject();stream.set_data(writer.pages[0].get_contents().get_data().replace(b'/MCID 0>>',b'/MCID 0 /Lang (fr)>>'))
+        writer.pages[0][NameObject('/Contents')]=writer._add_object(stream)
+        with self.candidate.open('wb') as handle:writer.write(handle)
+        with self.assertRaisesRegex(ValueError,'candidate_marked_properties_unsupported'):self.repair()
+        self.assertFalse(self.output.exists())
+    def test_anchor_can_keep_unchanged_text_state_outside_mcid_scope(self):
+        fixture(self.original,self.candidate);add_complete_anchor_with_figure_metadata(self.original,self.candidate)
+        writer=PdfWriter(clone_from=self.candidate);stream=DecodedStreamObject()
+        stream.set_data(writer.pages[0].get_contents().get_data().replace(b'/P <</MCID 0>> BDC BT',b'BT /P <</MCID 0>> BDC').replace(b'Tj ET EMC',b'Tj EMC ET'))
+        writer.pages[0][NameObject('/Contents')]=writer._add_object(stream)
+        with self.candidate.open('wb') as handle:writer.write(handle)
+        before=PdfReader(self.candidate).pages[0].get_contents().get_data();result=self.repair()
+        self.assertEqual([1],result['unchangedAnchorPageNumbers'])
+        self.assertEqual(before,PdfReader(self.output).pages[0].get_contents().get_data())
 
 
 if __name__=='__main__':unittest.main()

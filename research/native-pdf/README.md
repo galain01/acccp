@@ -102,26 +102,27 @@ The bounded `cross_page_repairs.py` helper restores all seven original paragraph
 lines to pages 2 and 3 with explicit page references and ParentTree ownership.
 It retains native language/layout attributes and rejects ambiguous ordering or
 unsupported scopes. The saved candidate retains identical pixels on all eight
-pages and passes UA1 machine validation. Independent checks still report **13
-unresolved local link destinations already present in the original**; these are
-real remaining defects, not repaired guesses.
+pages and passes UA1 machine validation. At this stage, independent checks found
+**13 unresolved local link destinations already present in the original**.
 
 Semantic testing also found another Discussion continuation excluded as Artifact
 on page 7, despite identical rendered pages. The source has unambiguous native
-references spanning pages 5 and 7, but the current paragraph writer safely
-rejects this case because page 5 also contains preserved Figure metadata scopes
-it cannot reconstruct. No incomplete repair is substituted for that finding.
-This remaining omission, heading/reading-order defects and missing table row
-header relationships block full accessibility approval and app integration.
-The completed six-batch audit covers all 2,030 saved tags, eight physical pages
-and eight excluded-text reviews. It reports 27 findings across the batches
-(including related table issues), rather than a passing overall result.
+references spanning pages 5 and 7. The first paragraph writer rejected this case
+because page 5 also contained preserved Figure metadata scopes it could not
+reconstruct. The completed six-batch audit of that candidate covered all 2,030
+saved tags, eight physical pages and eight excluded-text reviews. Its 27 findings
+(including related table issues) prompted the further remediation below.
 
-| Final candidate | UA1 machine checks | Independent preservation | Semantic audit / overall automated result |
+| Earlier candidate | UA1 machine checks | Independent preservation | Semantic audit / overall automated result |
 | --- | --- | --- | --- |
 | Authored-image fixture, with authorized fonts | Pass, 0 failures | Pass with verified font substitution | 0 findings; automated checks pass, human review required |
 | One-page CDC chart, existing structure retained | Pass, 0 failures | Pass, identical page pixels | 3 findings; blocked |
 | Eight-page CDC report, figures and first continuation restored | Pass, 0 failures | Pass, identical page pixels | 27 reported findings plus 13 broken original local destinations; blocked |
+
+These earlier preservation results predate the expanded authored-reading-text
+check. Later testing found lost native and inline `ActualText` replacements even
+when visible text and page pixels matched. The final gate below checks those
+associations independently; the earlier candidates are superseded.
 
 The authored-image fixture now passes veraPDF UA1 with **zero failed checks**,
 independent preservation/layout checks, and the model audit with **zero remaining
@@ -134,12 +135,12 @@ regions. Font substitution/layout checks also passed on the workshop and field
 methods fixtures, for **nine tested pages** overall. These additional font runs
 alone do not establish their complete PDF accessibility.
 
-The one-page CDC chart passes UA1 machine and preservation checks but still has
-three semantic findings on the existing-structure route: heading relationships,
+The first one-page CDC chart candidate passed UA1 machine and preservation checks
+but had three semantic findings on the existing-structure route: heading relationships,
 an incomplete original chart description, and a wrapped URL exposed as duplicate
 links. Preserving an authored description is distinct from establishing that it
-contains an adequate equivalent of a complex chart. Those findings block an
-overall automated pass and remain explicit in the report.
+contains an adequate equivalent of a complex chart. Those findings blocked that
+candidate and remain explicit in its immutable report.
 
 `conformance_repairs.py` handles bounded technical fixes and inventories missing
 fonts. `semantic_repairs.py` applies an exact-file, audit-supported role change
@@ -155,6 +156,40 @@ not a certificate or a production deliverable. Human checks still include
 screen-reader navigation and judgment about appropriate meaning, language and
 alternatives. See [veraPDF validation scope](https://docs.verapdf.org/validation/)
 and the [Matterhorn Protocol](https://pdfa.org/resource/the-matterhorn-protocol/).
+
+## Latest remediated samples
+
+The final local samples on 2026-10-21 pass the complete automated assessment:
+
+| Sample | Original pages + description pages | Failed UA1 checks | Findings in fresh complete model audit |
+| --- | ---: | ---: | ---: |
+| CDC report (`composed-v5`) | 8 + 1 | 0 | 0 |
+| CDC chart (`chart-v4`) | 1 + 1 | 0 | 0 |
+
+The report's final audit covers all 2,161 saved tags, nine physical pages and
+seven pages with excluded text. The chart audit covers all 44 tags and both
+physical pages. The final assessments use the strengthened table IDTree check.
+Each candidate retains identical original page pixels, painting and resources;
+the approved description text appears on one added page.
+
+The report now has explicit column, row and category header relationships for
+both tables. All 180 native IDTree entries and 3,000 header references resolve
+to the correct saved objects within their own tables. The previously excluded
+Discussion continuation is available in reading order. Table directions, front
+page navigation, staff lists and authored reading replacements are preserved
+and ordered appropriately. The original Figure descriptions remain attached to
+their original graphics, supplemented by evidence-based descriptions in the
+appendices. These results supersede the earlier candidates above.
+
+Final immutable output identities:
+
+- Report: `74d2b6239029ebea9da1b669af38c90198eb0630a7479d88a36ac6b70c9ee20d`
+- Chart: `41ed1d86bae74acfb49b73b6cdb7251dc203e32407f8396cbd03aaad6d0e648b`
+
+These are two repaired research samples, using bounded reviewed plans. Their
+assessment status remains `automated_checks_passed_manual_review_required`.
+Hands-on screen-reader testing and broader document coverage are still required
+before app integration or an established PDF/UA conformance claim.
 
 ## Reproduce locally
 
@@ -236,18 +271,100 @@ ordered text/child-tag content, and verified annotation references. This gives
 the auditor evidence for table and link relationships instead of making it
 infer those relationships from the rendered page alone.
 
-Verification completed: 160 Python tests, eleven audit-contract/batching tests, TypeScript
-checking and linting of the new TypeScript files.
+Table-header validation resolves the PDF's actual IDTree, checks its ordering,
+limits and exact reachable targets, and requires each header reference to stay
+within its own table. Mutation tests found that veraPDF alone accepted a missing
+IDTree; the independent checker now rejects that case as well as references to
+another table or to the cell itself.
+
+The local inspection also accounts for a pypdf extraction error that treated
+positive `TJ` letter-tightening adjustments as spaces inside words. Original
+font mappings, unchanged painting operations and independent PDFium extraction
+established the correct staff names. This correction affects inspection only;
+it does not rewrite PDF text or replace a screen-reader test. Native `ActualText`
+and its verified associations remain explicit evidence for the semantic auditor.
+
+Verification completed: 318 Python tests, thirteen audit-contract/batching/page-policy
+tests, TypeScript checking and linting of the changed TypeScript files.
 
 Tests:
 
 ```text
 python -m unittest discover -s research/native-pdf -p "test_*.py"
-npx vitest run research/native-pdf/audit-contract.test.ts research/native-pdf/audit-batches.test.ts
+npx vitest run research/native-pdf/audit-contract.test.ts research/native-pdf/audit-batches.test.ts research/native-pdf/audit-page-policy.test.ts
 npm run typecheck
 ```
 
 ## Implementation route
+
+### Further local remediation
+
+The local repair layer addresses the actual native structure after the first audit:
+
+- `cross_page_repairs.py` can restore a missing paragraph continuation while
+  leaving a verified, already-correct anchor page byte-for-byte unchanged. This
+  preserves unrelated Figure metadata on that page.
+- `structure_repairs.py` applies exact audited snapshots for heading roles,
+  reading-order permutations, section grouping and numbered reference lists.
+  List labels must already have separate, verified content references; the
+  writer does not guess where to split a text operation.
+- `table_repairs.py` binds every cell to its source painting, text and spans.
+  Explicit plans establish column, row and category headers with native IDs,
+  `Headers` associations and an IDTree. Explanatory table footnotes become Note
+  siblings, with their original content retained.
+- `pagination_artifacts.py` handles only exact repeated continuation captions.
+  Unique instructions such as "See table footnotes on the next page" remain
+  native paragraphs. `table_direction_order.py` places each reviewed direction
+  after its table title and before its intact two-page table, so "next page"
+  retains its meaning in continuous reading. The first caption, complete table
+  and actual footnotes remain reachable. The final auditor reviews all excluded
+  text.
+- `link_grouping_repairs.py` restores source-proven complete Link groups and
+  their content/annotation ownership. `navigation_repairs.py` separately repairs
+  four verified CDC report destinations in the research fixture. That destination
+  policy is pinned to this source; it is not a general URL-guessing feature.
+- `description_appendix.py` adds approved, evidence-bound image explanations on
+  at most two new pages, using embedded open-source fonts. Existing pages and
+  authored image descriptions remain intact. The new native section follows its
+  Figure in reading order; its heading level is explicit in the approved plan.
+- `opening_order_repairs.py` moves reviewed front-page navigation blocks using
+  exact audited native snapshots. `roster_repairs.py` groups existing staff
+  names and roles into lists without splitting text operations or changing the
+  original Form streams. Both verify saved ownership and unchanged page content.
+- `actual_text_repairs.py` restores authored reading text, including soft
+  hyphens and whitespace, on the same original painted content. An independent
+  association check protects these replacements as well as Figure alternatives.
+  A matching replacement string elsewhere does not count as preservation.
+  The CDC report has five reviewed tab-only scopes that become Artifact content:
+  four blank paragraphs and indentation before a retained footnote. This narrow
+  exception binds the exact original file and painted occurrences; other changes
+  to the availability of replacement text remain failures.
+
+These are bounded repair operations and reviewed local plans, not yet a general
+automatic native PDF service. No live route imports them. New document-bearing
+plans, source evidence, intermediate candidates and reports stay outside Git.
+
+`repair_validation.py` composes independent navigation and appendix verification.
+A bundle JSON uses `schemaVersion: 1` and the paths `navigationManifest` and/or
+`appendixManifest`, resolved relative to the bundle. An appendix ledger binds its
+immutable baseline, exact approved text, evidence files and final output. The
+checker separately verifies the original pages and all new text, tags and fonts.
+It never authorizes arbitrary page changes. A navigation ledger can continue
+through an appendix only when the two exact file hashes form a valid chain.
+Verified text/JSON evidence is also supplied to the auditor, with bounded reads
+and exact hashes. Evidence and proposed descriptions are treated as untrusted
+source material. A file hash establishes identity, not factual correctness or
+publisher provenance; source values are checked separately.
+
+```text
+node --conditions=react-server --env-file=PRIVATE_ENV_FILE --import tsx research/native-pdf/audit.ts source.pdf candidate.pdf NEW_REPORT_DIRECTORY TOOLCHAIN.json --repairs BUNDLE.json
+python research/native-pdf/assess_candidate.py source.pdf candidate.pdf --toolchain TOOLCHAIN.json --output NEW_ASSESSMENT_DIRECTORY --audit AUDIT.json --repairs BUNDLE.json
+```
+
+The local audit covers at most eight original pages plus two independently
+verified description pages. Every output page and native tag, including the
+appendix, still requires complete audit coverage. Font replacement manifests and
+these additional repair bundles cannot be combined in this experimental runner.
 
 The useful upstream seam is `DocumentProcessor.extractContents(input, config)`
 followed by `AutoTagger.tag(extraction, null)`. Extraction returns mutable native

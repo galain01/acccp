@@ -134,6 +134,45 @@ def _source_scope_properties(page, identifiers):
     return result
 
 
+def _can_keep_anchor_page(page, rows, selected, owners, target, page_number,
+                          old_leaves, source_ids, source_scopes, final_language,
+                          source_language):
+    """Prove an existing anchor page is complete before leaving all bytes alone.
+
+    One-to-one line scope correspondence avoids changing reading order or
+    inheriting a different language while adding the missing continuation.
+    Unrelated marked-content metadata is never reconstructed in this path.
+    """
+    expected = [identifier for number,identifier in old_leaves if number==page_number]
+    if not expected:
+        return False
+    mapping = defaultdict(set)
+    observed = []
+    for row in rows:
+        # Text state operators can legitimately sit outside the candidate's
+        # MCID wrapper. The unchanged full page program proves their placement;
+        # semantic ownership must agree for each actual painting operation.
+        if row['index'] not in selected or row['op'] not in PAINT:
+            continue
+        if row['artifact'] or owners.get((page_number,row['mcid'])) is not target:
+            return False
+        mapping[selected[row['index']]].add(row['mcid'])
+        if not observed or observed[-1]!=row['mcid']:
+            observed.append(row['mcid'])
+    if set(mapping)!=set(source_ids) or any(len(values)!=1 for values in mapping.values()):
+        return False
+    mapped = [next(iter(mapping[identifier])) for identifier in source_ids]
+    if mapped!=expected or observed!=expected or len(set(mapped))!=len(mapped):
+        return False
+    existing_scopes = _source_scope_properties(page,set(expected))
+    for source_id,candidate_id in zip(source_ids,mapped):
+        desired_language = source_scopes[source_id][1].get('/Lang',source_language)
+        current_language = existing_scopes[candidate_id][1].get('/Lang',final_language)
+        if desired_language is not None and current_language!=desired_language:
+            return False
+    return True
+
+
 def repair_cross_page_paragraph(original: Path, candidate: Path, output: Path, *,
                                 source_tag_id: str, candidate_tag_id: str,
                                 expected_original_sha256: str, expected_candidate_sha256: str) -> dict:
@@ -161,6 +200,20 @@ def repair_cross_page_paragraph(original: Path, candidate: Path, output: Path, *
     if not 2 <= len(pages) <= 4 or any(p not in pages for p,_ in old_leaves):
         raise ValueError('bounded_cross_page_paragraph_required')
     source_membership = set(source_leaves)
+    source_scopes_by_page = {
+        page_number:_source_scope_properties(source.pages[page_number],{mcid for p,mcid in source_leaves if p==page_number})
+        for page_number in pages
+    }
+    source_line_languages = {
+        properties.get('/Lang',source_language)
+        for scopes in source_scopes_by_page.values() for _,properties in scopes.values()
+    }
+    # A uniform authored line language can be carried on the paragraph itself.
+    # This lets an already-correct anchor keep its original content stream and
+    # all unrelated metadata, while retaining the same effective language.
+    final_language = source_language
+    if len(source_line_languages)==1 and None not in source_line_languages:
+        final_language = next(iter(source_line_languages))
     root, owners, _, _ = structure(writer)
     tree = parent_entries(root)
     # Verify the source structure itself owns every leaf being restored.
@@ -178,8 +231,8 @@ def repair_cross_page_paragraph(original: Path, candidate: Path, output: Path, *
         old_page, new_page = source.pages[page_number], writer.pages[page_number]
         if Canonicalizer(list(source.pages)).hash(old_page.get('/Resources', {})) != Canonicalizer(list(writer.pages)).hash(new_page.get('/Resources', {})):
             raise ValueError('page_resources_changed')
-        original_rows, proposed_rows = scan(old_page), scan(new_page, candidate=True)
-        source_scopes = _source_scope_properties(old_page,{mcid for p,mcid in source_leaves if p==page_number})
+        original_rows, proposed_rows = scan(old_page), scan(new_page)
+        source_scopes = source_scopes_by_page[page_number]
         ordered_source_mcids = []
         for row in original_rows:
             if row['op'] in PAINT and (page_number,row['mcid']) in source_membership and not row['artifact']:
@@ -216,9 +269,18 @@ def repair_cross_page_paragraph(original: Path, candidate: Path, output: Path, *
         entries = obj(tree.get(parent_keys[page_number]))
         if not isinstance(entries, ArrayObject):
             raise ValueError('page_parent_tree_array_required')
-        plans.append((page_number, proposed_rows, selected, list(entries), _existing_scope_names(new_page),source_scopes))
+        unchanged = _can_keep_anchor_page(new_page,proposed_rows,selected,owners,target,page_number,
+                                         old_leaves,ordered_source_mcids,source_scopes,final_language,source_language)
+        if not unchanged:
+            # Only pages that will actually be reconstructed need the strict
+            # no-extra-properties subset. Inspection alone never authorizes
+            # discarding metadata or optional-content behavior.
+            scan(new_page,candidate=True)
+        plans.append((page_number, proposed_rows, selected, list(entries), _existing_scope_names(new_page),source_scopes,unchanged))
     if not anchored:
         raise ValueError('surviving_paragraph_anchor_required')
+    if all(plan[-1] for plan in plans):
+        raise ValueError('no_missing_continuation_to_repair')
     # Every old reference must be either mapped original paint or a demonstrably
     # absent scope. No other paragraph content may be discarded during rebinding.
     for page_number, mcid in old_leaves:
@@ -226,7 +288,11 @@ def repair_cross_page_paragraph(original: Path, candidate: Path, output: Path, *
         if not isinstance(entries, ArrayObject) or mcid >= len(entries) or obj(entries[mcid]) is not target:
             raise ValueError('candidate_paragraph_parent_tree_mismatch')
     new_refs = []
-    for page_number, rows, selected, entries, scope_names, source_scopes in plans:
+    for page_number, rows, selected, entries, scope_names, source_scopes, unchanged in plans:
+        if unchanged:
+            new_refs.extend(DictionaryObject({NameObject('/Type'):NameObject('/MCR'),NameObject('/Pg'):writer.pages[page_number].indirect_reference,NameObject('/MCID'):NumberObject(identifier)})
+                            for number,identifier in old_leaves if number==page_number)
+            continue
         for p, mcid in old_leaves:
             if p == page_number: entries[mcid] = NullObject()
         groups = []
@@ -262,8 +328,8 @@ def repair_cross_page_paragraph(original: Path, candidate: Path, output: Path, *
     target[NameObject('/K')] = ArrayObject(new_refs)
     if source_attributes and not candidate_attributes:
         target[NameObject('/A')] = ArrayObject([attribute.clone(writer) for attribute in source_attributes])
-    if source_language is not None and source_language!=target_language:
-        target[NameObject('/Lang')]=TextStringObject(source_language)
+    if final_language is not None and final_language!=target_language:
+        target[NameObject('/Lang')]=TextStringObject(final_language)
     root[NameObject('/ParentTree')] = writer._add_object(DictionaryObject({NameObject('/Nums'):ArrayObject([value for key, entries in sorted(tree.items()) for value in (NumberObject(key),entries)])}))
     root[NameObject('/ParentTreeNextKey')] = NumberObject(max(tree,default=-1)+1)
     digest = _save(writer,output)
@@ -273,6 +339,12 @@ def repair_cross_page_paragraph(original: Path, candidate: Path, output: Path, *
     for number in pages:
         if drawing_fingerprint(operations(proposed.pages[number]),Canonicalizer()) != drawing_fingerprint(operations(reopened.pages[number]),Canonicalizer()):
             raise ValueError('saved_painting_changed')
+    unchanged_pages = [plan[0] for plan in plans if plan[-1]]
+    for number in unchanged_pages:
+        if proposed.pages[number].get_contents().get_data()!=reopened.pages[number].get_contents().get_data():
+            raise ValueError('saved_anchor_page_stream_changed')
+        if Canonicalizer(list(proposed.pages)).hash(proposed.pages[number].get('/Resources',{}))!=Canonicalizer(list(reopened.pages)).hash(reopened.pages[number].get('/Resources',{})):
+            raise ValueError('saved_anchor_page_resources_changed')
     figure_check = compare_figure_associations(proposed,reopened)
     if not figure_check['passed']:
         raise ValueError('saved_figure_associations_changed_or_unverifiable')
@@ -284,5 +356,8 @@ def repair_cross_page_paragraph(original: Path, candidate: Path, output: Path, *
             'restoredReferences':[{'pageNumber':p+1,'mcid':m} for p,m in leaves],
             'sourceLayoutAttributeSetsPreserved':len(source_attributes),
             'sourceEffectiveLanguagePreserved':str(source_language) if source_language is not None else None,
+            'outputParagraphLanguage':str(final_language) if final_language is not None else None,
+            'unchangedAnchorPageNumbers':[number+1 for number in unchanged_pages],
+            'rewrittenPageNumbers':[plan[0]+1 for plan in plans if not plan[-1]],
             'unchangedFigureAssociationsVerified':True,
             'verifiedParagraphPaintOperations':restored_paint}
