@@ -1273,8 +1273,26 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
         return None
 
     for tag in info["tags"]:
+        # ISO 32000 attribute precedence: later entries override earlier ones,
+        # and direct /A overrides class /C for the same owner and attribute.
+        # https://pdf-issues.pdfa.org/32000-2-2020/clause14.html#h14.7.6.1
+        header_attributes = [attr for attr in tag['attributes']
+            if attr.get('owner') == 'Table' and 'headersHex' in attr]
+        effective_headers = header_attributes[-1] if header_attributes else None
+        node = native_objects[tag['id']]
+        classes = resolved(node.get('/C', []))
+        classes = classes if isinstance(classes, list) else [classes]
+        if header_attributes and ('/R' in node or any('revision' in attr for attr in tag['attributes'])
+                or any(integer(entry) is not None for entry in classes)):
+            effective_headers = None
+            attribute_gaps += 1
+            info['findings'].append({'code': 'table_header_attribute_revisions_unsupported',
+                'severity': 'error', 'tagId': tag['id']})
         for attribute in tag["attributes"]:
             if "headersHex" in attribute:
+                attribute['headersEffective'] = attribute is effective_headers
+                if not attribute['headersEffective']:
+                    continue
                 attribute["headerTagIds"] = []
                 attribute["headersResolved"] = True
                 for header in attribute["headersHex"]:
@@ -1290,6 +1308,35 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
                         info['findings'].append({'code': 'table_header_not_in_same_table', 'severity': 'error', 'tagId': tag['id']})
                     else:
                         attribute["headerTagIds"].append(matches[0]["id"])
+    # Real, local IDs alone do not establish useful header relationships: a
+    # TH can point back to one of its descendants. Resolve the bounded graph
+    # iteratively so a cycle cannot pass or exhaust Python's recursion stack.
+    header_graph = {tag['id']: set(header for attr in tag['attributes']
+        if attr.get('headersEffective') for header in attr.get('headerTagIds', [])) for tag in info['tags']}
+    reverse_headers: dict[str, set[str]] = {}
+    for identity, headers in header_graph.items():
+        for header in headers:
+            reverse_headers.setdefault(header, set()).add(identity)
+    remaining = {identity: len(headers) for identity, headers in header_graph.items()}
+    pending = [identity for identity, count in remaining.items() if count == 0]
+    while pending:
+        for identity in reverse_headers.get(pending.pop(), set()):
+            remaining[identity] -= 1
+            if remaining[identity] == 0:
+                pending.append(identity)
+    # Anything left either participates in a cycle or depends on one. Each
+    # vertex and edge is visited at most once, including pathological inputs.
+    affected = {identity for identity, count in remaining.items() if count}
+    if affected:
+        attribute_gaps += 1
+        info['findings'].append({'code': 'cyclic_table_header_relationship',
+            'severity': 'error', 'tagIds': sorted(affected)[:MAX_FINDINGS]})
+    for tag in info['tags']:
+        for attribute in tag['attributes']:
+            if 'headersResolved' in attribute:
+                attribute['headersAcyclic'] = attribute['headersResolved'] and tag['id'] not in affected
+    info['table_header_graph'] = {'cycleDetected': bool(affected),
+        'resolvedEdgeCount': sum(len(headers) for headers in header_graph.values())}
     for page in info["page_content"]:
         if any((page["pageNumber"], mcid) not in content_seen for mcid in page["mcids"]):
             info["findings"].append({"code": "unowned_marked_content", "severity": "error", "page": page["pageNumber"]})
@@ -1580,6 +1627,12 @@ def figure_association_inventory(reader: PdfReader, *, include_actual_text: bool
             destination = result['figures'] if role == '/Figure' else result['replacementTexts']
             prefix = 'figure' if role == '/Figure' else 'actualtext'
             figure: dict[str, Any] = {"id": f"{prefix}-{len(destination) + 1}", "role": role.lstrip('/'), "pageNumber": page_number, "contentKeys": leaf_ids, "paintCount": sum(len(indices) for indices in events.values()), "membershipHash": digest(json.dumps(membership, sort_keys=True, separators=(",", ":")).encode()) if not gaps else None, "supported": not gaps, "gaps": sorted(gaps), "events": events}
+            if role == '/Figure':
+                # A copied description read in a different authored language is
+                # not equivalent, even when its Unicode string and paint match.
+                # Alt/ActualText on the StructElem inherits native language;
+                # language scopes on painted labels do not override this value.
+                figure['descriptionLanguage'] = effective_language(item)
             if role != '/Figure':
                 fallback_language = effective_language(item)
                 languages = {result['pages'][number]['eventLanguages'].get(event, fallback_language)
@@ -1607,8 +1660,15 @@ def compare_figure_associations(source: PdfReader, output: PdfReader) -> dict[st
             candidate = matches[0]
             used_candidates.add(candidate["id"])
             row.update({"outputFigureId": candidate["id"], "outputContentKeys": candidate["contentKeys"], "membershipVerified": True, "descriptionsIdentical": all(key not in original or candidate.get(key) == original[key] for key in ("alt", "actualText"))})
+            row.update({'sourceDescriptionLanguage': original.get('descriptionLanguage'),
+                        'outputDescriptionLanguage': candidate.get('descriptionLanguage'),
+                        'descriptionLanguageIdentical': not any(key in original for key in ('alt', 'actualText'))
+                            or original.get('descriptionLanguage') is None
+                            or candidate.get('descriptionLanguage') == original['descriptionLanguage']})
             if not row["descriptionsIdentical"]:
                 row["failureCode"] = "authored_figure_description_changed"
+            elif not row['descriptionLanguageIdentical']:
+                row['failureCode'] = 'authored_figure_description_language_changed'
         elif not original["supported"]:
             row["failureCode"] = "figure_membership_unverified"
         elif matches:
@@ -1621,7 +1681,7 @@ def compare_figure_associations(source: PdfReader, output: PdfReader) -> dict[st
                     hidden = True
             row["failureCode"] = "source_figure_hidden_as_artifact" if hidden else "source_figure_membership_changed"
         comparisons.append(row)
-    return {"passed": all(row["membershipVerified"] and row["descriptionsIdentical"] for row in comparisons), "checksComplete": all(row["membershipVerified"] for row in comparisons), "sourceFigureCount": len(before["figures"]), "outputFigureCount": len(after["figures"]), "comparisons": comparisons, "scope": before["scope"]}
+    return {"passed": all(row["membershipVerified"] and row["descriptionsIdentical"] and row.get('descriptionLanguageIdentical') for row in comparisons), "checksComplete": all(row["membershipVerified"] for row in comparisons), "sourceFigureCount": len(before["figures"]), "outputFigureCount": len(after["figures"]), "comparisons": comparisons, "scope": before["scope"]}
 
 
 def compare_actual_text_associations(source: PdfReader, output: PdfReader) -> dict[str, Any]:

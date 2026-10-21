@@ -191,6 +191,33 @@ assessment status remains `automated_checks_passed_manual_review_required`.
 Hands-on screen-reader testing and broader document coverage are still required
 before app integration or an established PDF/UA conformance claim.
 
+## Broader testing before integration
+
+The next matrix covered nine PDFs and 15 pages, including image-only scans,
+correct and deliberately incorrect OCR, interactive forms, unsigned XFA and a
+blank page. All original files and page appearances were preserved. Scans still
+need a text-recognition and accuracy workflow, and generated form descriptions
+remain placeholders. Six protected, malformed or over-limit inputs were rejected
+before output. The local batch runner currently reports generic errors and stops
+the entire batch on invalid input. See [the detailed results](BROAD_TEST_RESULTS.md)
+for evidence, reproduction and priorities. These cases received machine checks;
+they have not received complete semantic or human accessibility reviews.
+
+Saved-file adversarial tests also exercise reused drawing streams, clipped and
+shaded vector graphics, continued tables with three header levels, and text in
+multiple languages. They exposed two verifier gaps: an authored image description
+could change language without detection, and valid header IDs could form a cycle.
+The independent verifier now checks both. Header relationships use the effective
+attributes after class/direct overrides; unsupported attribute revisions make the
+inspection incomplete. Unsupported repeated semantic streams and merged data
+cells remain explicit refusals.
+
+[The hands-on review protocol](MANUAL_REVIEW.md) and `manual_review.py` prepare
+exact-file navigation and observation packs. They keep actual screen-reader
+results separate from native PDF evidence. The two CDC candidates still require
+that human pass before any conformance claim. No native PDF output has been added
+to the app.
+
 ## Reproduce locally
 
 Use a separate toolchain JSON containing absolute executable paths. Download
@@ -284,8 +311,10 @@ established the correct staff names. This correction affects inspection only;
 it does not rewrite PDF text or replace a screen-reader test. Native `ActualText`
 and its verified associations remain explicit evidence for the semantic auditor.
 
-Verification completed: 318 Python tests, thirteen audit-contract/batching/page-policy
-tests, TypeScript checking and linting of the changed TypeScript files.
+Verification completed: 342 Python tests, including 17 adversarial saved-file
+tests and seven manual-review-pack tests; thirteen audit-contract/batching/page-policy
+tests; TypeScript checking; and linting of the changed audit prompt. The prompt
+explicitly distinguishes effective table headers from superseded attributes.
 
 Tests:
 
