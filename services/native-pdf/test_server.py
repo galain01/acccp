@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 import server
+import stored_transport
 
 
 class HttpBoundaryTests(unittest.TestCase):
@@ -16,6 +17,7 @@ class HttpBoundaryTests(unittest.TestCase):
         cls.server = server.Server(("127.0.0.1", 0), server.Handler)
         cls.server.api_key = "synthetic-test-key-" + "x" * 32
         cls.server.toolchain = Path("fixed-test-toolchain.json")
+        cls.server.storage_origin = "https://example-project.supabase.co"
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
 
@@ -57,6 +59,7 @@ class HttpBoundaryTests(unittest.TestCase):
             ("/prepare", {"Transfer-Encoding": "chunked"}, 400),
             ("/prepare?download=http://example.org", {}, 404),
             ("/repair", {"Content-Type": "application/pdf"}, 400),
+            ("/repair-stored", {"Content-Type": "application/json", "Content-Length": str(stored_transport.MAX_REFERENCE + 1)}, 400),
         ]
         with patch.object(server, "execute") as execute:
             for path, headers, expected in variants:
@@ -69,6 +72,22 @@ class HttpBoundaryTests(unittest.TestCase):
             status, body, _ = self.request("/prepare", b"%PDF-1.7 synthetic")
             self.assertEqual((200, {"ok": True}), (status, body))
             execute.assert_called_once_with("prepare", b"%PDF-1.7 synthetic", self.server.toolchain)
+
+    def test_stored_repair_only_passes_verified_payload_to_pdf_child_with_remaining_deadline(self):
+        reference, payload = b'{"signedReference":"synthetic"}', b'{"source":"synthetic verified request"}'
+        with patch.object(server, "fetch_stored", return_value=payload) as fetch, patch.object(server, "execute", return_value=(200, {"ok": True})) as execute:
+            status, body, _ = self.request("/repair-stored", reference, {"Content-Type": "application/json"})
+        self.assertEqual((200, {"ok": True}), (status, body))
+        self.assertEqual((reference, self.server.storage_origin), fetch.call_args.args)
+        self.assertEqual(("repair", payload, self.server.toolchain), execute.call_args.args)
+        self.assertGreater(execute.call_args.kwargs["timeout"], 0)
+        self.assertLessEqual(execute.call_args.kwargs["timeout"], server.DEADLINE)
+
+    def test_stored_reference_failure_never_starts_pdf_processing(self):
+        with patch.object(server, "fetch_stored", side_effect=stored_transport.TransportError("native_pdf_invalid_plan")), patch.object(server, "execute") as execute:
+            status, body, _ = self.request("/repair-stored", b'{}', {"Content-Type": "application/json"})
+        self.assertEqual((400, {"error": {"code": "native_pdf_invalid_plan"}}), (status, body))
+        execute.assert_not_called()
 
     def test_parallel_job_is_rejected_and_slot_released_after_error(self):
         server.ACTIVE.acquire()

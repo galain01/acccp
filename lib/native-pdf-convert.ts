@@ -35,6 +35,7 @@ import {
   type NativePdfPlan,
   type NativePdfOperation,
   type NativePdfFinding,
+  type NativePdfTransport,
 } from "./native-pdf-worker";
 import {
   NATIVE_PDF_REPAIR_PROMPT,
@@ -462,7 +463,8 @@ function forUi(f: NativePdfFinding): AccessibilityError {
 }
 export async function repairNativePdf(
   source: Buffer,
-  filename: string
+  filename: string,
+  options: { transport?: NativePdfTransport } = {}
 ): Promise<NativePdfConversionResult | ConversionError> {
   const calls: ModelCallUsage[] = [];
   let stage: DiagnosticStage = "native_pdf_prepare";
@@ -551,7 +553,8 @@ export async function repairNativePdf(
       source,
       time(),
       prepared,
-      plan
+      plan,
+      options.transport
     );
     if (repaired.pageCount !== prepared.pageCount)
       throw new NativePdfError("native_pdf_preservation");

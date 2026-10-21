@@ -74,9 +74,13 @@ issues and are asked to review the repaired PDF before sharing it.
 - Model requests: bounded page/tag batches and at most four simultaneous calls,
   within the existing 260-second workflow deadline. Every completed conversion
   and audit call contributes to token and cost metrics, including failed attempts.
-- The private worker accepts only authenticated app requests. It receives PDF
-  content but no storage or model credentials, fetches no document URLs, and
-  deletes temporary files on completion or failure. The institutional LiteLLM
+- The private worker accepts only authenticated app requests. Large repair
+  requests use one short-lived signed object in the existing private storage
+  bucket. The worker can fetch only that configured project's narrowly defined
+  transfer path, verifies its exact size and SHA256, and refuses redirects.
+  It receives no storage service-role or model credentials. Its document
+  processors receive only the verified request bytes, and temporary files are
+  deleted on completion or failure. The institutional LiteLLM
   endpoint receives the source/output excerpts, images and metadata needed by
   the repair model and auditor, as in other document workflows.
 
@@ -105,6 +109,16 @@ Purge includes canonical job PDF/review paths even if artifact persistence faile
 plus every recorded legacy artifact path. Blob deletion precedes record deletion;
 failed cleanup keeps its discovery records. Downloaded local files are unaffected.
 Anonymous daily/model usage, cost and outcome totals survive content deletion.
+
+When a repair request exceeds 4 MiB, `native-pdf-transport-storage.ts` first
+commits a non-downloadable cleanup receipt, then uploads its bounded JSON under
+`{session}/{document}/{job}/native-pdf-request-{UUID}.json` while holding the
+retained-document lock. The worker gets a 60-second signed reference. The app
+removes the object after the request and removes its receipt only after a
+confirmed upload and deletion. Failed cleanup remains discoverable by purge.
+A recent unsettled receipt delays physical deletion for one hour to allow an
+ambiguous upload to settle; user access still expires after the original 14 days.
+This transfer changes no page content or image resolution.
 
 Before hosted activation, review and apply the migration to the intended
 database, build and configure the private service, and verify the deployed

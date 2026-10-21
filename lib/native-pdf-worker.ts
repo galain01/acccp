@@ -82,14 +82,29 @@ export interface NativePdfPlan {
   title?: string;
   operations: NativePdfOperation[];
 }
+export interface NativePdfStoredRequest {
+  requestUrl: string;
+  requestSha256: string;
+  requestBytes: number;
+}
+/** Production provides owned, retained storage; standalone local tools can send inline. */
+export type NativePdfTransport = <T>(
+  payload: Buffer,
+  signal: AbortSignal,
+  action: (descriptor: NativePdfStoredRequest) => Promise<T>
+) => Promise<T>;
 export class NativePdfError extends Error {
   readonly diagnostic;
-  constructor(code: DiagnosticCode = "native_pdf_worker_failed") {
+  constructor(
+    code: DiagnosticCode = "native_pdf_worker_failed",
+    httpStatus?: number
+  ) {
     super(code);
     this.name = "NativePdfError";
     this.diagnostic = createJobDiagnostic({
       stage: "native_pdf_prepare",
       code,
+      httpStatus,
     });
   }
 }
@@ -389,7 +404,8 @@ export async function nativePdfRequest(
   source: Buffer,
   timeoutMs: number,
   candidate?: NativePdfState,
-  plan?: NativePdfPlan
+  plan?: NativePdfPlan,
+  transport?: NativePdfTransport
 ): Promise<NativePdfState> {
   if (!Number.isFinite(timeoutMs) || timeoutMs < 1)
     throw new NativePdfError("native_pdf_timeout");
@@ -422,8 +438,11 @@ export async function nativePdfRequest(
   const signal = AbortSignal.timeout(
     Math.max(1, Math.floor(Math.min(timeoutMs, 90_000)))
   );
-  try {
-    const response = await fetch(url, {
+  const send = async (
+    requestUrl: URL,
+    requestBody: Uint8Array<ArrayBuffer> | string
+  ) => {
+    const response = await fetch(requestUrl, {
       method: "POST",
       redirect: "manual",
       cache: "no-store",
@@ -433,34 +452,63 @@ export async function nativePdfRequest(
         "Content-Type":
           path === "prepare" ? "application/pdf" : "application/json",
       },
-      body,
+      body: requestBody,
     });
     if (
       (response.status >= 300 && response.status < 400) ||
       [401, 403].includes(response.status)
     ) {
       void response.body?.cancel().catch(() => {});
-      throw new NativePdfError("native_pdf_configuration");
+      throw new NativePdfError("native_pdf_configuration", response.status);
     }
-    const raw = await boundedResponse(
-      response,
-      signal,
-      response.ok ? 16 * 1024 * 1024 : 4096
-    );
     if (!response.ok) {
+      // Platform errors can be plain text. Preserve the safe status even when
+      // there is no worker JSON; never retain arbitrary upstream error bodies.
+      let raw: unknown;
+      try {
+        raw = await boundedResponse(response, signal, 4096);
+      } catch {
+        if (signal.aborted) throw new NativePdfError("native_pdf_timeout");
+      }
       const code =
         objectRecord(raw) && objectRecord(raw.error)
           ? raw.error.code
           : undefined;
       throw new NativePdfError(
-        WORKER_CODES.includes(code as DiagnosticCode)
-          ? (code as DiagnosticCode)
-          : response.status === 503 || response.status === 429
-            ? "native_pdf_busy"
-            : "native_pdf_worker_failed"
+        response.status === 413
+          ? "pdf_complexity_limit"
+          : WORKER_CODES.includes(code as DiagnosticCode)
+            ? (code as DiagnosticCode)
+            : response.status === 503 || response.status === 429
+              ? "native_pdf_busy"
+              : "native_pdf_worker_failed",
+        response.status
       );
     }
+    const raw = await boundedResponse(response, signal, 16 * 1024 * 1024);
     return parseNativePdfState(raw, source);
+  };
+  try {
+    if (
+      path === "repair" &&
+      typeof body === "string" &&
+      Buffer.byteLength(body) > MAX_FILE_SIZE_BYTES &&
+      transport
+    ) {
+      const payload = Buffer.from(body);
+      const storedUrl = configuration("repair-stored").url;
+      return await transport(payload, signal, async (descriptor) => {
+        if (
+          descriptor.requestBytes !== payload.length ||
+          descriptor.requestSha256 !== pdfSha256(payload) ||
+          typeof descriptor.requestUrl !== "string" ||
+          descriptor.requestUrl.length > 8000
+        )
+          return fail();
+        return send(storedUrl, JSON.stringify(descriptor));
+      });
+    }
+    return await send(url, body);
   } catch (error) {
     if (signal.aborted) throw new NativePdfError("native_pdf_timeout");
     if (error instanceof NativePdfError) throw error;
