@@ -7,7 +7,7 @@ import {
 import { isOutputTarget } from "@/lib/output-formats";
 
 describe("requested document output", () => {
-  it.each(["lecture.docx", "article.pdf"])(
+  it.each(["article.pdf"])(
     "never substitutes HTML for unavailable native %s output",
     (filename) => {
       const choice = getOutputChoice(filename, "original");
@@ -24,6 +24,18 @@ describe("requested document output", () => {
       expect(getOutputChoice(filename, "html").target).toBe("canvas_html");
     }
   );
+
+  it("offers native Word without changing previously saved HTML destinations", () => {
+    expect(getOutputChoice("notes.DOCX", "original").target).toBe(
+      "accessible_docx"
+    );
+    expect(getOutputChoice("notes.docx", "html").target).toBe("canvas_html");
+    expect(
+      getDocumentOutputChoice({ name: "old.docx", outputTarget: "canvas_html" })
+        .target
+    ).toBe("canvas_html");
+    expect(isOutputTarget("accessible_docx")).toBe(true);
+  });
 
   it("supports native PowerPoint while leaving HTML unavailable", () => {
     expect(getOutputChoice("lecture.PPTX", "original").target).toBe(
@@ -46,12 +58,7 @@ describe("requested document output", () => {
   });
 
   it("does not widen the API contract to unsupported targets or UI intent values", () => {
-    for (const value of [
-      "original",
-      "html",
-      "accessible_docx",
-      "accessible_pdf",
-    ])
+    for (const value of ["original", "html", "accessible_pdf"])
       expect(isOutputTarget(value)).toBe(false);
     expect(isOutputIntent("original")).toBe(true);
     expect(isOutputIntent("html")).toBe(true);

@@ -33,17 +33,17 @@ Only enable a destination after its repair and validation pipeline works.
 
 ## Implementation status
 
-The current branch implements the shared workflow foundation. It does not add
-native Word or PDF repair. Production is unchanged until a separate release.
+The current branch implements the shared workflow and native Word repair.
+Native PDF remains planned. Production is unchanged until a separate release.
 
 | Input | Keep original format | HTML |
 | --- | --- | --- |
 | `.pptx` | Existing native repair engine | Not implemented |
-| `.docx` | Not implemented | Existing Canvas HTML engine |
+| `.docx` | Native repair; local testing | Existing Canvas HTML engine |
 | `.pdf` | Not implemented | Existing Canvas HTML engine |
 
 For the preparatory UI, requested `original`/`html` intent is distinct from
-executable `OutputTarget`. The server still accepts only `accessible_pptx` and
+executable `OutputTarget`. The server accepts `accessible_docx`, `accessible_pptx` and
 `canvas_html`, with its existing input/target checks. An unavailable choice must
 never be submitted using the legacy Canvas default. Destination changes are
 limited to local pending files; an attempted/saved file keeps its fixed target.
@@ -67,34 +67,19 @@ file, including content and visual preservation, rather than trusting the
 model's claim that it fixed something. PDF previews are evidence for native
 Office repairs; they are not the editable output.
 
-### Word: next native engine
+### Word: implemented on this branch
 
-Build a dedicated DOCX inspector and writer using the existing OOXML preservation
-pattern from PowerPoint. Reuse generic bounded ZIP/XML handling where suitable;
-do not force paragraph operations into slide/object contracts.
+See [native Word repair](word-accessibility.md) for the pipeline, supported
+operations, limits, storage and migration. The engine patches original OOXML,
+checks content/parts, reopens and renders the actual output, and independently
+audits its metadata and pages. Its strict preservation mode rolls back repairs
+that change rendered pixels or pagination. Complex structures remain review
+items. The result offers a native download, change summary and actionable
+findings; per-change keep/restore is future work.
 
-Initial supported fixes should include heading hierarchy, supported image
-descriptions/decorative state, header rows in simple data tables, language
-settings, and simple link labels without changing destinations. Preserve
-existing authored alternatives unless an explicit reviewable replacement is
-justified. Treat merged captions, complex tables, fields, tracked changes,
-equations, embedded objects, and ambiguous legacy drawings conservatively.
-
-Native table headers use `w:trPr/w:tblHeader`; visual formatting alone is not
-enough. Heading fixes should retain existing visual formatting where practical.
-Paragraph changes may cause reflow, so compare content and layout instead of
-requiring identical page pixels.
-
-Anchor changes to stable package parts and paragraph/table/drawing identities
-plus source hashes. Word pages are not stable source objects. Use section names
-and exact nearby text in review items, with page numbers only when verified.
-Use the application's actual-difference keep/restore review pattern; Word Track
-Changes does not consistently represent every accessibility metadata change.
-
-Before enabling: validate against OOXML schema, reopen and check repaired
-properties, compare untouched parts/media/text/data/links, render before/after,
-run independent audit, test Word's Accessibility Checker and representative
-screen-reader navigation. Include source-to-output and restore-all tests.
+Local evaluation uses controlled and instructor files with independent OpenXML
+SDK, package-preservation and visual comparisons. Word Accessibility Checker
+and screen-reader verification remain part of the release review.
 
 ### PDF: choose and evaluate a remediation engine
 
@@ -138,11 +123,10 @@ without changing existing saved Canvas outputs.
 
 ## Shared persistence and rollout
 
-Before adding native engines, introduce explicit destination dispatch and
-typed native/HTML results. The current route and result dialog have
-PowerPoint-versus-everything-else branches that must not turn a new native Word
-or PDF target into HTML. Add `accessible_docx`/`accessible_pdf`, their output
-artifacts, MIME types, signed downloads, and canonical purge paths together.
+Explicit dispatch and typed results now separate Canvas HTML, native Word and
+native PowerPoint, including artifacts, MIME types, downloads and purge paths.
+The future `accessible_pdf` destination must add these together; it cannot
+fall through to the HTML branch.
 
 One source should eventually own several independent result jobs. The current
 database still enforces legacy `UNIQUE(document_id)` alongside

@@ -41,8 +41,7 @@ export function getOutputChoice(
   if (isDocxFilename(filename))
     return {
       label: "Word (.docx)",
-      unavailableReason:
-        "Word output is not available yet. You can choose HTML (Canvas), or keep your original file for a future release.",
+      target: "accessible_docx",
     };
   if (isPdfFilename(filename))
     return {

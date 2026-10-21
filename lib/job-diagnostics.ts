@@ -1,6 +1,9 @@
 /** Data-only, bounded diagnostics. No provider messages or arbitrary metadata. */
 export const DIAGNOSTIC_STAGES = [
   "pptx_prepare",
+  "docx_prepare",
+  "docx_repair",
+  "docx_audit",
   "word_to_pdf",
   "pdf_render",
   "conversion",
@@ -11,6 +14,9 @@ export const DIAGNOSTIC_STAGES = [
 export type DiagnosticStage = (typeof DIAGNOSTIC_STAGES)[number];
 
 export const DIAGNOSTIC_CODES = [
+  "docx_invalid",
+  "docx_invalid_plan",
+  "docx_visual_change",
   "pptx_invalid",
   "pptx_render_failed",
   "pptx_visual_change",
@@ -159,6 +165,9 @@ export function readJobDiagnostic(input: unknown): JobDiagnostic | null {
 }
 
 const STAGE_LABELS: Record<DiagnosticStage, string> = {
+  docx_prepare: "Word preparation",
+  docx_repair: "Word accessibility repair",
+  docx_audit: "Word accessibility review",
   pptx_prepare: "PowerPoint preparation",
   word_to_pdf: "Word-to-PDF conversion",
   pdf_render: "PDF page preparation",
@@ -172,6 +181,12 @@ export function diagnosticStageLabel(stage: DiagnosticStage): string {
 }
 
 const EXPLANATIONS: Record<DiagnosticCode, string> = {
+  docx_invalid:
+    "The app could not safely read this Word document. Use an unprotected .docx file up to 4 MB. Embed linked images or templates and remove fields that load external files. Macro-enabled and digitally signed files are not supported.",
+  docx_invalid_plan:
+    "The AI service did not return a complete, usable Word repair plan. Try again or contact the administrator.",
+  docx_visual_change:
+    "The proposed repairs changed the document layout during verification. Review this document in Word before sharing it.",
   pptx_invalid:
     "The app could not safely read this presentation. Use an unprotected .pptx file up to 25 MB, with at most 60 slides. Macro-enabled and digitally signed files are not supported.",
   pptx_render_failed:

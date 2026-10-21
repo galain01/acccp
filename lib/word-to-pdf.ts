@@ -9,6 +9,7 @@ import {
   DOCX_MIME_TYPE,
   isPdfBuffer,
   MAX_FILE_SIZE_BYTES,
+  MAX_DOCX_OUTPUT_SIZE_BYTES,
 } from "@/lib/document-input";
 
 const RENDER_TIMEOUT_MS = 60_000;
@@ -215,15 +216,34 @@ async function readPdf(
 /** Render in a dedicated worker; source bytes and credentials stay server-side. */
 export async function renderWordToPdf(
   buffer: Buffer,
-  filename: string
+  filename: string,
+  timeoutMs = RENDER_TIMEOUT_MS,
+  options: { maxInputBytes?: number } = {}
 ): Promise<Buffer> {
+  if (
+    !Number.isFinite(timeoutMs) ||
+    timeoutMs < 1 ||
+    timeoutMs > RENDER_TIMEOUT_MS
+  )
+    throw new RangeError(
+      "Word rendering timeout must be between 1 and 60000 milliseconds."
+    );
+  const maxInputBytes = options.maxInputBytes ?? MAX_FILE_SIZE_BYTES;
+  if (
+    !Number.isSafeInteger(maxInputBytes) ||
+    maxInputBytes < 1 ||
+    maxInputBytes > MAX_DOCX_OUTPUT_SIZE_BYTES
+  )
+    throw new RangeError(
+      "Word rendering input limit exceeds the supported generated-output size."
+    );
   if (!filename.toLowerCase().endsWith(".docx")) {
     throw new WordToPdfError("Upload a .docx Word document or a PDF.", 415);
   }
   if (buffer.byteLength === 0) {
     throw new WordToPdfError("The Word document is empty.", 400);
   }
-  if (buffer.byteLength > MAX_FILE_SIZE_BYTES) {
+  if (buffer.byteLength > maxInputBytes) {
     throw new WordToPdfError(
       "File too large. Maximum upload size is 4 MB.",
       413,
@@ -254,7 +274,7 @@ export async function renderWordToPdf(
         )
       );
       controller.abort();
-    }, RENDER_TIMEOUT_MS);
+    }, timeoutMs);
   });
 
   try {

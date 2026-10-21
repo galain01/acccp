@@ -3,10 +3,9 @@
 ## Overview
 
 ACCCP helps OSU instructors improve the accessibility of teaching materials and
-choose the format they need. PowerPoint can be repaired in its original `.pptx`
-format; Word and PDF can currently be converted to Canvas-compatible HTML.
-Native Word and PDF repair are planned and remain unavailable until their
-dedicated engines are validated. See the [implementation roadmap](docs/document-accessibility-roadmap.md)
+choose the format they need. Word and PowerPoint have native repair paths that
+return editable `.docx` and `.pptx` files. Word and PDF can also become
+Canvas-compatible HTML. Native PDF repair is planned. See the [implementation roadmap](docs/document-accessibility-roadmap.md)
 for the format-preserving direction and release gates.
 
 This project was developed as part of a summer 2026 CSE 5911 capstone session
@@ -55,7 +54,9 @@ project's technical reference for humans.
    their existing destination. Word-to-HTML requires the
    [Word rendering service](docs/word-to-pdf.md).
 3. Click **Improve accessibility**. Eligible new or failed unlocked documents are
-   processed; completed documents require an explicit rerun. Native PowerPoint
+   processed; completed documents require an explicit rerun. Native Word uses
+   its [layout-preserving repair and audit pipeline](docs/word-accessibility.md).
+   Native PowerPoint
    uses its [dedicated repair and review pipeline](docs/powerpoint-accessibility.md).
    For Canvas HTML, Word documents are first rendered to PDF by the configured
    service. Word/PDF then enter the two-stage HTML pipeline:
@@ -75,8 +76,9 @@ project's technical reference for humans.
    Word conversions also include a manual-review notice: linked content can be
    omitted and fonts or page layout can change during rendering. Compare the
    rendered result with the original even when conversion succeeds.
-4. Open a completed document to review its result. Native PowerPoint provides
-   an updated `.pptx`, measured changes and review items. HTML results provide
+4. Open a completed document to review its result. Native Word and PowerPoint
+   provide an updated file, measured changes and review items. Run the matching
+   Office Accessibility Checker before sharing. HTML results provide
    formatted HTML, items labeled **Needs a fix** or **Please check**, and buttons
    to copy or download it for Canvas.
 5. Locking a document (padlock icon in the table) excludes it from the next

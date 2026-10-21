@@ -41,15 +41,18 @@ export default function DocumentProcessingNotice({
           </p>
           <p>
             Download the updated file and review its changes and remaining
-            questions. For PowerPoint, also run its built-in Accessibility
-            Checker before sharing the presentation.
+            questions. For Word and PowerPoint, also run the built-in
+            Accessibility Checker before sharing the document.
           </p>
         </div>
       </aside>
     );
   }
 
-  if (outputTarget === "accessible_pptx") {
+  if (
+    outputTarget === "accessible_pptx" ||
+    outputTarget === "accessible_docx"
+  ) {
     return (
       <aside
         aria-labelledby={headingId}
@@ -57,13 +60,17 @@ export default function DocumentProcessingNotice({
       >
         <h2 id={headingId} className="mb-2 flex items-center gap-2 font-medium">
           <Info className="size-4 shrink-0" aria-hidden="true" />
-          Review the updated presentation
+          Review the updated{" "}
+          {outputTarget === "accessible_docx"
+            ? "Word document"
+            : "presentation"}
         </h2>
         <p className="leading-relaxed">
           The tool makes supported accessibility improvements and lists items
-          that still need your attention by slide. Open the result in
-          PowerPoint, run its Accessibility Checker, and compare it with your
-          original before sharing it with students.
+          that still need your attention. Open the result in
+          {outputTarget === "accessible_docx" ? " Word" : " PowerPoint"}, run
+          its Accessibility Checker, and compare it with your original before
+          sharing it with students.
         </p>
       </aside>
     );

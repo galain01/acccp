@@ -283,7 +283,7 @@ export default function DocumentWorkspace({
           processingPhase: undefined,
           documentId,
           jobId: data.jobId,
-          html: target === "accessible_pptx" ? undefined : data.html,
+          html: target === "canvas_html" ? data.html : undefined,
           changes: data.changes,
           errorMessage: undefined,
           errors: data.errors,
@@ -384,9 +384,9 @@ export default function DocumentWorkspace({
           className="text-sm text-muted-foreground"
         >
           Choose a format for new files, then adjust individual files below.
-          Original-format improvements are currently available for PowerPoint.
-          Word and PDF currently support HTML output only. PowerPoint to HTML is
-          not available yet.
+          Original-format improvements are available for Word and PowerPoint.
+          Word and PDF can also become HTML. PDF repair and PowerPoint to HTML
+          are not available yet.
         </p>
         {hasDocuments && (
           <div>

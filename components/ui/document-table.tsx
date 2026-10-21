@@ -44,7 +44,7 @@ interface DocumentTableProps {
 
 function statusBadge(
   status: ConversionStatus,
-  isPowerPoint = false,
+  isNative = false,
   hasAccessibilityErrors = false,
   uploading = false
 ): React.JSX.Element {
@@ -60,7 +60,7 @@ function statusBadge(
         </Badge>
       );
     case "success":
-      if (isPowerPoint) {
+      if (isNative) {
         return (
           <Badge variant={hasAccessibilityErrors ? "destructive" : "secondary"}>
             {hasAccessibilityErrors ? "Needs a fix" : "Ready to review"}
@@ -243,7 +243,8 @@ export default function DocumentTable({
                           }
                           value={
                             doc.outputIntent ??
-                            (doc.outputTarget === "accessible_pptx"
+                            (doc.outputTarget &&
+                            doc.outputTarget !== "canvas_html"
                               ? "original"
                               : "html")
                           }
@@ -283,7 +284,8 @@ export default function DocumentTable({
                       ) : (
                         statusBadge(
                           doc.status,
-                          doc.outputTarget === "accessible_pptx",
+                          doc.outputTarget === "accessible_pptx" ||
+                            doc.outputTarget === "accessible_docx",
                           doc.errors?.some(
                             (issue) => issue.severity === "error"
                           ),

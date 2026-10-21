@@ -20,6 +20,7 @@ import { archiveDocumentMetrics } from "./retained-metrics";
 import {
   htmlOutputKey,
   pptxOutputKey,
+  docxOutputKey,
   outputReviewKey,
   removeObjects,
   sourceDocxKey,
@@ -252,6 +253,11 @@ async function purgeNextDocument(
             artifact.jobId
               ? [
                   pptxOutputKey(
+                    document.sessionId,
+                    document.id,
+                    artifact.jobId
+                  ),
+                  docxOutputKey(
                     document.sessionId,
                     document.id,
                     artifact.jobId

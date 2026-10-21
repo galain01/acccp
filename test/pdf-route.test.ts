@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   auth: vi.fn(),
   convert: vi.fn(),
   convertPowerPoint: vi.fn(),
+  convertWord: vi.fn(),
   renderWord: vi.fn(),
   countPages: vi.fn(),
   upload: vi.fn(),
@@ -45,6 +46,7 @@ vi.mock("@/lib/document-upload", () => ({
   },
 }));
 vi.mock("@/lib/convert", () => ({ convertPdf: mocks.convert }));
+vi.mock("@/lib/word-convert", () => ({ convertWord: mocks.convertWord }));
 vi.mock("@/lib/powerpoint-convert", () => ({
   convertPowerPoint: mocks.convertPowerPoint,
 }));
@@ -78,6 +80,8 @@ vi.mock("@/lib/storage", () => ({
     `${sessionId}/${documentId}/output.html`,
   sourcePptxKey: (sessionId: string, documentId: string) =>
     `${sessionId}/${documentId}/source.pptx`,
+  docxOutputKey: (s: string, d: string, j: string) =>
+    `${s}/${d}/${j}/output.docx`,
   pptxOutputKey: (sessionId: string, documentId: string, jobId: string) =>
     `${sessionId}/${documentId}/${jobId}/output.pptx`,
   outputReviewKey: (sessionId: string, documentId: string, jobId: string) =>
@@ -121,6 +125,7 @@ const usage = {
 function chain(value: unknown = []) {
   const builder = {
     from: vi.fn(),
+    leftJoin: vi.fn(),
     where: vi.fn(),
     values: vi.fn(),
     set: vi.fn(),
@@ -131,6 +136,7 @@ function chain(value: unknown = []) {
   };
   for (const method of [
     builder.from,
+    builder.leftJoin,
     builder.where,
     builder.values,
     builder.set,
@@ -261,6 +267,18 @@ describe("document conversion route", () => {
       extractionWarnings: [],
       calls: [usage],
     });
+    mocks.convertWord.mockResolvedValue({
+      docx: Buffer.from("PK\x03\x04repaired Word"),
+      errors: [],
+      changes: [
+        "Course schedule: identified the first row as column headings.",
+      ],
+      model: usage.model,
+      tokensUsed: 300,
+      extractionWarnings: [],
+      calls: [usage, { ...usage, stage: "validate" }],
+      pageCount: 3,
+    });
     mocks.convertPowerPoint.mockResolvedValue({
       pptx: Buffer.from("PK\x03\x04remediated presentation"),
       errors: [],
@@ -334,10 +352,243 @@ describe("document conversion route", () => {
     ).toEqual(body.changes);
   });
 
+  it("repairs Word in its original format and saves both model stages without HTML or a stored preview PDF", async () => {
+    const response = await POST(
+      request({
+        name: "Course.DOCX",
+        contents: DOCX,
+        outputTarget: "accessible_docx",
+      })
+    );
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toMatchObject({
+      documentId: "doc-1",
+      jobId: "job-1",
+      outputTarget: "accessible_docx",
+      tokensUsed: 300,
+    });
+    expect(body).not.toHaveProperty("html");
+    expect(body).not.toHaveProperty("docx");
+    expect(mocks.convertWord).toHaveBeenCalledExactlyOnceWith(
+      Buffer.from(DOCX),
+      "Course.DOCX"
+    );
+    expect(mocks.convert).not.toHaveBeenCalled();
+    expect(mocks.convertPowerPoint).not.toHaveBeenCalled();
+    expect(mocks.renderWord).not.toHaveBeenCalled();
+    expect(mocks.countPages).not.toHaveBeenCalled();
+    expect(mocks.upload.mock.calls.map(([key]) => key)).toEqual([
+      "session-1/doc-1/source.docx",
+      "session-1/doc-1/job-1/output.docx",
+      "session-1/doc-1/job-1/review.json",
+    ]);
+    expect(mocks.upload.mock.calls[0].slice(1)).toEqual([
+      Buffer.from(DOCX),
+      DOCX_MIME_TYPE,
+    ]);
+    expect(mocks.upload.mock.calls[1][2]).toBe(DOCX_MIME_TYPE);
+    const review = JSON.parse(mocks.upload.mock.calls[2][1]);
+    expect(review).toMatchObject({
+      outputTarget: "accessible_docx",
+      changes: body.changes,
+      findings: [],
+    });
+    expect(artifactValues().map((value) => value.artifactType)).toEqual([
+      "source_docx",
+      "docx_output",
+      "review_metadata",
+    ]);
+    expect(
+      artifactValues().every((value) => value.previewSnippet === null)
+    ).toBe(true);
+    expect(inserted.get(conversionJobs)?.values).toHaveBeenCalledWith(
+      expect.objectContaining({
+        outputTarget: "accessible_docx",
+        expiresAt: "2026-09-15T00:00:00.000Z",
+      })
+    );
+    expect(updated.set).toHaveBeenLastCalledWith(
+      expect.objectContaining({ pageCount: 3, status: "completed" })
+    );
+    const receipts = inserted.get(modelCalls)?.values.mock.calls[0][0];
+    expect(receipts).toEqual([
+      expect.objectContaining({
+        ...usage,
+        jobId: "job-1",
+        costUsd: "0.001",
+        id: expect.any(String),
+      }),
+      expect.objectContaining({
+        ...usage,
+        stage: "validate",
+        jobId: "job-1",
+        costUsd: "0.001",
+        id: expect.any(String),
+      }),
+    ]);
+    expect(new Set(receipts.map((call: { id: string }) => call.id)).size).toBe(
+      2
+    );
+    expect(inserted.get(modelCalls)?.onConflictDoNothing).toHaveBeenCalledWith({
+      target: modelCalls.id,
+    });
+  });
+
+  it("retries native Word from the immutable original without replacing it or writing a preview PDF", async () => {
+    ownedDocument("course.docx");
+    mocks.download.mockResolvedValueOnce(Buffer.from(DOCX));
+    expect(
+      (
+        await POST(
+          request({ documentId: "doc-1", outputTarget: "accessible_docx" })
+        )
+      ).status
+    ).toBe(200);
+    expect(mocks.download).toHaveBeenCalledExactlyOnceWith(
+      "session-1/doc-1/source.docx"
+    );
+    expect(mocks.convertWord).toHaveBeenCalledExactlyOnceWith(
+      Buffer.from(DOCX),
+      "course.docx"
+    );
+    expect(inserted.has(documents)).toBe(false);
+    expect(mocks.upload.mock.calls.map(([key]) => key)).toEqual([
+      "session-1/doc-1/job-1/output.docx",
+      "session-1/doc-1/job-1/review.json",
+    ]);
+  });
+
+  it.each(["canvas_html", "accessible_docx"])(
+    "rejects changing a saved Word destination from %s before downloading its source",
+    async (savedTarget) => {
+      mocks.db.select
+        .mockReturnValueOnce(chain([{ id: "session-1" }]))
+        .mockReturnValueOnce(
+          chain([
+            {
+              id: "doc-1",
+              originalFilename: "course.docx",
+              outputTarget: savedTarget,
+            },
+          ])
+        );
+      const response = await POST(
+        request({
+          documentId: "doc-1",
+          outputTarget:
+            savedTarget === "canvas_html" ? "accessible_docx" : "canvas_html",
+        })
+      );
+      expect(response.status).toBe(409);
+      expect(mocks.download).not.toHaveBeenCalled();
+      expect(mocks.renderWord).not.toHaveBeenCalled();
+      expect(mocks.convertWord).not.toHaveBeenCalled();
+      expect(mocks.convert).not.toHaveBeenCalled();
+      expect(mocks.db.insert).not.toHaveBeenCalled();
+    }
+  );
+
+  it("returns 409 for an active native Word job before incurring another model call", async () => {
+    ownedDocument("course.docx");
+    const active = chain([{ status: "processing" }]);
+    mocks.db.select.mockReturnValueOnce(active);
+    mocks.download.mockResolvedValueOnce(Buffer.from(DOCX));
+    expect(
+      (
+        await POST(
+          request({ documentId: "doc-1", outputTarget: "accessible_docx" })
+        )
+      ).status
+    ).toBe(409);
+    const predicate = new PgDialect().sqlToQuery(
+      active.where.mock.calls[0][0] as SQL
+    );
+    expect(predicate.params).toEqual(
+      expect.arrayContaining(["doc-1", "accessible_docx", "processing"])
+    );
+    expect(predicate.sql).toContain("330 seconds");
+    expect(mocks.convertWord).not.toHaveBeenCalled();
+    expect(mocks.db.insert).not.toHaveBeenCalled();
+    expect(mocks.upload).not.toHaveBeenCalled();
+  });
+
+  it("keeps native Word model usage when its repair cannot preserve the rendered layout", async () => {
+    mocks.convertWord.mockResolvedValueOnce({
+      error: "unsafe provider details must not be saved",
+      calls: [usage, { ...usage, stage: "validate" }],
+      diagnostic: createJobDiagnostic({
+        stage: "docx_repair",
+        code: "docx_visual_change",
+      }),
+    });
+    const response = await POST(
+      request({
+        name: "course.docx",
+        contents: DOCX,
+        outputTarget: "accessible_docx",
+      })
+    );
+    expect(response.status).toBe(500);
+    expect(JSON.stringify(await response.json())).not.toContain(
+      "unsafe provider"
+    );
+    expect(mocks.upload.mock.calls.map(([key]) => key)).toEqual([
+      "session-1/doc-1/source.docx",
+    ]);
+    expect(updated.set).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: "failed",
+        errorCode: "docx_visual_change",
+      })
+    );
+    expect(inserted.get(modelCalls)?.values).toHaveBeenCalledWith([
+      expect.objectContaining({ stage: "convert", costUsd: "0.001" }),
+      expect.objectContaining({ stage: "validate", costUsd: "0.001" }),
+    ]);
+    expect(artifactValues()).toEqual([]);
+  });
+
+  it.each(["output.docx", "review.json"])(
+    "retains all native Word usage if %s cannot be stored",
+    async (failedFile) => {
+      mocks.upload
+        .mockImplementationOnce(async () => {})
+        .mockImplementation(async (key: string) => {
+          if (key.endsWith(failedFile))
+            throw new Error("private-storage-error");
+        });
+      const response = await POST(
+        request({
+          name: "course.docx",
+          contents: DOCX,
+          outputTarget: "accessible_docx",
+        })
+      );
+      expect(response.status).toBe(500);
+      expect(JSON.stringify(await response.json())).not.toContain(
+        "private-storage-error"
+      );
+      expect(updated.set).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: "failed",
+          errorCode: "output_storage_failed",
+        })
+      );
+      expect(inserted.get(modelCalls)?.values).toHaveBeenCalledWith([
+        expect.objectContaining({ stage: "convert", costUsd: "0.001" }),
+        expect.objectContaining({ stage: "validate", costUsd: "0.001" }),
+      ]);
+      expect(artifactValues()).toEqual([]);
+    }
+  );
+
   it.each([
     ["course.pdf", PDF, "accessible_pptx"],
     ["course.docx", DOCX, "accessible_pptx"],
     ["course.pptx", DOCX, "canvas_html"],
+    ["course.pdf", PDF, "accessible_docx"],
+    ["course.pptx", DOCX, "accessible_docx"],
   ])(
     "rejects mismatched source %s and target %s before storing content",
     async (name, contents, outputTarget) => {

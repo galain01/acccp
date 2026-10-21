@@ -24,6 +24,8 @@ vi.mock("@/lib/storage", () => ({
     `${session}/${id}/output.html`,
   sourcePptxKey: (session: string, id: string) =>
     `${session}/${id}/source.pptx`,
+  docxOutputKey: (session: string, id: string, job: string) =>
+    `${session}/${id}/${job}/output.docx`,
   pptxOutputKey: (session: string, id: string, job: string) =>
     `${session}/${id}/${job}/output.pptx`,
   outputReviewKey: (session: string, id: string, job: string) =>
@@ -283,11 +285,44 @@ describe("document purge", () => {
     expect(mocks.remove.mock.calls[0][0]).toEqual([
       ...keys,
       `${root}/job-pptx/output.pptx`,
+      `${root}/job-pptx/output.docx`,
       `${root}/job-pptx/review.json`,
       `${root}/job-legacy/output.pptx`,
+      `${root}/job-legacy/output.docx`,
       `${root}/job-legacy/review.json`,
       "legacy/output.pptx",
     ]);
+    expect(archiveQueries()).toHaveLength(4);
+  });
+
+  it("purges native Word outputs and review files even after partial metadata saves, while archiving usage", async () => {
+    queued(
+      [document],
+      [{ id: document.id }],
+      [
+        { jobId: "word-job", storageKey: null },
+        { jobId: "word-job", storageKey: "old-word-result.docx" },
+        { jobId: "word-job", storageKey: "old-word-review.json" },
+      ]
+    );
+    expect(await purgeDocumentIfEligible(document.id)).toBe("purged");
+    const prefix = `${document.sessionId}/${document.id}/word-job`;
+    const removed = mocks.remove.mock.calls[0][0] as string[];
+    expect(removed).toEqual(
+      expect.arrayContaining([
+        keys[0],
+        `${prefix}/output.docx`,
+        `${prefix}/review.json`,
+        "old-word-result.docx",
+        "old-word-review.json",
+      ])
+    );
+    expect(
+      removed.filter((key) => key === `${prefix}/output.docx`)
+    ).toHaveLength(1);
+    expect(mocks.remove.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.db.delete.mock.invocationCallOrder[0]
+    );
     expect(archiveQueries()).toHaveLength(4);
   });
 

@@ -292,6 +292,50 @@ describe("Word renderer bounded responses", () => {
     expect(fetchMock.mock.calls[0][1]?.signal?.aborted).toBe(true);
   });
 
+  it("honors a shorter workflow deadline and aborts the request", async () => {
+    vi.useFakeTimers();
+    fetchMock.mockReturnValue(new Promise(() => {}));
+    const pending = renderWordToPdf(word, "file.docx", 1200);
+    const assertion = expect(pending).rejects.toMatchObject({
+      status: 504,
+      diagnostic: { code: "word_timeout" },
+    });
+    await vi.advanceTimersByTimeAsync(1200);
+    await assertion;
+    expect(fetchMock.mock.calls[0][1]?.signal?.aborted).toBe(true);
+  });
+
+  it.each([0, -1, NaN, 60_001])(
+    "rejects invalid workflow timeout %s before sending a file",
+    async (timeout) => {
+      await expect(renderWordToPdf(word, "file.docx", timeout)).rejects.toThrow(
+        RangeError
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
+    }
+  );
+
+  it("accepts a trusted generated DOCX over the upload limit without raising the default", async () => {
+    const generated = Buffer.alloc(MAX_FILE_SIZE_BYTES + 1);
+    word.copy(generated);
+    await expect(renderWordToPdf(generated, "file.docx")).rejects.toMatchObject(
+      { status: 413 }
+    );
+    await expect(
+      renderWordToPdf(generated, "file.docx", 60_000, {
+        maxInputBytes: 8 * 1024 * 1024,
+      })
+    ).resolves.toEqual(pdf);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects an unbounded trusted rendering input limit", async () => {
+    await expect(
+      renderWordToPdf(word, "file.docx", 60_000, { maxInputBytes: Infinity })
+    ).rejects.toThrow(RangeError);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("also times out a response whose PDF stream stalls", async () => {
     vi.useFakeTimers();
     const cancel = vi.fn();

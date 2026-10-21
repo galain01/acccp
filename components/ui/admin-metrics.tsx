@@ -216,8 +216,8 @@ export default async function AdminMetrics({
           }
         >
           {formatNumber(summary.pageMeasuredJobCount)} of{" "}
-          {formatNumber(summary.jobCount)} jobs have page or slide counts. PDF
-          pages or PowerPoint slides from the latest attempt.
+          {formatNumber(summary.jobCount)} jobs have page or slide counts. Word
+          preview pages, PDF pages or PowerPoint slides from the latest attempt.
         </MetricCard>
         <MetricCard
           title="Average cost per job"
