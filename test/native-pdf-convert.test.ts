@@ -422,7 +422,10 @@ describe("native PDF orchestration", () => {
   it("uses the immutable source and exact saved PDF, preserving all model-call costs and explicit review limits", async () => {
     const state = await makeState();
     useState(state);
-    const result = await repairNativePdf(state.pdf, "lecture.pdf");
+    const transport = vi.fn();
+    const result = await repairNativePdf(state.pdf, "lecture.pdf", {
+      transport,
+    });
     if ("error" in result) throw Error(result.error);
     expect(result.pdf).toEqual(state.pdf);
     expect(mocks.worker.mock.calls[1]).toEqual([
@@ -435,6 +438,7 @@ describe("native PDF orchestration", () => {
         candidateSha256: state.candidateSha256,
         operations: [],
       },
+      transport,
     ]);
     expect(result.calls.map((c) => c.stage)).toEqual(["convert", "validate"]);
     expect(result.calls.map((c) => c.costUsd)).toEqual([0.01, 0.01]);

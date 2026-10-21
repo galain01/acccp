@@ -7,9 +7,11 @@ repairs for the app's `accessible_pdf` destination. See
 The app supplies the model and independent semantic audit. This worker runs
 OpenDataLoader PDF 2.5.14 only for untagged inputs, applies approved native tag
 changes, compares saved output with the immutable original, and runs veraPDF
-1.30.3 using its PDF/UA-1 profile. It does not call a model, fetch document URLs
-or access application storage. Existing tags, figure descriptions, reading
-replacements, interactive values and original page layout are protected.
+1.30.3 using its PDF/UA-1 profile. It does not call a model or hold application
+storage credentials. For large repair requests, a separate bounded downloader
+can read one short-lived signed object from the configured private Supabase
+bucket. Existing tags, figure descriptions, reading replacements, interactive
+values and original page layout are protected.
 
 The reusable independent checker is copied explicitly from
 `research/native-pdf/verify_pdf.py`. Its research-only source-hash exceptions
@@ -35,14 +37,25 @@ files. Local Windows uses process-group termination through the system
 `taskkill` program on timeout; Linux also sets address-space, CPU, open-file,
 output-file and core-dump limits. Neither mode claims to be an OS sandbox.
 
+The production supervisor also receives the public `SUPABASE_URL` origin.
+Only `/repair-stored` needs this setting. It accepts a small signed reference
+when the complete repair JSON would exceed Vercel's request limit. The app
+tracks the temporary object for cleanup and purge, then removes it after the
+request. The worker permits only the configured HTTPS origin, the private
+`documents` bucket and a UUID-scoped native repair filename; it rejects
+redirects, encoded paths, extra query options and arbitrary URLs. Its separate
+download process uses verified TLS, ignores proxies, checks actual byte count
+and SHA256, and is terminated after 15 seconds. The download and PDF processing
+share the overall 90-second deadline. The signed URL never reaches PDF tools.
+
 ## Container
 
 The Dockerfile lives at the repository root because Vercel uses its containing
 directory as the build context. A deny-by-default root
 `.dockerignore` and explicit `COPY` paths exclude application secrets, source
 documents, local binaries and test outputs. Build-time tool downloads have
-pinned versions and SHA256 checks. Runtime document processing downloads
-nothing. The image runs as an unprivileged user, and the startup script clears
+pinned versions and SHA256 checks. Tools are never downloaded during document
+processing. The image runs as an unprivileged user, and the startup script clears
 shared project variables before starting the HTTP supervisor.
 
 ```text
@@ -62,7 +75,7 @@ one active PDF job per service process and no durable queue. Saturation
 returns a controlled busy response immediately.
 
 Each request uses a fresh temporary directory and child process. Python and
-Java receive clean runtime environments, without model/storage credentials or
+Java receive clean runtime environments, without model/service-role credentials or
 inherited runtime injection options. JVM scratch paths and working directories
 are pinned to the request directory. Cleanup follows successful, failed and
 timed-out jobs. Responses never contain native stderr or filesystem paths.
@@ -80,6 +93,8 @@ files, precise form-control findings, complete validator evidence, and honest
 evidence for pages without selectable text. HTTP tests exercise authentication,
 ambiguous headers, input limits, capacity, subprocess credential isolation,
 actual timeout cleanup and controlled failures.
+Stored-transport tests also cover URL scope, verified TLS, redirects, bounded
+reads, exact hashes, child credential isolation and download timeout cleanup.
 
 On 2026-10-21 the local HTTP service successfully prepared and repaired the
 synthetic workshop PDF with the real pinned Java tools. The output retained

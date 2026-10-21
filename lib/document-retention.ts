@@ -64,8 +64,25 @@ export function eligibleDocumentCondition(): SQL {
     isNull(documents.uploadExpiresAt),
     lte(documents.uploadExpiresAt, sql`clock_timestamp() - interval '1 hour'`)
   );
+  // An aborted server-side transport upload can finish after the client saw an
+  // error. Keep its committed receipt through the same conservative settlement
+  // window as direct uploads, so a late write cannot outlive its discovery row.
+  // Successful transport cleanup removes its receipt and releases this barrier.
+  // Retrieval still expires at 14 days; this only delays physical cleanup.
+  const transportSettled = sql`not exists (
+    select 1 from ${artifacts} as transport_artifact
+    inner join ${conversionJobs} as transport_job
+      on transport_job.id = transport_artifact.job_id
+    where transport_job.document_id = ${documents.id}
+      and transport_artifact.artifact_type = 'review_metadata'
+      and transport_artifact.artifact_status = 'expired'
+      and transport_artifact.filename = 'native-pdf-request.json'
+      and transport_artifact.is_user_downloadable = false
+      and transport_artifact.created_at > clock_timestamp() - interval '1 hour'
+  )`;
   return and(
     uploadSettled,
+    transportSettled,
     or(
       isNotNull(documents.deletedAt),
       lte(documents.createdAt, databaseCutoff()),

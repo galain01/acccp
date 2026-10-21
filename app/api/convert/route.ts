@@ -36,6 +36,7 @@ import { verifyRoleOrUnauthorized } from "@/lib/auth";
 import { convertPowerPoint } from "@/lib/powerpoint-convert";
 import { convertWord } from "@/lib/word-convert";
 import { repairNativePdf } from "@/lib/native-pdf-convert";
+import { createNativePdfTransport } from "@/lib/native-pdf-transport-storage";
 import { createStoredPowerPointRenderer } from "@/lib/powerpoint-render-storage";
 import {
   DEFAULT_OUTPUT_TARGET,
@@ -620,7 +621,15 @@ async function convertRequest(req: NextRequest) {
     : isNativeWord
       ? await convertWord(sourceBuffer, filename)
       : isNativePdf
-        ? await repairNativePdf(sourceBuffer, filename)
+        ? await repairNativePdf(sourceBuffer, filename, {
+            transport: createNativePdfTransport({
+              documentId,
+              jobId,
+              sessionId,
+              userId,
+              attemptNumber: job.attemptNumber,
+            }),
+          })
         : await convertPdf(buffer, pdfFilename);
 
   if ("error" in result) {

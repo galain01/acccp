@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => ({
   convertPowerPoint: vi.fn(),
   convertWord: vi.fn(),
   repairNativePdf: vi.fn(),
+  pdfTransport: vi.fn(),
   renderWord: vi.fn(),
   countPages: vi.fn(),
   upload: vi.fn(),
@@ -50,6 +51,9 @@ vi.mock("@/lib/convert", () => ({ convertPdf: mocks.convert }));
 vi.mock("@/lib/word-convert", () => ({ convertWord: mocks.convertWord }));
 vi.mock("@/lib/native-pdf-convert", () => ({
   repairNativePdf: mocks.repairNativePdf,
+}));
+vi.mock("@/lib/native-pdf-transport-storage", () => ({
+  createNativePdfTransport: () => mocks.pdfTransport,
 }));
 vi.mock("@/lib/powerpoint-convert", () => ({
   convertPowerPoint: mocks.convertPowerPoint,
@@ -341,7 +345,8 @@ describe("native PDF conversion route", () => {
     expect(body).not.toHaveProperty("pdf");
     expect(mocks.repairNativePdf).toHaveBeenCalledExactlyOnceWith(
       Buffer.from(PDF),
-      "Course.PDF"
+      "Course.PDF",
+      { transport: mocks.pdfTransport }
     );
     expect(mocks.convert).not.toHaveBeenCalled();
     expect(mocks.convertWord).not.toHaveBeenCalled();
@@ -430,7 +435,8 @@ describe("native PDF conversion route", () => {
     );
     expect(mocks.repairNativePdf).toHaveBeenCalledExactlyOnceWith(
       Buffer.from(PDF),
-      "course.pdf"
+      "course.pdf",
+      { transport: mocks.pdfTransport }
     );
     expect(inserted.has(documents)).toBe(false);
     expect(mocks.upload.mock.calls.map(([key]) => key)).toEqual([

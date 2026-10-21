@@ -4,6 +4,7 @@ import {
   nativePdfRequest,
   parseNativePdfState,
   pdfSha256,
+  type NativePdfTransport,
 } from "@/lib/native-pdf-worker";
 
 const source = Buffer.from("%PDF-1.7\nfixture source\n%%EOF");
@@ -312,5 +313,104 @@ describe("native PDF service client", () => {
       })
     ).rejects.toThrow("pdf_protocol_error");
     expect(fetch).not.toHaveBeenCalled();
+  });
+  it.each([413, 500, 503])(
+    "retains HTTP %s for a plain-text platform failure",
+    async (status) => {
+      vi.mocked(fetch).mockResolvedValue(
+        new Response("private platform details", { status })
+      );
+      await expect(
+        nativePdfRequest("prepare", source, 1000)
+      ).rejects.toMatchObject({
+        diagnostic: {
+          httpStatus: status,
+          code:
+            status === 413
+              ? "pdf_complexity_limit"
+              : status === 503
+                ? "native_pdf_busy"
+                : "native_pdf_worker_failed",
+        },
+      });
+    }
+  );
+  it("transfers a near-limit PDF pair by an exact short-lived object reference", async () => {
+    const large = Buffer.alloc(4 * 1024 * 1024 - 1024, 32);
+    source.copy(large);
+    const raw = {
+      ...response(),
+      sourceSha256: pdfSha256(large),
+      candidateSha256: pdfSha256(large),
+      pdfBase64: large.toString("base64"),
+    };
+    const state = parseNativePdfState(raw, large);
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify(raw)));
+    let payloadBytes = 0;
+    let cleaned = false;
+    const transport: NativePdfTransport = async (payload, signal, action) => {
+      payloadBytes = payload.length;
+      expect(signal.aborted).toBe(false);
+      const decoded = JSON.parse(payload.toString());
+      expect(Buffer.from(decoded.sourcePdfBase64, "base64").equals(large)).toBe(
+        true
+      );
+      expect(
+        Buffer.from(decoded.candidatePdfBase64, "base64").equals(large)
+      ).toBe(true);
+      try {
+        return await action({
+          requestUrl: "https://project.supabase.co/synthetic-signed-object",
+          requestSha256: pdfSha256(payload),
+          requestBytes: payload.length,
+        });
+      } finally {
+        cleaned = true;
+      }
+    };
+    const result = await nativePdfRequest(
+      "repair",
+      large,
+      90_000,
+      state,
+      {
+        schemaVersion: 1,
+        candidateSha256: state.candidateSha256,
+        operations: [],
+      },
+      transport
+    );
+    expect(result.pdf.equals(large)).toBe(true);
+    expect(payloadBytes).toBeGreaterThan(10 * 1024 * 1024);
+    expect(cleaned).toBe(true);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const [url, init] = vi.mocked(fetch).mock.calls[0];
+    expect(String(url)).toBe("https://private-worker.example/repair-stored");
+    expect(Buffer.byteLength(init!.body as string)).toBeLessThan(1024);
+    expect(init!.body).not.toContain(large.toString("base64"));
+  });
+  it("keeps small local repair calls inline without reserving storage", async () => {
+    const state = parseNativePdfState(response(), source);
+    const reserved = vi.fn();
+    const transport: NativePdfTransport = async () => {
+      reserved();
+      throw new Error("Unexpected storage transfer");
+    };
+    await nativePdfRequest(
+      "repair",
+      source,
+      1000,
+      state,
+      {
+        schemaVersion: 1,
+        candidateSha256: state.candidateSha256,
+        operations: [],
+      },
+      transport
+    );
+    expect(reserved).not.toHaveBeenCalled();
+    expect(String(vi.mocked(fetch).mock.calls[0][0])).toBe(
+      "https://private-worker.example/repair"
+    );
   });
 });

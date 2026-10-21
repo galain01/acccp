@@ -1,9 +1,11 @@
 # Native PDF worker protocol, version 1
 
 The private service accepts `Authorization: Bearer NATIVE_PDF_API_KEY`. It has
-no public route, storage credentials, model credentials or document fetch route.
+no public route, storage credentials or model credentials.
 `GET /health` requires authentication. `POST /prepare` takes `application/pdf`
-bytes; `POST /repair` takes JSON. Both return the same JSON shape:
+bytes; `POST /repair` takes JSON. `POST /repair-stored` accepts the narrow signed
+reference below for repair JSON above the platform request limit. All return
+the same JSON shape:
 
 ```json
 {
@@ -77,11 +79,34 @@ Figure descriptions can fill missing descriptions or replace
 an autotagger placeholder only when the original had no authored description
 on that content. Existing authored descriptions and ActualText are preserved.
 Simple table cells may gain `TH` plus `Scope` (`Column` or `Row`); merged or
-complex cells are left for review. No arbitrary PDF/XML/paths/URLs are accepted.
+complex cells are left for review. No arbitrary PDF/XML/paths are accepted.
+
+For large repair bodies, the app uploads those exact JSON bytes to a tracked,
+short-lived private storage object, then sends this exact envelope to
+`POST /repair-stored` with `Content-Type: application/json`:
+
+```json
+{
+  "requestUrl": "https://PROJECT.supabase.co/storage/v1/object/sign/documents/SESSION_UUID/DOCUMENT_UUID/JOB_UUID/native-pdf-request-REQUEST_UUID.json?token=SIGNED_JWT",
+  "requestSha256": "64 lowercase hexadecimal characters",
+  "requestBytes": 11138229
+}
+```
+
+The envelope is limited to 16 KiB. The URL must exactly match the configured
+`SUPABASE_URL` HTTPS origin and the UUID-based path shown above. Only the JWT
+`token` query parameter is allowed. Ports, credentials, fragments, percent
+escapes, whitespace, backslashes and redirects are rejected. A separate
+transport subprocess fetches at most 12 MiB with verified TLS and no proxy or
+application credentials, checks exact size and SHA256, and exits within 15
+seconds. The supervisor checks the saved bytes again before passing only the
+repair JSON to the PDF processor. Transport files are deleted in all outcomes;
+the app deletes the remote object and tracks failed cleanup for its purge.
 
 Bounds: 4 MiB PDF input and candidate, 60 pages, 5,000 tags, 500,000 text
-characters, 12 MiB HTTP JSON body, 16 MiB response, one active job per process,
-90 seconds per worker request. Busy jobs fail immediately with HTTP 503.
+characters, 12 MiB repair JSON, 16 KiB stored-reference HTTP body, 16 MiB
+response, one active job per process, 90 seconds per worker request including
+the signed-object download. Busy jobs fail immediately with HTTP 503.
 All request-local files are deleted after success or failure, including Java
 scratch files pinned by `-Djava.io.tmpdir`. An isolated
 processor receives only fixed runtime paths, no application secrets. Process

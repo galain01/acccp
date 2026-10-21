@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -12,12 +13,16 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+
+import stored_transport
 
 MAX_PDF = 4 * 1024 * 1024
 MAX_BODY = 12 * 1024 * 1024
 MAX_RESULT = 16 * 1024 * 1024
 DEADLINE = 90
 PROCESSOR = Path(__file__).with_name("worker.py")
+TRANSPORT = Path(__file__).with_name("stored_transport.py")
 ACTIVE = threading.BoundedSemaphore(1)
 CONNECTIONS = threading.BoundedSemaphore(8)
 ERROR_STATUS = {"pdf_invalid": 400, "pdf_password": 400, "pdf_page_limit": 400,
@@ -54,7 +59,7 @@ def kill_tree(process):
     process.wait(timeout=10)
 
 
-def execute(mode, body, toolchain):
+def execute(mode, body, toolchain, *, timeout=None):
     # Every disk file, including failed outputs and native temporary files,
     # belongs to this request and is removed before the HTTP response finishes.
     with tempfile.TemporaryDirectory(prefix="native-pdf-") as temporary:
@@ -82,7 +87,7 @@ def execute(mode, body, toolchain):
         for thread in threads:
             thread.start()
         try:
-            process.wait(timeout=DEADLINE)
+            process.wait(timeout=DEADLINE if timeout is None else max(0.01, timeout))
         except subprocess.TimeoutExpired:
             kill_tree(process)
             return 504, {"error": {"code": "native_pdf_timeout"}}
@@ -104,6 +109,37 @@ def execute(mode, body, toolchain):
             return 200, json.loads(result.read_bytes())
         except Exception:
             return 503, {"error": {"code": "native_pdf_worker_failed"}}
+
+
+def fetch_stored(body, origin, *, timeout=stored_transport.FETCH_DEADLINE):
+    """Fetch separately so no signed URL reaches a PDF document processor."""
+    stored_transport.validate_reference(body, origin)
+    with tempfile.TemporaryDirectory(prefix="native-pdf-transport-") as temporary:
+        folder = Path(temporary)
+        request, result = folder / "reference.json", folder / "request.json"
+        request.write_bytes(body)
+        environment = child_environment()
+        environment.update(TMPDIR=str(folder), TEMP=str(folder), TMP=str(folder), HOME=str(folder))
+        process = subprocess.Popen([sys.executable, str(TRANSPORT), str(request), str(result), origin],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   env=environment, cwd=folder, start_new_session=os.name == "posix",
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        try:
+            process.wait(timeout=max(0.01, min(stored_transport.FETCH_DEADLINE, timeout)))
+        except subprocess.TimeoutExpired:
+            kill_tree(process)
+            raise stored_transport.TransportError("native_pdf_timeout") from None
+        if process.returncode != 0:
+            code = next((key for key, value in stored_transport.EXIT_CODES.items() if value == process.returncode), "native_pdf_worker_failed")
+            raise stored_transport.TransportError(code)
+        if not result.is_file() or not 0 < result.stat().st_size <= MAX_BODY:
+            raise stored_transport.TransportError("pdf_complexity_limit")
+        payload = result.read_bytes()
+        # Independently verify the saved transport child's exact bytes.
+        reference, _, _ = stored_transport.validate_reference(body, origin)
+        if len(payload) != reference["requestBytes"] or hashlib.sha256(payload).hexdigest() != reference["requestSha256"]:
+            raise stored_transport.TransportError()
+        return payload
 
 
 class Server(ThreadingHTTPServer):
@@ -168,10 +204,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.authorized():
             return self.send_json(401, {"error": {"code": "unauthorized"}})
-        if self.path not in ("/prepare", "/repair"):
+        if self.path not in ("/prepare", "/repair", "/repair-stored"):
             return self.send_json(404, {"error": {"code": "not_found"}})
         lengths = self.headers.get_all("Content-Length", [])
-        maximum = MAX_PDF if self.path == "/prepare" else MAX_BODY
+        maximum = MAX_PDF if self.path == "/prepare" else stored_transport.MAX_REFERENCE if self.path == "/repair-stored" else MAX_BODY
         content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
         expected_type = "application/pdf" if self.path == "/prepare" else "application/json"
         if (self.headers.get("Transfer-Encoding") is not None or len(lengths) != 1
@@ -181,11 +217,21 @@ class Handler(BaseHTTPRequestHandler):
         if not ACTIVE.acquire(blocking=False):
             return self.send_json(503, {"error": {"code": "native_pdf_busy"}})
         try:
+            started = time.monotonic()
             body = self.rfile.read(int(lengths[0]))
             if len(body) != int(lengths[0]):
                 return self.send_json(400, {"error": {"code": "pdf_invalid"}})
-            status, response = execute(self.path[1:], body, self.server.toolchain)
+            if self.path == "/repair-stored":
+                body = fetch_stored(body, getattr(self.server, "storage_origin", ""), timeout=DEADLINE - (time.monotonic() - started))
+                remaining = DEADLINE - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise stored_transport.TransportError("native_pdf_timeout")
+                status, response = execute("repair", body, self.server.toolchain, timeout=remaining)
+            else:
+                status, response = execute(self.path[1:], body, self.server.toolchain)
             return self.send_json(status, response)
+        except stored_transport.TransportError as error:
+            return self.send_json(ERROR_STATUS[error.code], {"error": {"code": error.code}})
         except (TimeoutError, OSError):
             return self.send_json(504, {"error": {"code": "native_pdf_timeout"}})
         except Exception:
@@ -205,6 +251,7 @@ def main():
         raise SystemExit("Native PDF worker configuration is incomplete.")
     server = Server((options.host, options.port), Handler)
     server.api_key, server.toolchain = key, options.toolchain.resolve()
+    server.storage_origin = os.environ.get("SUPABASE_URL", "").rstrip("/")
     server.serve_forever(poll_interval=0.5)
 
 

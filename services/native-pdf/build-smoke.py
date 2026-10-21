@@ -51,7 +51,7 @@ def require(condition, message):
 
 def request(service, path, body=None, *, authorized=True, method="POST"):
     connection = http.client.HTTPConnection("127.0.0.1", service.server_port, timeout=100)
-    headers = {"Content-Type": "application/json" if path == "/repair" else "application/pdf"}
+    headers = {"Content-Type": "application/json" if path.startswith("/repair") else "application/pdf"}
     if authorized:
         headers["Authorization"] = "Bearer " + service.api_key
     try:
@@ -90,6 +90,7 @@ def main():
     service = server.Server(("127.0.0.1", 0), server.Handler)
     service.api_key = secrets.token_hex(32)
     service.toolchain = args.toolchain.resolve()
+    service.storage_origin = "https://synthetic-build-test.supabase.co"
     thread = threading.Thread(target=service.serve_forever, daemon=True)
     thread.start()
     try:
@@ -99,6 +100,10 @@ def main():
                 "Unauthenticated health request was accepted")
         require(request(service, "/prepare", source, authorized=False)[0] == 401,
                 "Unauthenticated document request was accepted")
+        require(request(service, "/repair-stored", b"{}", authorized=False)[0] == 401,
+                "Unauthenticated stored request was accepted")
+        require(request(service, "/repair-stored", b"{}")[0] == 400,
+                "Invalid stored reference was accepted")
         require(request(service, "/health", method="GET") == (200, {"status": "ok", "protocolVersion": 1}),
                 "Authenticated service health failed")
         status, prepared = request(service, "/prepare", source)
