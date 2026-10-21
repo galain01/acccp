@@ -4,35 +4,30 @@ import { useRef, useState, type DragEvent } from "react";
 import { Upload } from "lucide-react";
 import { cn } from "@/lib/utils";
 import DocumentProcessingNotice from "./document-processing-notice";
-import { maxFileSizeForFilename } from "@/lib/document-input";
 import {
-  DEFAULT_OUTPUT_TARGET,
-  isSupportedOutputForFilename,
-  type OutputTarget,
-} from "@/lib/output-formats";
+  isSupportedDocumentFilename,
+  maxFileSizeForFilename,
+} from "@/lib/document-input";
 
 interface FileUploadProps {
   onFilesSelected: (files: File[]) => void;
   disabled?: boolean;
-  outputTarget?: OutputTarget;
 }
 
 export default function FileUpload({
   onFilesSelected,
   disabled = false,
-  outputTarget = DEFAULT_OUTPUT_TARGET,
 }: FileUploadProps): React.JSX.Element {
   const inputRef = useRef<HTMLInputElement>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [rejectHint, setRejectHint] = useState<string | null>(null);
-  const isPowerPoint = outputTarget === "accessible_pptx";
 
   const handleFiles = (fileList: FileList | null) => {
     if (!fileList || disabled) return;
 
     const accepted = Array.from(fileList).filter(
       (file) =>
-        isSupportedOutputForFilename(file.name, outputTarget) &&
+        isSupportedDocumentFilename(file.name) &&
         file.size > 0 &&
         file.size <= maxFileSizeForFilename(file.name)
     );
@@ -40,12 +35,9 @@ export default function FileUpload({
 
     if (rejected > 0) {
       setRejectHint(
-        isPowerPoint
-          ? "Upload a PowerPoint (.pptx) file up to 25 MB. Empty files and older .ppt files are not supported."
-          : "Upload a PDF or Word (.docx) file up to 4 MB. Empty files are not supported."
+        `${rejected} file${rejected === 1 ? " was" : "s were"} not added. Choose Word (.docx) or PDF files up to 4 MB, or PowerPoint (.pptx) files up to 25 MB. Empty, older, and macro-enabled files are not supported.`
       );
-      setTimeout(() => setRejectHint(null), 3000);
-    }
+    } else setRejectHint(null);
 
     if (accepted.length > 0) {
       onFilesSelected(accepted);
@@ -93,28 +85,17 @@ export default function FileUpload({
       >
         <Upload className="size-8 text-muted-foreground" />
         <p className="text-sm font-medium">
-          {isPowerPoint
-            ? "Drop PowerPoint files here or click to browse"
-            : "Drop Word or PDF files here or click to browse"}
+          Drop Word, PDF, or PowerPoint files here or click to browse
         </p>
         <p className="text-xs text-muted-foreground">
-          {isPowerPoint
-            ? "PowerPoint (.pptx) files up to 25 MB and 60 slides. Complex presentations may still exceed processing limits."
-            : "Word (.docx) and PDF files up to 4 MB and 60 PDF pages. Word files are converted automatically."}
+          Mix file types in one upload. Word (.docx) and PDF: up to 4 MB and 60
+          PDF pages. PowerPoint (.pptx): up to 25 MB and 60 slides.
         </p>
         <input
           ref={inputRef}
           type="file"
-          accept={
-            isPowerPoint
-              ? ".pptx,application/vnd.openxmlformats-officedocument.presentationml.presentation"
-              : ".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-          }
-          aria-label={
-            isPowerPoint
-              ? "Upload PowerPoint documents"
-              : "Upload Word or PDF documents"
-          }
+          accept=".pdf,.docx,.pptx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.presentationml.presentation"
+          aria-label="Upload documents"
           multiple
           className="hidden"
           disabled={disabled}
@@ -124,7 +105,7 @@ export default function FileUpload({
           }}
         />
       </div>
-      <DocumentProcessingNotice compact outputTarget={outputTarget} />
+      <DocumentProcessingNotice compact outputTarget="mixed" />
       {rejectHint && (
         <p role="status" className="text-sm text-destructive">
           {rejectHint}

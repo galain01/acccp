@@ -12,11 +12,11 @@ export default function DocumentProcessingNotice({
 }: {
   compact?: boolean;
   className?: string;
-  outputTarget?: OutputTarget;
+  outputTarget?: OutputTarget | "mixed";
 }): React.JSX.Element {
   const headingId = useId();
 
-  if (outputTarget === "accessible_pptx") {
+  if (outputTarget === "mixed") {
     return (
       <aside
         aria-labelledby={headingId}
@@ -24,13 +24,53 @@ export default function DocumentProcessingNotice({
       >
         <h2 id={headingId} className="mb-2 flex items-center gap-2 font-medium">
           <Info className="size-4 shrink-0" aria-hidden="true" />
-          Review the updated presentation
+          File limits and review
+        </h2>
+        <div className="space-y-2 leading-relaxed">
+          {!compact && (
+            <p>
+              Word and PDF files can be up to 4 MB and 60 rendered pages.
+              PowerPoint files can be up to 25 MB and 60 slides. Large scans and
+              complex presentations may reach processing limits sooner.
+            </p>
+          )}
+          <p>
+            Processing and review may take several minutes. If a limit is
+            reached, that attempt stops with an error. PDF page preparation has
+            a 90-second limit; AI processing takes additional time.
+          </p>
+          <p>
+            Download the updated file and review its changes and remaining
+            questions. For Word and PowerPoint, also run the built-in
+            Accessibility Checker before sharing the document.
+          </p>
+        </div>
+      </aside>
+    );
+  }
+
+  if (
+    outputTarget === "accessible_pptx" ||
+    outputTarget === "accessible_docx"
+  ) {
+    return (
+      <aside
+        aria-labelledby={headingId}
+        className={cn("rounded-xl border bg-muted/50 p-4 text-sm", className)}
+      >
+        <h2 id={headingId} className="mb-2 flex items-center gap-2 font-medium">
+          <Info className="size-4 shrink-0" aria-hidden="true" />
+          Review the updated{" "}
+          {outputTarget === "accessible_docx"
+            ? "Word document"
+            : "presentation"}
         </h2>
         <p className="leading-relaxed">
           The tool makes supported accessibility improvements and lists items
-          that still need your attention by slide. Open the result in
-          PowerPoint, run its Accessibility Checker, and compare it with your
-          original before sharing it with students.
+          that still need your attention. Open the result in
+          {outputTarget === "accessible_docx" ? " Word" : " PowerPoint"}, run
+          its Accessibility Checker, and compare it with your original before
+          sharing it with students.
         </p>
       </aside>
     );

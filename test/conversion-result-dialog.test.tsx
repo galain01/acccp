@@ -9,6 +9,7 @@ import type { UploadedDocument } from "@/lib/types/document";
 
 vi.mock("@/lib/actions/documents", () => ({
   getDocumentHtml: vi.fn().mockResolvedValue("<h2>Saved result</h2>"),
+  getDocumentOutputDownload: vi.fn(),
 }));
 
 vi.mock("@/lib/actions/powerpoint-review", () => ({
@@ -17,7 +18,10 @@ vi.mock("@/lib/actions/powerpoint-review", () => ({
 }));
 
 import ConversionResultDialog from "@/components/ui/conversion-result-dialog";
-import { getDocumentHtml } from "@/lib/actions/documents";
+import {
+  getDocumentHtml,
+  getDocumentOutputDownload,
+} from "@/lib/actions/documents";
 
 let host: HTMLDivElement;
 let root: Root;
@@ -93,6 +97,10 @@ beforeEach(() => {
   document.body.append(host);
   root = createRoot(host);
   vi.mocked(getDocumentHtml).mockResolvedValue("<h2>Saved result</h2>");
+  vi.mocked(getDocumentOutputDownload).mockResolvedValue({
+    url: "https://storage.example.test/fresh-word",
+    filename: "Course-accessible.docx",
+  });
 });
 
 afterEach(async () => {
@@ -100,6 +108,114 @@ afterEach(async () => {
   host.remove();
   vi.unstubAllGlobals();
   vi.clearAllMocks();
+  vi.restoreAllMocks();
+});
+
+describe("native Word results", () => {
+  it("shows actual changes and review locations without fetching HTML or offering HTML actions", async () => {
+    await mount({
+      name: "Course.DOCX",
+      outputTarget: "accessible_docx",
+      html: undefined,
+      changes: ["Course schedule: identified its first row as column labels."],
+      errors: [
+        finding({
+          severity: "warning",
+          suggestion: "In Word, check the labels in the course schedule table.",
+        }),
+      ],
+    });
+    const dialog = resultDialog();
+    expect(
+      dialog.querySelector('section[aria-label="Changes made"]')?.textContent
+    ).toContain("identified its first row as column labels");
+    expect(dialog.textContent).toContain("Word’s Accessibility Checker");
+    expect(facultyText()).toContain("Course schedule");
+    expect(facultyText()).toContain("page 5");
+    expect(facultyText()).toContain("In Word, check the labels");
+    const actions = Array.from(dialog.querySelectorAll("button")).map(
+      (button) => button.textContent
+    );
+    expect(actions).toContain("Download Word document");
+    expect(actions).not.toContain("Copy HTML");
+    expect(actions).not.toContain("Download HTML");
+    expect(actions).not.toContain("Review changes");
+    expect(getDocumentHtml).not.toHaveBeenCalled();
+  });
+
+  it("gets a fresh signed Word URL on each download click and preserves warnings", async () => {
+    const clicked: string[] = [];
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+      this: HTMLAnchorElement
+    ) {
+      clicked.push(this.href);
+    });
+    vi.mocked(getDocumentOutputDownload)
+      .mockResolvedValueOnce({
+        url: "https://storage.example.test/word-first",
+        filename: "Course-accessible.docx",
+      })
+      .mockResolvedValueOnce({
+        url: "https://storage.example.test/word-second",
+        filename: "Course-accessible.docx",
+      });
+    await mount({
+      name: "Course.docx",
+      outputTarget: "accessible_docx",
+      html: undefined,
+    });
+    const download = () =>
+      Array.from(resultDialog().querySelectorAll("button")).find(
+        (button) => button.textContent === "Download Word document"
+      )!;
+    await act(async () => download().click());
+    await act(async () => download().click());
+    expect(getDocumentOutputDownload).toHaveBeenCalledTimes(2);
+    expect(getDocumentOutputDownload).toHaveBeenNthCalledWith(
+      1,
+      "doc-1",
+      "accessible_docx"
+    );
+    expect(getDocumentOutputDownload).toHaveBeenNthCalledWith(
+      2,
+      "doc-1",
+      "accessible_docx"
+    );
+    expect(clicked).toEqual([
+      "https://storage.example.test/word-first",
+      "https://storage.example.test/word-second",
+    ]);
+    expect(reviewItem()).not.toBeNull();
+    expect(
+      resultDialog().querySelector('[role="status"]')?.textContent
+    ).toContain("need a fix");
+    expect(getDocumentHtml).not.toHaveBeenCalled();
+  });
+
+  it("explains an expired Word result while retaining the changes and review list", async () => {
+    vi.mocked(getDocumentOutputDownload).mockResolvedValueOnce(null);
+    await mount({
+      name: "Course.docx",
+      outputTarget: "accessible_docx",
+      html: undefined,
+      changes: ["Identified section headings."],
+    });
+    const download = Array.from(resultDialog().querySelectorAll("button")).find(
+      (button) => button.textContent === "Download Word document"
+    )!;
+    await act(async () => download.click());
+    expect(
+      resultDialog().querySelector('[role="alert"]')?.textContent
+    ).toContain("expire after 14 days");
+    expect(resultDialog().textContent).toContain(
+      "files on your computer are unaffected"
+    );
+    expect(resultDialog().textContent).toContain(
+      "Identified section headings."
+    );
+    expect(reviewItem()).not.toBeNull();
+    expect(getDocumentHtml).not.toHaveBeenCalled();
+  });
 });
 
 describe("faculty-facing conversion findings", () => {

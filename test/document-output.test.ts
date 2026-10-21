@@ -78,6 +78,83 @@ beforeEach(() => {
 afterEach(() => vi.useRealTimers());
 
 describe("owned output downloads", () => {
+  it("signs only an owned Word result with its native artifact and attachment filename", async () => {
+    const builder = chain([
+      { storageKey: "session/doc/job/output.docx", filename: "Course.DOCX" },
+    ]);
+    mocks.db.select.mockReturnValueOnce(builder);
+    expect(
+      await getDocumentOutputDownload("word-doc", "accessible_docx")
+    ).toEqual({
+      url: "https://storage.example.test/owned-signed-download",
+      filename: "Course-accessible.docx",
+    });
+    const compiled = query(builder.where.mock.calls[0][0]);
+    expect(compiled.sql).toContain('"sessions"."owner_user_id"');
+    expect(compiled.sql).toContain("clock_timestamp()");
+    expect(compiled.params).toEqual(
+      expect.arrayContaining([
+        "word-doc",
+        "owner-1",
+        "accessible_docx",
+        "docx_output",
+        "available",
+      ])
+    );
+    expect(compiled.params).not.toContain("html_output");
+    expect(mocks.sign).toHaveBeenCalledExactlyOnceWith(
+      "session/doc/job/output.docx",
+      60,
+      "Course-accessible.docx"
+    );
+    expect(mocks.download).not.toHaveBeenCalled();
+  });
+
+  it("returns no Word download for another owner or unavailable artifact", async () => {
+    expect(
+      await getDocumentOutputDownload("someone-elses-word", "accessible_docx")
+    ).toBeNull();
+    expect(mocks.sign).not.toHaveBeenCalled();
+  });
+
+  it("does not sign an expired Word result and bounds a near-expiry URL to the original upload", async () => {
+    mocks.retained.mockRejectedValueOnce(new DocumentUnavailableError());
+    expect(
+      await getDocumentOutputDownload("expired-word", "accessible_docx")
+    ).toBeNull();
+    expect(mocks.sign).not.toHaveBeenCalled();
+    createdAt = new Date(
+      now.getTime() - DOCUMENT_RETENTION_MS + 12_000
+    ).toISOString();
+    mocks.db.select.mockReturnValueOnce(
+      chain([{ storageKey: "owned-word", filename: "Guide.docx" }])
+    );
+    expect(
+      await getDocumentOutputDownload("word-doc", "accessible_docx")
+    ).not.toBeNull();
+    expect(mocks.sign).toHaveBeenCalledExactlyOnceWith(
+      "owned-word",
+      11,
+      "Guide-accessible.docx"
+    );
+  });
+
+  it("withholds a Word URL if signing delay would let it outlive retention", async () => {
+    createdAt = new Date(
+      now.getTime() - DOCUMENT_RETENTION_MS + 12_000
+    ).toISOString();
+    mocks.db.select.mockReturnValueOnce(
+      chain([{ storageKey: "owned-word", filename: "Guide.docx" }])
+    );
+    mocks.sign.mockImplementationOnce(async () => {
+      vi.setSystemTime(new Date(now.getTime() + 2_000));
+      return "https://storage.example.test/late-word";
+    });
+    expect(
+      await getDocumentOutputDownload("word-doc", "accessible_docx")
+    ).toBeNull();
+  });
+
   it("signs only the owned target artifact and requests a PPTX attachment filename", async () => {
     const builder = chain([
       { storageKey: "session/doc/job/output.pptx", filename: "Lecture.PPTX" },

@@ -225,7 +225,11 @@ export async function getDocumentOutputDownload(
             eq(conversionJobs.outputTarget, outputTarget),
             eq(
               artifacts.artifactType,
-              outputTarget === "accessible_pptx" ? "pptx_output" : "html_output"
+              outputTarget === "accessible_pptx"
+                ? "pptx_output"
+                : outputTarget === "accessible_docx"
+                  ? "docx_output"
+                  : "html_output"
             ),
             eq(artifacts.artifactStatus, "available"),
             retainedDocumentCondition()

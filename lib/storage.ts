@@ -54,6 +54,14 @@ export function pptxOutputKey(
   return `${sessionId}/${documentId}/${jobId}/output.pptx`;
 }
 
+export function docxOutputKey(
+  sessionId: string,
+  documentId: string,
+  jobId: string
+): string {
+  return `${sessionId}/${documentId}/${jobId}/output.docx`;
+}
+
 export function outputReviewKey(
   sessionId: string,
   documentId: string,

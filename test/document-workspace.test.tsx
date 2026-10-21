@@ -152,6 +152,33 @@ async function mount(documents: UploadedDocument[] = []) {
   });
 }
 
+// The existing conversion regressions exercise the established HTML path.
+// Explicitly select it; new workflow tests below retain the real native default.
+async function mountHtmlWorkflow(documents: UploadedDocument[] = []) {
+  await mount(documents);
+  await selectOutput("html");
+}
+
+async function chooseRowOutput(name: string, value: "original" | "html") {
+  const select = row(name).querySelector("select")!;
+  expect(select).not.toBeNull();
+  expect(select.getAttribute("aria-label")).toBe(`Download format for ${name}`);
+  await act(async () => {
+    select.value = value;
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+}
+
+async function uploadFiles(names: string[]) {
+  await act(async () => {
+    Object.defineProperty(uploadInput(), "files", {
+      value: names.map((name) => new File(["synthetic"], name)),
+      configurable: true,
+    });
+    uploadInput().dispatchEvent(new Event("change", { bubbles: true }));
+  });
+}
+
 async function upload(name: string) {
   const file = new File(["%PDF-synthetic"], name, {
     type: "application/pdf",
@@ -170,10 +197,10 @@ async function click(target: HTMLButtonElement) {
   await act(async () => target.click());
 }
 
-async function selectOutput(value: "canvas_html" | "accessible_pptx") {
+async function selectOutput(value: "original" | "html") {
   const select = host.querySelector("select")!;
   expect(host.querySelector(`label[for="${select.id}"]`)?.textContent).toBe(
-    "Output format"
+    "Default for new uploads"
   );
   await act(async () => {
     select.value = value;
@@ -230,6 +257,73 @@ afterEach(async () => {
 });
 
 describe("DocumentWorkspace conversion selection", () => {
+  it("keeps new Word files native by default and does not resend a completed repair in the next batch", async () => {
+    fetchMock.mockImplementation(
+      async () =>
+        ({
+          ok: true,
+          json: async () => ({
+            documentId: `word-${fetchMock.mock.calls.length}`,
+            jobId: `job-${fetchMock.mock.calls.length}`,
+            outputTarget: "accessible_docx",
+            changes: ["Identified section headings."],
+            errors: [],
+          }),
+        }) as Response
+    );
+    await mount();
+    await uploadFiles(["first.docx"]);
+    await click(button("Improve accessibility"));
+    expect(requests()[0].get("outputTarget")).toBe("accessible_docx");
+    expect((requests()[0].get("file") as File).name).toBe("first.docx");
+    expect(row("first.docx").textContent).toContain("Ready to review");
+    expect(row("first.docx").querySelector("select")).toBeNull();
+    expect(uploadPowerPointDocument).not.toHaveBeenCalled();
+    await uploadFiles(["second.docx"]);
+    await click(button("Improve accessibility"));
+    expect(requests().map((form) => (form.get("file") as File).name)).toEqual([
+      "first.docx",
+      "second.docx",
+    ]);
+    expect(
+      requests().every((form) => form.get("outputTarget") === "accessible_docx")
+    ).toBe(true);
+    expect(getDocumentHtml).not.toHaveBeenCalled();
+  });
+
+  it("retries a saved native Word failure with its fixed target and document ID", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      json: async () => ({
+        documentId: "word-saved",
+        jobId: "word-job",
+        outputTarget: "accessible_docx",
+        error: "Repair could not preserve this document's layout.",
+      }),
+    } as Response);
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        documentId: "word-saved",
+        jobId: "word-job",
+        outputTarget: "accessible_docx",
+        changes: [],
+        errors: [],
+      }),
+    } as Response);
+    await mount();
+    await uploadFiles(["retry.docx"]);
+    await click(button("Improve accessibility"));
+    expect(row("retry.docx").textContent).toContain("Error");
+    expect(row("retry.docx").querySelector("select")).toBeNull();
+    await selectOutput("html");
+    await click(button("Improve accessibility"));
+    expect(requests()[1].get("documentId")).toBe("word-saved");
+    expect(requests()[1].get("outputTarget")).toBe("accessible_docx");
+    expect(requests()[1].has("file")).toBe(false);
+    expect(row("retry.docx").textContent).toContain("Ready to review");
+  });
+
   it("shows Uploading then Processing and retries a completed PowerPoint upload without sending its file again", async () => {
     let finishUpload!: (documentId: string) => void;
     vi.mocked(uploadPowerPointDocument).mockImplementationOnce(
@@ -242,10 +336,10 @@ describe("DocumentWorkspace conversion selection", () => {
     );
     const conversion = deferredResponse();
     fetchMock.mockReturnValueOnce(conversion.promise);
-    await mount();
-    await selectOutput("accessible_pptx");
+    await mountHtmlWorkflow();
+    await selectOutput("original");
     await upload("retry.pptx");
-    await click(button("Convert"));
+    await click(button("Improve accessibility"));
     expect(row("retry.pptx").textContent).toContain("Uploading");
     expect(fetchMock).not.toHaveBeenCalled();
     await act(async () => finishUpload("ready-source"));
@@ -258,7 +352,7 @@ describe("DocumentWorkspace conversion selection", () => {
         json: async () => ({ error: "Conversion failed." }),
       } as Response)
     );
-    await click(button("Convert"));
+    await click(button("Improve accessibility"));
     expect(vi.mocked(uploadPowerPointDocument)).toHaveBeenCalledOnce();
     expect(requests().map((form) => form.get("documentId"))).toEqual([
       "ready-source",
@@ -274,14 +368,14 @@ describe("DocumentWorkspace conversion selection", () => {
         throw new DocumentUploadError();
       }
     );
-    await mount();
-    await selectOutput("accessible_pptx");
+    await mountHtmlWorkflow();
+    await selectOutput("original");
     await upload("retry.pptx");
-    await click(button("Convert"));
+    await click(button("Improve accessibility"));
     expect(deleteDocument).toHaveBeenCalledExactlyOnceWith("failed-upload");
     expect(fetchMock).not.toHaveBeenCalled();
     expect(row("retry.pptx").textContent).toContain("Error");
-    await click(button("Convert"));
+    await click(button("Improve accessibility"));
     expect(uploadPowerPointDocument).toHaveBeenCalledTimes(2);
     expect(requests()[0].get("documentId")).toBe("uploaded-retry.pptx");
     expect(row("retry.pptx").textContent).toContain("Ready to review");
@@ -299,10 +393,10 @@ describe("DocumentWorkspace conversion selection", () => {
           };
         })
     );
-    await mount();
-    await selectOutput("accessible_pptx");
+    await mountHtmlWorkflow();
+    await selectOutput("original");
     await upload("removed.pptx");
-    await click(button("Convert"));
+    await click(button("Improve accessibility"));
     await click(button("Remove removed.pptx"));
     await act(async () => finishReservation());
     expect(deleteDocument).toHaveBeenCalledExactlyOnceWith("late-reservation");
@@ -325,10 +419,10 @@ describe("DocumentWorkspace conversion selection", () => {
         );
       }
     );
-    await mount();
-    await selectOutput("accessible_pptx");
+    await mountHtmlWorkflow();
+    await selectOutput("original");
     await upload("removed.pptx");
-    await click(button("Convert"));
+    await click(button("Improve accessibility"));
     await click(button("Remove removed.pptx"));
     expect(uploadSignal.aborted).toBe(true);
     expect(deleteDocument).toHaveBeenCalledExactlyOnceWith("pending-storage");
@@ -342,12 +436,12 @@ describe("DocumentWorkspace conversion selection", () => {
     fetchMock
       .mockReturnValueOnce(first.promise)
       .mockReturnValueOnce(third.promise);
-    await mount([
+    await mountHtmlWorkflow([
       savedDocument("first", "idle"),
       savedDocument("second", "idle"),
       savedDocument("third", "idle"),
     ]);
-    await click(button("Convert"));
+    await click(button("Improve accessibility"));
     expect(requests()).toHaveLength(1);
     expect(row("first.pdf").textContent).toContain("Processing");
     expect(row("second.pdf").textContent).toContain("Queued");
@@ -365,11 +459,11 @@ describe("DocumentWorkspace conversion selection", () => {
   it("retains a completed upload on navigation and never starts the next queued file", async () => {
     const pending = deferredResponse();
     fetchMock.mockReturnValueOnce(pending.promise);
-    await mount();
-    await selectOutput("accessible_pptx");
+    await mountHtmlWorkflow();
+    await selectOutput("original");
     await upload("first.pptx");
     await upload("second.pptx");
-    await click(button("Convert"));
+    await click(button("Improve accessibility"));
     expect(requests()[0].get("documentId")).toBe("uploaded-first.pptx");
     const signal = fetchMock.mock.calls[0][1]?.signal;
     await act(async () => root.render(null));
@@ -392,10 +486,10 @@ describe("DocumentWorkspace conversion selection", () => {
         });
       }
     );
-    await mount();
-    await selectOutput("accessible_pptx");
+    await mountHtmlWorkflow();
+    await selectOutput("original");
     await upload("late.pptx");
-    await click(button("Convert"));
+    await click(button("Improve accessibility"));
     await act(async () => root.render(null));
     await act(async () => finishUpload("completed-late"));
     expect(deleteDocument).not.toHaveBeenCalled();
@@ -443,7 +537,7 @@ describe("DocumentWorkspace conversion selection", () => {
         ],
       }),
     } as Response);
-    await mount([
+    await mountHtmlWorkflow([
       savedDocument("lecture", "success", {
         name: "lecture.pptx",
         outputTarget: "accessible_pptx",
@@ -467,20 +561,20 @@ describe("DocumentWorkspace conversion selection", () => {
     expect(getPowerPointReview).toHaveBeenCalledOnce();
   });
   it("keeps each upload's output format when the selector changes and skips completed PowerPoints", async () => {
-    await mount([
+    await mountHtmlWorkflow([
       savedDocument("done", "success", {
         name: "done.pptx",
         outputTarget: "accessible_pptx",
       }),
     ]);
     await upload("article.pdf");
-    await selectOutput("accessible_pptx");
+    await selectOutput("original");
     await upload("slides.pptx");
-    await selectOutput("canvas_html");
-    expect(row("article.pdf").textContent).toContain("Canvas HTML");
+    await selectOutput("html");
+    expect(row("article.pdf").textContent).toContain("HTML (Canvas)");
     expect(row("slides.pptx").textContent).toContain("PowerPoint (.pptx)");
     expect(row("done.pptx").textContent).toContain("Ready to review");
-    await click(button("Convert"));
+    await click(button("Improve accessibility"));
     expect(
       requests().map((form) => [
         (form.get("file") as File)?.name ?? form.get("documentId"),
@@ -491,27 +585,149 @@ describe("DocumentWorkspace conversion selection", () => {
       ["uploaded-slides.pptx", "accessible_pptx"],
     ]);
     expect(requests()[1].has("file")).toBe(false);
-    expect(button("Convert").disabled).toBe(true);
+    expect(button("Improve accessibility").disabled).toBe(true);
     await click(button("Re-convert", row("done.pptx")));
     expect(requests()[2].get("outputTarget")).toBe("accessible_pptx");
     expect(requests()[2].get("documentId")).toBe("done");
   });
 
-  it("does not accept a file belonging to the other selected output format", async () => {
+  it("keeps mixed uploads visible with the original default and processes only available outputs", async () => {
     await mount();
-    await upload("slides.pptx");
-    expect(host.querySelectorAll("tbody tr")).toHaveLength(0);
-    await selectOutput("accessible_pptx");
-    await upload("article.pdf");
-    expect(host.querySelectorAll("tbody tr")).toHaveLength(0);
-    expect(button("Convert").disabled).toBe(true);
+    expect(host.querySelector("select")?.value).toBe("original");
+    await uploadFiles(["notes.docx", "article.pdf", "slides.pptx"]);
+    expect(host.querySelectorAll("tbody tr")).toHaveLength(3);
+    expect(row("notes.docx").textContent).toContain("Word (.docx)");
+    expect(row("article.pdf").textContent).toContain(
+      "PDF output is not available yet"
+    );
+    expect(row("slides.pptx").cells[3].textContent).toContain("Ready");
+    expect(host.textContent).toContain(
+      "1 file has an unavailable output format"
+    );
+    expect(host.textContent).toContain("2 files are ready to process");
+    await click(button("Improve accessibility"));
+    expect(requests()).toHaveLength(2);
+    expect(requests()[0].get("outputTarget")).toBe("accessible_docx");
+    expect((requests()[0].get("file") as File).name).toBe("notes.docx");
+    expect(requests()[1].get("outputTarget")).toBe("accessible_pptx");
+    expect(requests()[1].get("documentId")).toBe("uploaded-slides.pptx");
+    expect(row("notes.docx").cells[3].textContent).toBe(
+      "Ready to reviewPlease check: 1"
+    );
+    expect(row("article.pdf").cells[3].textContent).toBe("Not available yet");
+    expect(button("Improve accessibility").disabled).toBe(true);
+    expect(uploadPowerPointDocument).toHaveBeenCalledOnce();
+  });
+
+  it("honors per-file overrides and never submits unavailable native or PowerPoint HTML requests", async () => {
+    await mount();
+    await uploadFiles(["keep.pdf", "notes.docx", "slides.pptx"]);
+    await chooseRowOutput("notes.docx", "html");
+    await chooseRowOutput("slides.pptx", "html");
+    expect(host.textContent).toContain(
+      "PowerPoint to HTML is not available yet"
+    );
+    await click(button("Improve accessibility"));
+    expect(requests()).toHaveLength(1);
+    expect((requests()[0].get("file") as File).name).toBe("notes.docx");
+    expect(requests()[0].get("outputTarget")).toBe("canvas_html");
+    expect(uploadPowerPointDocument).not.toHaveBeenCalled();
+    expect(row("notes.docx").querySelector("select")).toBeNull();
+    expect(row("keep.pdf").cells[3].textContent).toBe("Not available yet");
+    expect(row("slides.pptx").cells[3].textContent).toBe("Not available yet");
+    await chooseRowOutput("slides.pptx", "original");
+    await click(button("Improve accessibility"));
+    expect(requests()).toHaveLength(2);
+    expect(requests()[1].get("outputTarget")).toBe("accessible_pptx");
+  });
+
+  it("applies a bulk default only to untouched unlocked files and preserves restored job targets", async () => {
+    await mount([
+      savedDocument("saved", "idle"),
+      savedDocument("done", "success", {
+        name: "done.pptx",
+        outputTarget: "accessible_pptx",
+      }),
+    ]);
+    await uploadFiles(["one.pdf", "two.docx", "locked.pdf"]);
+    await click(button("Lock locked.pdf"));
+    await selectOutput("html");
+    expect(row("one.pdf").querySelector("select")?.value).toBe("original");
+    await click(button("Apply to pending files (2)"));
+    expect(row("one.pdf").querySelector("select")?.value).toBe("html");
+    expect(row("two.docx").querySelector("select")?.value).toBe("html");
+    expect(row("locked.pdf").cells[3].textContent).toBe("Not available yet");
+    expect(row("saved.pdf").querySelector("select")).toBeNull();
+    expect(row("done.pptx").querySelector("select")).toBeNull();
+    await click(button("Improve accessibility"));
+    expect(requests().map((form) => form.get("outputTarget"))).toEqual([
+      "canvas_html",
+      "canvas_html",
+      "canvas_html",
+    ]);
+    expect(requests()[0].get("documentId")).toBe("saved");
+    expect(row("done.pptx").textContent).toContain("Ready to review");
+  });
+
+  it("keeps an attempted destination fixed after an unsaved failure", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      json: async () => ({ error: "Could not prepare the source." }),
+    } as Response);
+    await mount();
+    await upload("retry.docx");
+    await chooseRowOutput("retry.docx", "html");
+    await click(button("Improve accessibility"));
+    expect(row("retry.docx").querySelector("select")).toBeNull();
+    await selectOutput("original");
+    expect(button("Apply to pending files (0)").disabled).toBe(true);
+    await click(button("Improve accessibility"));
+    expect(requests().map((form) => form.get("outputTarget"))).toEqual([
+      "canvas_html",
+      "canvas_html",
+    ]);
+  });
+
+  it("does not upload or call the conversion endpoint when every chosen output is unavailable", async () => {
+    await mount();
+    await uploadFiles(["notes.pdf", "article.pdf"]);
+    expect(button("Improve accessibility").disabled).toBe(true);
+    await click(button("Improve accessibility"));
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(uploadPowerPointDocument).not.toHaveBeenCalled();
+    expect(host.textContent).toContain("Pending files stay in this browser");
+  });
+
+  it("freezes pending choices while a batch runs and keeps the queued destination", async () => {
+    const pending = deferredResponse();
+    fetchMock.mockReturnValueOnce(pending.promise);
+    await mount();
+    await uploadFiles(["article.pdf", "slides.pptx", "unavailable.pdf"]);
+    await chooseRowOutput("article.pdf", "html");
+    await click(button("Improve accessibility"));
+    expect(row("slides.pptx").cells[3].textContent).toBe("Queued");
+    expect(row("slides.pptx").querySelector("select")).toBeNull();
+    expect(row("unavailable.pdf").querySelector("select")?.disabled).toBe(true);
+    expect(host.querySelector("select")?.disabled).toBe(true);
+    expect(button("Apply to pending files (1)").disabled).toBe(true);
+    // A dispatched change must not alter the pending row while processing.
+    await chooseRowOutput("unavailable.pdf", "html");
+    await act(async () => pending.resolve(conversionResponse("article.pdf")));
+    expect(requests().map((form) => form.get("outputTarget"))).toEqual([
+      "canvas_html",
+      "accessible_pptx",
+    ]);
+    expect(row("unavailable.pdf").cells[3].textContent).toBe(
+      "Not available yet"
+    );
+    expect(button("Improve accessibility").disabled).toBe(true);
   });
 
   it("shows PowerPoint changes and slide locations, downloads a fresh signed result, and never fetches HTML", async () => {
     const downloadClick = vi
       .spyOn(HTMLAnchorElement.prototype, "click")
       .mockImplementation(() => {});
-    await mount([
+    await mountHtmlWorkflow([
       savedDocument("slides", "success", {
         name: "lecture.pptx",
         outputTarget: "accessible_pptx",
@@ -557,7 +773,7 @@ describe("DocumentWorkspace conversion selection", () => {
 
   it("explains an expired PowerPoint download without offering HTML actions", async () => {
     vi.mocked(getDocumentOutputDownload).mockResolvedValueOnce(null);
-    await mount([
+    await mountHtmlWorkflow([
       savedDocument("expired", "success", {
         name: "expired.pptx",
         outputTarget: "accessible_pptx",
@@ -586,10 +802,10 @@ describe("DocumentWorkspace conversion selection", () => {
         tokensUsed: 0,
       }),
     } as Response);
-    await mount();
-    await selectOutput("accessible_pptx");
+    await mountHtmlWorkflow();
+    await selectOutput("original");
     await upload("new-slides.pptx");
-    await click(button("Convert"));
+    await click(button("Improve accessibility"));
     expect(row("new-slides.pptx").textContent).toContain("Ready to review");
     await click(button("new-slides.pptx"));
     const dialog = document.body.querySelector('[role="dialog"]')!;
@@ -602,7 +818,7 @@ describe("DocumentWorkspace conversion selection", () => {
   });
 
   it("uses the document output format for location labels even if finding metadata claims slides", async () => {
-    await mount([
+    await mountHtmlWorkflow([
       savedDocument("article", "success", {
         errors: [
           {
@@ -640,7 +856,7 @@ describe("DocumentWorkspace conversion selection", () => {
         "The table is missing column labels for software that reads aloud.",
       suggestion: "Select the table in PowerPoint and identify its header row.",
     };
-    await mount([
+    await mountHtmlWorkflow([
       savedDocument("needs-fix", "success", {
         name: "needs-fix.pptx",
         outputTarget: "accessible_pptx",
@@ -658,7 +874,7 @@ describe("DocumentWorkspace conversion selection", () => {
     ).toBe("Needs a fix");
     expect(row("needs-fix.pptx").textContent).not.toContain("Ready to review");
     expect(row("review-only.pptx").textContent).toContain("Ready to review");
-    expect(button("Convert").disabled).toBe(true);
+    expect(button("Improve accessibility").disabled).toBe(true);
     await click(button("needs-fix.pptx"));
     const dialog = document.body.querySelector('[role="dialog"]')!;
     expect(dialog.querySelector('[role="status"]')?.textContent).toContain(
@@ -667,13 +883,13 @@ describe("DocumentWorkspace conversion selection", () => {
     expect(button("Download PowerPoint", dialog).disabled).toBe(false);
     await click(button("Close", document.body));
     await upload("new.pdf");
-    await click(button("Convert"));
+    await click(button("Improve accessibility"));
     expect(requests()).toHaveLength(1);
     expect((requests()[0].get("file") as File).name).toBe("new.pdf");
   });
 
   it("distinguishes completed conversions needing review from failed conversions", async () => {
-    await mount([
+    await mountHtmlWorkflow([
       savedDocument("needs-review", "success", {
         errors: [
           {
@@ -703,18 +919,18 @@ describe("DocumentWorkspace conversion selection", () => {
   });
 
   it("converts a newly added document without re-sending the first successful document", async () => {
-    await mount();
-    expect(button("Convert").disabled).toBe(true);
+    await mountHtmlWorkflow();
+    expect(button("Improve accessibility").disabled).toBe(true);
 
     await upload("first.pdf");
-    await click(button("Convert"));
+    await click(button("Improve accessibility"));
     expect(row("first.pdf").textContent).toContain("Success");
     expect(row("first.pdf").textContent).toContain("Please check: 1");
-    expect(button("Convert").disabled).toBe(true);
+    expect(button("Improve accessibility").disabled).toBe(true);
 
     await upload("second.pdf");
-    expect(button("Convert").disabled).toBe(false);
-    await click(button("Convert"));
+    expect(button("Improve accessibility").disabled).toBe(false);
+    await click(button("Improve accessibility"));
 
     expect(requests().map((form) => (form.get("file") as File)?.name)).toEqual([
       "first.pdf",
@@ -723,17 +939,17 @@ describe("DocumentWorkspace conversion selection", () => {
     expect(requests().every((form) => !form.has("documentId"))).toBe(true);
     expect(row("first.pdf").textContent).toContain("Success");
     expect(row("second.pdf").textContent).toContain("Success");
-    expect(button("Convert").disabled).toBe(true);
+    expect(button("Improve accessibility").disabled).toBe(true);
   });
 
   it("skips unlocked successes restored on reload while allowing failed jobs to retry", async () => {
-    await mount([
+    await mountHtmlWorkflow([
       savedDocument("already-done", "success"),
       savedDocument("retry-me", "error"),
       savedDocument("new-ready", "idle"),
     ]);
-    expect(button("Convert").disabled).toBe(false);
-    await click(button("Convert"));
+    expect(button("Improve accessibility").disabled).toBe(false);
+    await click(button("Improve accessibility"));
 
     expect(requests().map((form) => form.get("documentId"))).toEqual([
       "retry-me",
@@ -742,11 +958,11 @@ describe("DocumentWorkspace conversion selection", () => {
     expect(row("already-done.pdf").textContent).toContain("Success");
     expect(row("retry-me.pdf").textContent).toContain("Success");
     expect(row("new-ready.pdf").textContent).toContain("Success");
-    expect(button("Convert").disabled).toBe(true);
+    expect(button("Improve accessibility").disabled).toBe(true);
   });
 
   it("re-converts just the selected successful document, leaving a new document ready", async () => {
-    await mount([
+    await mountHtmlWorkflow([
       savedDocument("selected", "success"),
       savedDocument("other-success", "success"),
     ]);
@@ -760,7 +976,7 @@ describe("DocumentWorkspace conversion selection", () => {
     expect(row("new.pdf").textContent).toContain("Ready");
     expect(row("other-success.pdf").textContent).toContain("Success");
 
-    await click(button("Convert"));
+    await click(button("Improve accessibility"));
     expect(requests()).toHaveLength(2);
     expect((requests()[1].get("file") as File).name).toBe("new.pdf");
   });
@@ -775,18 +991,18 @@ describe("DocumentWorkspace conversion selection", () => {
           "PDF page preparation stopped on PDF page 5. An image exceeds the processing limit.",
       }),
     } as Response);
-    await mount();
+    await mountHtmlWorkflow();
     await upload("retry.pdf");
-    await click(button("Convert"));
+    await click(button("Improve accessibility"));
     expect(row("retry.pdf").textContent).toContain("Error");
     await click(button("retry.pdf"));
     expect(
       document.body.querySelector('[role="dialog"]')?.textContent
     ).toContain("PDF page 5");
     await click(button("Close", document.body));
-    expect(button("Convert").disabled).toBe(false);
+    expect(button("Improve accessibility").disabled).toBe(false);
 
-    await click(button("Convert"));
+    await click(button("Improve accessibility"));
     expect(requests()).toHaveLength(2);
     expect((requests()[0].get("file") as File).name).toBe("retry.pdf");
     expect(requests()[1].get("documentId")).toBe("saved-before-model-error");
@@ -795,7 +1011,7 @@ describe("DocumentWorkspace conversion selection", () => {
   });
 
   it("keeps locked and unsupported files out of bulk conversion and re-conversion", async () => {
-    await mount([
+    await mountHtmlWorkflow([
       savedDocument("locked-ready", "idle", { locked: true }),
       savedDocument("locked-success", "success", { locked: true }),
       savedDocument("legacy-success", "success", { name: "legacy.doc" }),
@@ -813,21 +1029,21 @@ describe("DocumentWorkspace conversion selection", () => {
         (item) => item.textContent?.trim() === "Re-convert"
       )
     ).toBe(false);
-    await click(button("Convert"));
+    await click(button("Improve accessibility"));
     expect(requests().map((form) => form.get("documentId"))).toEqual(["ready"]);
     expect(row("locked-ready.pdf").textContent).toContain("Ready");
     expect(row("legacy.txt").textContent).toContain("Error");
-    expect(button("Convert").disabled).toBe(true);
+    expect(button("Improve accessibility").disabled).toBe(true);
   });
 
   it("blocks repeated clicks and every other conversion while a batch is pending", async () => {
     const pending = deferredResponse();
     fetchMock.mockReturnValueOnce(pending.promise);
-    await mount([
+    await mountHtmlWorkflow([
       savedDocument("saved-success", "success"),
       savedDocument("ready", "idle"),
     ]);
-    const bulk = button("Convert");
+    const bulk = button("Improve accessibility");
     const reconvert = button("Re-convert", row("saved-success.pdf"));
 
     // Dispatch before React flushes the disabled state: a button-only guard
@@ -840,7 +1056,7 @@ describe("DocumentWorkspace conversion selection", () => {
 
     expect(requests()).toHaveLength(1);
     expect(requests()[0].get("documentId")).toBe("ready");
-    expect(button("Convert").disabled).toBe(true);
+    expect(button("Improve accessibility").disabled).toBe(true);
     expect(isDisabled(button("Re-convert", row("saved-success.pdf")))).toBe(
       true
     );
@@ -857,13 +1073,13 @@ describe("DocumentWorkspace conversion selection", () => {
   it("blocks duplicate single-document re-conversion and a simultaneous bulk request", async () => {
     const pending = deferredResponse();
     fetchMock.mockReturnValueOnce(pending.promise);
-    await mount([
+    await mountHtmlWorkflow([
       savedDocument("selected", "success"),
       savedDocument("other-success", "success"),
       savedDocument("new-ready", "idle"),
     ]);
     const reconvert = button("Re-convert", row("selected.pdf"));
-    const bulk = button("Convert");
+    const bulk = button("Improve accessibility");
     await act(async () => {
       reconvert.click();
       reconvert.click();
@@ -876,27 +1092,27 @@ describe("DocumentWorkspace conversion selection", () => {
     expect(isDisabled(button("Re-convert", row("other-success.pdf")))).toBe(
       true
     );
-    expect(button("Convert").disabled).toBe(true);
+    expect(button("Improve accessibility").disabled).toBe(true);
     expect(row("new-ready.pdf").textContent).toContain("Ready");
 
     await act(async () => pending.resolve(conversionResponse("selected")));
-    expect(button("Convert").disabled).toBe(false);
+    expect(button("Improve accessibility").disabled).toBe(false);
   });
 
   it.each(["queued", "processing"] as const)(
     "disables conversion for a workspace restored with a %s job",
     async (status) => {
-      await mount([
+      await mountHtmlWorkflow([
         savedDocument("busy", status),
         savedDocument("saved-success", "success"),
         savedDocument("ready", "idle"),
       ]);
-      expect(button("Convert").disabled).toBe(true);
+      expect(button("Improve accessibility").disabled).toBe(true);
       expect(isDisabled(button("Re-convert", row("saved-success.pdf")))).toBe(
         true
       );
       expect(uploadInput().disabled).toBe(true);
-      await click(button("Convert"));
+      await click(button("Improve accessibility"));
       await click(button("Re-convert", row("saved-success.pdf")));
       expect(fetchMock).not.toHaveBeenCalled();
     }

@@ -14,7 +14,7 @@ export default async function DashboardPage({
     <main className="mx-auto my-8 md:mx-16 lg:mx-24">
       <div className="flex items-center justify-between gap-4">
         <h1 className="font-bold md:text-2xl">
-          Accessible Canvas Content Conversion Platform
+          Document Accessibility Workspace
         </h1>
         <ApplicationUsage />
       </div>

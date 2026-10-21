@@ -38,14 +38,16 @@ function FindingLocation({
   issue,
   isWord,
   isPowerPoint,
+  isNativeWord,
 }: {
   issue: AccessibilityError;
   isWord: boolean;
   isPowerPoint: boolean;
+  isNativeWord: boolean;
 }): React.JSX.Element {
   const location = issue.location;
   const pages = location?.sourcePages;
-  const pageLabel = isWord ? "Converted PDF" : "PDF";
+  const pageLabel = isNativeWord ? "Preview" : isWord ? "Converted PDF" : "PDF";
   const source =
     location?.scope === "document"
       ? "Whole document"
@@ -107,8 +109,11 @@ export default function ConversionResultDialog({
   // and is only worth fetching once someone actually opens the result.
   const documentId = document?.documentId;
   const isPowerPoint = document?.outputTarget === "accessible_pptx";
+  const isNativeWord = document?.outputTarget === "accessible_docx";
+  const isNative = isPowerPoint || isNativeWord;
+  const nativeLabel = isNativeWord ? "Word document" : "PowerPoint";
   const needsHtml =
-    open && document?.status === "success" && !isPowerPoint && !document.html;
+    open && document?.status === "success" && !isNative && !document.html;
   const isLoadingHtml = Boolean(needsHtml) && fetchedHtml === undefined;
 
   useEffect(() => {
@@ -162,7 +167,7 @@ export default function ConversionResultDialog({
     URL.revokeObjectURL(url);
   };
 
-  const handlePowerPointDownload = async () => {
+  const handleNativeDownload = async () => {
     if (!documentId || downloadPending.current) return;
     downloadPending.current = true;
     setIsDownloading(true);
@@ -172,11 +177,11 @@ export default function ConversionResultDialog({
       // instructor is reading the findings. Ownership and expiry are server-checked.
       const download = await getDocumentOutputDownload(
         documentId,
-        "accessible_pptx"
+        isNativeWord ? "accessible_docx" : "accessible_pptx"
       );
       if (!download) {
         setDownloadError(
-          "This online PowerPoint copy is unavailable. Online documents expire after 14 days. Re-upload the original to process it again; files on your computer are unaffected."
+          `This online ${nativeLabel} copy is unavailable. Online documents expire after 14 days. Re-upload the original to process it again; files on your computer are unaffected.`
         );
         return;
       }
@@ -186,7 +191,7 @@ export default function ConversionResultDialog({
       anchor.click();
     } catch {
       setDownloadError(
-        "The PowerPoint download could not be prepared. Please try again."
+        `The ${nativeLabel} download could not be prepared. Please try again.`
       );
     } finally {
       downloadPending.current = false;
@@ -202,8 +207,8 @@ export default function ConversionResultDialog({
         <DialogHeader>
           <DialogTitle>{document.name}</DialogTitle>
           <DialogDescription>
-            {isPowerPoint
-              ? "PowerPoint accessibility improvements and items to review."
+            {isNative
+              ? `${isNativeWord ? "Word" : "PowerPoint"} accessibility improvements and items to review.`
               : "Conversion result for this document."}
           </DialogDescription>
           {(errorCount > 0 || warningCount > 0) && (
@@ -229,6 +234,17 @@ export default function ConversionResultDialog({
               the slides with your original, and work through the items below.
               Slide numbers refer to the order of slides in the presentation.
             </p>
+          ) : isNativeWord ? (
+            <p>
+              <span className="font-semibold text-primary">
+                Review your updated Word document
+              </span>{" "}
+              before sharing it. Run Word’s Accessibility Checker and review the
+              changes and remaining questions below. Lists and table headings
+              may have small formatting changes to improve navigation while
+              keeping the surrounding layout. Page references use the app’s
+              preview; Word may paginate differently on your computer.
+            </p>
           ) : (
             <p>
               <span className="font-semibold text-primary">
@@ -248,15 +264,16 @@ export default function ConversionResultDialog({
           <p className="text-sm text-destructive">{document.errorMessage}</p>
         )}
 
-        {isSuccess && isPowerPoint && errorCount > 0 && (
+        {isSuccess && isNative && errorCount > 0 && (
           <p role="status" className="text-sm text-destructive">
             This file still has accessibility problems that need a fix. Download
-            it and address the items marked “Needs a fix” in PowerPoint before
-            sharing it with students.
+            it and address the items marked “Needs a fix” in{" "}
+            {isNativeWord ? "Word" : "PowerPoint"} before sharing it with
+            students.
           </p>
         )}
 
-        {isSuccess && !isPowerPoint && !html && (
+        {isSuccess && !isNative && !html && (
           <p className="text-sm text-muted-foreground">
             {isLoadingHtml
               ? "Loading converted HTML…"
@@ -264,7 +281,7 @@ export default function ConversionResultDialog({
           </p>
         )}
 
-        {isSuccess && !isPowerPoint && html && (
+        {isSuccess && !isNative && html && (
           <div className="flex flex-col gap-4">
             <div className="flex flex-wrap gap-2">
               <Button onClick={handleCopy}>
@@ -288,20 +305,22 @@ export default function ConversionResultDialog({
           </div>
         )}
 
-        {isSuccess && isPowerPoint && (
+        {isSuccess && isNative && (
           <div className="flex flex-col gap-4">
             <div className="flex flex-wrap gap-2">
               {!reviewOpen && (
                 <Button
-                  onClick={handlePowerPointDownload}
+                  onClick={handleNativeDownload}
                   disabled={!documentId || isDownloading}
                 >
                   {isDownloading
                     ? "Preparing download…"
-                    : "Download PowerPoint"}
+                    : isNativeWord
+                      ? "Download Word document"
+                      : "Download PowerPoint"}
                 </Button>
               )}
-              {documentId && document.jobId && (
+              {isPowerPoint && documentId && document.jobId && (
                 <Button
                   variant="outline"
                   onClick={() => setReviewOpen((value) => !value)}
@@ -336,8 +355,8 @@ export default function ConversionResultDialog({
                   </ul>
                 ) : (
                   <p className="text-sm text-muted-foreground">
-                    No automatic changes were reported. Review the presentation
-                    and the items below.
+                    No automatic changes were reported. Review the document and
+                    the items below.
                   </p>
                 )}
               </section>
@@ -372,6 +391,7 @@ export default function ConversionResultDialog({
                     issue={issue}
                     isWord={/\.docx$/i.test(document.name)}
                     isPowerPoint={isPowerPoint}
+                    isNativeWord={isNativeWord}
                   />
                   <p className="mt-2 break-words">
                     <span className="font-medium">What needs attention:</span>{" "}

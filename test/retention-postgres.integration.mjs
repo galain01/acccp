@@ -42,6 +42,8 @@ vi.mock("@/lib/storage", () => ({
   sourcePptxKey: (session, document) => `${session}/${document}/source.pptx`,
   pptxOutputKey: (session, document, job) =>
     `${session}/${document}/${job}/output.pptx`,
+  docxOutputKey: (session, document, job) =>
+    `${session}/${document}/${job}/output.docx`,
   outputReviewKey: (session, document, job) =>
     `${session}/${document}/${job}/review.json`,
 }));
@@ -276,6 +278,12 @@ beforeAll(async () => {
       "utf8"
     )
   );
+  await pg.exec(
+    await readFile(
+      new URL("../drizzle/0015_native_word_outputs.sql", import.meta.url),
+      "utf8"
+    )
+  );
 });
 
 afterAll(async () => {
@@ -427,6 +435,105 @@ describe("retention against in-memory PostgreSQL", () => {
       [document.id]
     );
     expect(orphaned.rows[0].total).toBe(0);
+  });
+
+  it("supports native Word artifacts and diagnostics, then purges private content while retaining both model stages", async () => {
+    const document = await seedDocument(360);
+    await pg.query(
+      "UPDATE conversion_jobs SET output_target='accessible_docx', profile_version='word-v1', model_name='synthetic-word', page_count=2, processing_duration_ms=12500 WHERE id=$1",
+      [document.jobId]
+    );
+    const base = `${sessionId}/${document.id}`;
+    const nativeKeys = [
+      `${base}/source.docx`,
+      `${base}/${document.jobId}/output.docx`,
+      `${base}/${document.jobId}/review.json`,
+    ];
+    for (const [type, key] of [
+      ["docx_output", nativeKeys[1]],
+      ["review_metadata", nativeKeys[2]],
+    ]) {
+      blobs.set(key, "native Word private content");
+      await pg.query(
+        "INSERT INTO artifacts(job_id,artifact_type,filename,mime_type,storage_key) VALUES($1,$2,$3,'application/test',$4)",
+        [document.jobId, type, key.split("/").at(-1), key]
+      );
+    }
+    await pg.query(
+      "UPDATE model_calls SET model='synthetic-word', prompt_tokens=200, completion_tokens=50, cost_usd=0.004, cost_source='gateway' WHERE job_id=$1",
+      [document.jobId]
+    );
+    await pg.query(
+      "INSERT INTO model_calls(job_id,stage,model,prompt_tokens,completion_tokens,cost_usd,cost_source) VALUES($1,'validate','synthetic-word',100,20,0.002,'gateway')",
+      [document.jobId]
+    );
+    const diagnostic = createJobDiagnostic({
+      stage: "docx_repair",
+      code: "docx_visual_change",
+      attemptNumber: 1,
+    });
+    const failedAt = new Date().toISOString();
+    await fixture.db.transaction(async (tx) => {
+      await tx
+        .insert(schema.jobEvents)
+        .values({
+          jobId: document.jobId,
+          eventType: "conversion_failed",
+          message: "Controlled Word repair explanation",
+          metadata: { diagnostic },
+        });
+      await recordFailureCount(tx, diagnostic, failedAt);
+    });
+    const before = await combinedMetrics();
+    const beforeStats = await combinedJobStats();
+    expect(before.calls.map((row) => row.stage)).toEqual([
+      "convert",
+      "validate",
+    ]);
+    expect(await purgeDocumentIfEligible(document.id)).toBe("purged");
+    expect(blobs.size).toBe(0);
+    expect(fixture.remove.mock.calls[0][0]).toEqual(
+      expect.arrayContaining(nativeKeys)
+    );
+    expect(
+      Object.values(await linkedCounts(document.id, document.jobId)).every(
+        (count) => count === 0
+      )
+    ).toBe(true);
+    expect(await combinedMetrics()).toEqual(before);
+    expect(await combinedJobStats()).toEqual(beforeStats);
+    const totals = (
+      await pg.query(
+        "SELECT sum(prompt_tokens+completion_tokens)::int AS tokens, sum(cost_usd)::text AS cost FROM retained_model_metrics WHERE model='synthetic-word'"
+      )
+    ).rows[0];
+    expect(totals.tokens).toBe(370);
+    expect(Number(totals.cost)).toBe(0.006);
+    const failures = (
+      await pg.query(
+        "SELECT stage,code,failure_count::int FROM daily_failure_metrics"
+      )
+    ).rows;
+    expect(failures).toEqual([
+      { stage: "docx_repair", code: "docx_visual_change", failure_count: 1 },
+    ]);
+    const archived = JSON.stringify({
+      ...(await archivedMetrics()),
+      ...(await archivedJobStats()),
+      failures,
+    });
+    for (const privateValue of [
+      document.id,
+      document.jobId,
+      sessionId,
+      ownerId,
+      "synthetic.docx",
+      "native Word private content",
+      "Synthetic source excerpt",
+    ])
+      expect(archived).not.toContain(privateValue);
+    expect(await purgeDocumentIfEligible(document.id)).toBe("retained");
+    expect(await combinedMetrics()).toEqual(before);
   });
 
   it("preserves latest-attempt pages, all-attempt tokens and exact duration frequencies by original job cohort", async () => {

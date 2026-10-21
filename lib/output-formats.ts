@@ -5,16 +5,24 @@ import {
 } from "./document-input";
 
 /** Input files and their output destinations are separate, versioned contracts. */
-export type OutputTarget = "canvas_html" | "accessible_pptx";
+export type OutputTarget =
+  | "canvas_html"
+  | "accessible_pptx"
+  | "accessible_docx";
 
 export const DEFAULT_OUTPUT_TARGET: OutputTarget = "canvas_html";
 export const OUTPUT_PROFILES = {
   canvas_html: { label: "Canvas HTML", version: "canvas-html-v1" },
   accessible_pptx: { label: "Accessible PowerPoint", version: "powerpoint-v1" },
+  accessible_docx: { label: "Accessible Word", version: "word-v1" },
 } as const;
 
 export function isOutputTarget(value: unknown): value is OutputTarget {
-  return value === "canvas_html" || value === "accessible_pptx";
+  return (
+    value === "canvas_html" ||
+    value === "accessible_pptx" ||
+    value === "accessible_docx"
+  );
 }
 
 export function getOutputTargetForFilename(filename: string): OutputTarget {
@@ -27,7 +35,9 @@ export function isSupportedOutputForFilename(
 ): boolean {
   return outputTarget === "accessible_pptx"
     ? isPptxFilename(filename)
-    : isPdfFilename(filename) || isDocxFilename(filename);
+    : outputTarget === "accessible_docx"
+      ? isDocxFilename(filename)
+      : isPdfFilename(filename) || isDocxFilename(filename);
 }
 
 export const supportsOutputTarget = isSupportedOutputForFilename;
@@ -41,7 +51,9 @@ export function outputFilename(
     .replace(/[\x00-\x1f\x7f/\\]/g, "_");
   return outputTarget === "accessible_pptx"
     ? `${stem}-accessible.pptx`
-    : `${stem}.html`;
+    : outputTarget === "accessible_docx"
+      ? `${stem}-accessible.docx`
+      : `${stem}.html`;
 }
 
 /** Change summaries contain document content and follow the same retention. */

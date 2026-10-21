@@ -2,16 +2,22 @@
 
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { deleteDocument } from "@/lib/actions/documents";
-import { isPptxFilename, maxFileSizeForFilename } from "@/lib/document-input";
+import {
+  isPptxFilename,
+  isSupportedDocumentFilename,
+  maxFileSizeForFilename,
+} from "@/lib/document-input";
 import {
   DocumentUploadError,
   uploadPowerPointDocument,
 } from "@/lib/document-upload-client";
 import {
-  DEFAULT_OUTPUT_TARGET,
-  isSupportedOutputForFilename,
-  type OutputTarget,
-} from "@/lib/output-formats";
+  canChooseDocumentOutput,
+  getDocumentOutputChoice,
+  getOutputChoice,
+  isOutputIntent,
+  type OutputIntent,
+} from "@/lib/output-intent";
 import type { UploadedDocument } from "@/lib/types/document";
 import { Button } from "./button";
 import DocumentTable from "./document-table";
@@ -26,10 +32,7 @@ function isBatchTarget(doc: UploadedDocument): boolean {
   return (
     !doc.locked &&
     (doc.status === "idle" || doc.status === "error") &&
-    isSupportedOutputForFilename(
-      doc.name,
-      doc.outputTarget ?? DEFAULT_OUTPUT_TARGET
-    )
+    Boolean(getDocumentOutputChoice(doc).target)
   );
 }
 
@@ -39,9 +42,7 @@ export default function DocumentWorkspace({
 }: DocumentWorkspaceProps): React.JSX.Element {
   const [documents, setDocuments] =
     useState<UploadedDocument[]>(initialDocuments);
-  const [outputTarget, setOutputTarget] = useState<OutputTarget>(
-    DEFAULT_OUTPUT_TARGET
-  );
+  const [outputIntent, setOutputIntent] = useState<OutputIntent>("original");
   const outputFormatId = useId();
   const abortControllersRef = useRef<Map<string, AbortController>>(new Map());
   const mountedRef = useRef(false);
@@ -55,14 +56,12 @@ export default function DocumentWorkspace({
     (doc) => doc.status === "processing" || doc.status === "queued"
   );
   const hasDocuments = documents.length > 0;
-  const canConvert = documents.some(isBatchTarget) && !isProcessing;
-  const hasUnsupportedDocuments = documents.some(
-    (doc) =>
-      !isSupportedOutputForFilename(
-        doc.name,
-        doc.outputTarget ?? DEFAULT_OUTPUT_TARGET
-      )
-  );
+  const readyCount = documents.filter(isBatchTarget).length;
+  const canConvert = readyCount > 0 && !isProcessing;
+  const unavailableCount = documents.filter(
+    (doc) => !getDocumentOutputChoice(doc).target
+  ).length;
+  const editableCount = documents.filter(canChooseDocumentOutput).length;
 
   useEffect(() => {
     mountedRef.current = true;
@@ -88,7 +87,7 @@ export default function DocumentWorkspace({
     (files: File[]) => {
       const compatibleFiles = files.filter(
         (file) =>
-          isSupportedOutputForFilename(file.name, outputTarget) &&
+          isSupportedDocumentFilename(file.name) &&
           file.size > 0 &&
           file.size <= maxFileSizeForFilename(file.name)
       );
@@ -102,12 +101,36 @@ export default function DocumentWorkspace({
           uploadedAt: new Date(),
           status: "idle" as const,
           locked: false,
-          outputTarget,
+          outputIntent,
+          outputTarget: getOutputChoice(file.name, outputIntent).target,
           file,
         })),
       ]);
     },
-    [outputTarget]
+    [outputIntent]
+  );
+
+  const changeOutput = useCallback(
+    (intent: OutputIntent, docId?: string) => {
+      if (
+        isProcessing ||
+        batchActiveRef.current ||
+        abortControllersRef.current.size > 0
+      )
+        return;
+      setDocuments((prev) =>
+        prev.map((doc) =>
+          (!docId || doc.id === docId) && canChooseDocumentOutput(doc)
+            ? {
+                ...doc,
+                outputIntent: intent,
+                outputTarget: getOutputChoice(doc.name, intent).target,
+              }
+            : doc
+        )
+      );
+    },
+    [isProcessing]
   );
 
   const toggleDocumentLock = useCallback((docId: string) => {
@@ -152,11 +175,9 @@ export default function DocumentWorkspace({
 
   const convertDocument = useCallback(
     async (doc: UploadedDocument) => {
+      const target = getDocumentOutputChoice(doc).target;
       if (
-        !isSupportedOutputForFilename(
-          doc.name,
-          doc.outputTarget ?? DEFAULT_OUTPUT_TARGET
-        ) ||
+        !target ||
         abortControllersRef.current.has(doc.id) ||
         deletedRowsRef.current.has(doc.id) ||
         !mountedRef.current
@@ -216,7 +237,7 @@ export default function DocumentWorkspace({
           return;
         const form = new FormData();
         form.append("sessionId", sessionId);
-        form.append("outputTarget", doc.outputTarget ?? DEFAULT_OUTPUT_TARGET);
+        form.append("outputTarget", target);
         if (documentId) form.append("documentId", documentId);
         else form.append("file", doc.file!);
         const response = await fetch("/api/convert", {
@@ -262,7 +283,7 @@ export default function DocumentWorkspace({
           processingPhase: undefined,
           documentId,
           jobId: data.jobId,
-          html: doc.outputTarget === "accessible_pptx" ? undefined : data.html,
+          html: target === "canvas_html" ? data.html : undefined,
           changes: data.changes,
           errorMessage: undefined,
           errors: data.errors,
@@ -342,40 +363,51 @@ export default function DocumentWorkspace({
           htmlFor={outputFormatId}
           className="text-sm font-medium text-foreground"
         >
-          Output format
+          Default for new uploads
         </label>
         <select
           id={outputFormatId}
-          value={outputTarget}
+          value={outputIntent}
           disabled={isProcessing}
           aria-describedby={`${outputFormatId}-description`}
-          onChange={(event) =>
-            setOutputTarget(event.target.value as OutputTarget)
-          }
+          onChange={(event) => {
+            if (isOutputIntent(event.target.value))
+              setOutputIntent(event.target.value);
+          }}
           className="h-10 w-full rounded-lg border border-input bg-background px-3 text-sm focus-visible:outline-2 focus-visible:outline-ring disabled:opacity-50 sm:max-w-sm"
         >
-          <option value="canvas_html">Canvas HTML</option>
-          <option value="accessible_pptx">PowerPoint (.pptx)</option>
+          <option value="original">Keep original format</option>
+          <option value="html">HTML (Canvas)</option>
         </select>
         <p
           id={`${outputFormatId}-description`}
           className="text-sm text-muted-foreground"
         >
-          {outputTarget === "accessible_pptx"
-            ? "Upload a PowerPoint (.pptx) to improve its accessibility and download an updated PowerPoint file."
-            : "Upload a Word (.docx) document or PDF to create HTML for Canvas."}
-          {hasDocuments &&
-            " This choice applies to new uploads. Documents already listed keep their output format."}
+          Choose a format for new files, then adjust individual files below.
+          Original-format improvements are available for Word and PowerPoint.
+          Word and PDF can also become HTML. PDF repair and PowerPoint to HTML
+          are not available yet.
         </p>
+        {hasDocuments && (
+          <div>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={isProcessing || editableCount === 0}
+              onClick={() => changeOutput(outputIntent)}
+            >
+              Apply to pending files ({editableCount})
+            </Button>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Applies to unlocked files that have not started processing. Saved
+              results and attempted files keep their output format.
+            </p>
+          </div>
+        )}
         <h2 className="text-sm font-medium text-foreground">
           Upload documents
         </h2>
-        <FileUpload
-          key={outputTarget}
-          outputTarget={outputTarget}
-          onFilesSelected={addDocuments}
-          disabled={isProcessing}
-        />
+        <FileUpload onFilesSelected={addDocuments} disabled={isProcessing} />
         <p className="text-sm text-muted-foreground">
           Download the results you want to keep. Online copies of originals and
           converted files expire 14 days after the document is first saved for
@@ -387,26 +419,29 @@ export default function DocumentWorkspace({
 
       <section>
         <Button size="lg" disabled={!canConvert} onClick={runConversion}>
-          Convert
+          Improve accessibility
         </Button>
         {!hasDocuments && (
           <p className="mt-2 text-sm text-muted-foreground">
-            Upload at least one file for your selected output format to enable
-            conversion.
+            Add files and choose an available output format to start.
           </p>
         )}
         {hasDocuments && !isProcessing && (
           <p className="mt-2 text-sm text-muted-foreground">
-            Convert processes only new or failed documents that are unlocked.
-            Completed documents are skipped. Use Re-convert on a completed
-            document to generate a new result and use additional model tokens.
+            {readyCount} file{readyCount === 1 ? " is" : "s are"} ready to
+            process. Only new or failed documents that are unlocked are
+            processed. Completed documents are skipped. Use Re-convert on a
+            completed document to generate a new result and use additional model
+            tokens.
           </p>
         )}
-        {hasUnsupportedDocuments && (
-          <p className="mt-2 text-sm text-muted-foreground">
-            Previous conversions remain available until they expire. Canvas HTML
-            accepts PDF and .docx files; PowerPoint output accepts .pptx files.
-            Save older .doc or .ppt files in the newer format before uploading.
+        {unavailableCount > 0 && (
+          <p role="status" className="mt-2 text-sm text-muted-foreground">
+            {unavailableCount} file{unavailableCount === 1 ? " has" : "s have"}{" "}
+            an unavailable output format and will not be processed. Choose an
+            available format for each pending file, or remove it. Pending files
+            stay in this browser until processing starts and are lost if you
+            reload or leave this page. Your original files are unchanged.
           </p>
         )}
         {hasDocuments && isProcessing && (
@@ -424,6 +459,7 @@ export default function DocumentWorkspace({
         onDeleteDocument={handleDeleteDocument}
         onReconvert={reconvertDocument}
         isProcessing={isProcessing}
+        onChangeOutput={(docId, intent) => changeOutput(intent, docId)}
         onReviewExport={(docId, result) =>
           updateDocument(docId, {
             errors: result.findings,

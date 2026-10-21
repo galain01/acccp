@@ -1,7 +1,7 @@
 /**
  * POST /api/convert
  *
- * Converts PDF/DOCX to Canvas HTML or remediates PPTX in its native format, preserving the
+ * Converts PDF/DOCX to Canvas HTML or repairs DOCX/PPTX in their native formats, preserving the
  * conversion job, its artifacts, and its accessibility findings.
  *
  * Request:  multipart/form-data
@@ -34,6 +34,7 @@ import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 
 import { verifyRoleOrUnauthorized } from "@/lib/auth";
 import { convertPowerPoint } from "@/lib/powerpoint-convert";
+import { convertWord } from "@/lib/word-convert";
 import { createStoredPowerPointRenderer } from "@/lib/powerpoint-render-storage";
 import {
   DEFAULT_OUTPUT_TARGET,
@@ -94,6 +95,7 @@ import {
   downloadObject,
   htmlOutputKey,
   pptxOutputKey,
+  docxOutputKey,
   outputReviewKey,
   sourceDocxKey,
   sourcePdfKey,
@@ -109,7 +111,7 @@ const PROVIDER = "litellm";
 class ConversionInProgressError extends Error {
   constructor(readonly documentId: string) {
     super(
-      "This presentation is already being processed. Wait for it to finish before trying again."
+      "This document is already being processed. Wait for it to finish before trying again."
     );
   }
 }
@@ -322,8 +324,10 @@ async function convertRequest(req: NextRequest) {
       .select({
         id: documents.id,
         originalFilename: documents.originalFilename,
+        outputTarget: conversionJobs.outputTarget,
       })
       .from(documents)
+      .leftJoin(conversionJobs, eq(conversionJobs.documentId, documents.id))
       .where(
         and(
           eq(documents.id, existingDocumentId),
@@ -332,6 +336,15 @@ async function convertRequest(req: NextRequest) {
         )
       );
     if (!existing) return json({ error: "Document not found." }, 404);
+    if (existing.outputTarget && existing.outputTarget !== outputTarget) {
+      return json(
+        {
+          error:
+            "This saved document already has an output format. Upload another copy to choose a different format.",
+        },
+        409
+      );
+    }
 
     documentId = existing.id;
     filename = existing.originalFilename;
@@ -348,7 +361,7 @@ async function convertRequest(req: NextRequest) {
       return json(
         {
           error:
-            "Choose Accessible PowerPoint for a .pptx file, or Canvas HTML for a PDF or Word file.",
+            "Choose Word output for .docx, PowerPoint output for .pptx, or Canvas HTML for PDF or Word files.",
         },
         415
       );
@@ -409,7 +422,7 @@ async function convertRequest(req: NextRequest) {
       return json(
         {
           error:
-            "Choose Accessible PowerPoint for a .pptx file, or Canvas HTML for a PDF or Word file.",
+            "Choose Word output for .docx, PowerPoint output for .pptx, or Canvas HTML for PDF or Word files.",
         },
         415
       );
@@ -428,8 +441,8 @@ async function convertRequest(req: NextRequest) {
     const inputError = validateDocumentInput(sourceBuffer, filename);
     if (inputError) return json({ error: inputError }, 415);
 
-    // Render before creating rows: a rejected Word file leaves no empty document.
-    // PDFs use the existing path without contacting the Word renderer.
+    // The HTML path renders Word before creating rows. Native engines prepare
+    // their source as part of the recorded job, including any failure diagnostics.
     documentId = "";
   }
 
@@ -439,12 +452,15 @@ async function convertRequest(req: NextRequest) {
   const startedAt = new Date().toISOString();
   const isWord = isDocxFilename(filename);
   const isPowerPoint = isPptxFilename(filename);
+  const isNativeWord = outputTarget === "accessible_docx";
+  const isNative = isPowerPoint || isNativeWord;
   const pdfFilename = isWord ? filename.replace(/\.docx$/i, ".pdf") : filename;
   let buffer: Buffer;
   try {
-    buffer = isWord
-      ? await renderWordToPdf(sourceBuffer, filename)
-      : sourceBuffer;
+    buffer =
+      isWord && !isNativeWord
+        ? await renderWordToPdf(sourceBuffer, filename)
+        : sourceBuffer;
   } catch (error) {
     if (!(error instanceof WordToPdfError)) throw error;
     // Word rendering precedes document/job creation. Keep that behavior and
@@ -470,7 +486,7 @@ async function convertRequest(req: NextRequest) {
     : isWord
       ? DOCX_MIME_TYPE
       : PDF_MIME_TYPE;
-  const pageCount = isPowerPoint ? null : await countPdfPages(buffer);
+  const pageCount = isNative ? null : await countPdfPages(buffer);
 
   if (!isReconversion) {
     const [created] = await db
@@ -496,7 +512,7 @@ async function convertRequest(req: NextRequest) {
     try {
       await withRetainedDocument(documentId, async () => {
         await uploadObject(sourceKey, sourceBuffer, sourceMimeType);
-        if (isWord) {
+        if (isWord && !isNativeWord) {
           await uploadObject(
             sourcePdfKey(sessionId, documentId),
             buffer,
@@ -516,9 +532,9 @@ async function convertRequest(req: NextRequest) {
     }
   }
 
-  // Each destination has its own job; retries update only that destination.
+  // A saved document keeps its destination; retries update that same job.
   const job = await withRetainedDocument(documentId, async (tx, document) => {
-    if (isPowerPoint) {
+    if (isNative) {
       // The retained-document row lock serializes competing starts for this
       // presentation. A request that lost its response must not bill twice.
       const [active] = await tx
@@ -587,7 +603,9 @@ async function convertRequest(req: NextRequest) {
           jobId
         ),
       })
-    : await convertPdf(buffer, pdfFilename);
+    : isNativeWord
+      ? await convertWord(sourceBuffer, filename)
+      : await convertPdf(buffer, pdfFilename);
 
   if ("error" in result) {
     const diagnostic = createJobDiagnostic({
@@ -616,11 +634,20 @@ async function convertRequest(req: NextRequest) {
 
   const outputKey = isPowerPoint
     ? pptxOutputKey(sessionId, documentId, jobId)
-    : htmlOutputKey(sessionId, documentId);
-  const outputBody = "pptx" in result ? result.pptx : result.html;
+    : isNativeWord
+      ? docxOutputKey(sessionId, documentId, jobId)
+      : htmlOutputKey(sessionId, documentId);
+  const outputBody =
+    "pptx" in result
+      ? result.pptx
+      : "docx" in result
+        ? result.docx
+        : result.html;
   const outputMimeType = isPowerPoint
     ? PPTX_MIME_TYPE
-    : "text/html; charset=utf-8";
+    : isNativeWord
+      ? DOCX_MIME_TYPE
+      : "text/html; charset=utf-8";
   const changes = "changes" in result ? readOutputChanges(result.changes) : [];
   const reviewKey = outputReviewKey(sessionId, documentId, jobId);
   const reviewBody = JSON.stringify({
@@ -650,7 +677,7 @@ async function convertRequest(req: NextRequest) {
           return false;
         }
         const expiresAt = retentionExpiresAt(document.createdAt);
-        if (isReconversion && isWord) {
+        if (isReconversion && isWord && !isNativeWord) {
           // A failed model attempt must not replace the PDF paired with the last
           // saved HTML and artifact metadata. Persist this render only on success.
           await uploadObject(
@@ -660,7 +687,7 @@ async function convertRequest(req: NextRequest) {
           );
         }
         await uploadObject(outputKey, outputBody, outputMimeType);
-        if (isPowerPoint)
+        if (isNative)
           await uploadObject(reviewKey, reviewBody, "application/json");
 
         const artifactsUpdatedAt = new Date().toISOString();
@@ -709,27 +736,35 @@ async function convertRequest(req: NextRequest) {
                   previewSnippet: null,
                 },
               ]
-            : [
-                {
-                  artifactType: "source_pdf" as const,
-                  filename: pdfFilename,
-                  mimeType: PDF_MIME_TYPE,
-                  storageKey: sourcePdfKey(sessionId, documentId),
-                  fileSizeBytes: buffer.byteLength,
-                  previewSnippet: null,
-                },
-              ]),
+            : isNativeWord
+              ? []
+              : [
+                  {
+                    artifactType: "source_pdf" as const,
+                    filename: pdfFilename,
+                    mimeType: PDF_MIME_TYPE,
+                    storageKey: sourcePdfKey(sessionId, documentId),
+                    fileSizeBytes: buffer.byteLength,
+                    previewSnippet: null,
+                  },
+                ]),
           {
             artifactType: isPowerPoint
               ? ("pptx_output" as const)
-              : ("html_output" as const),
+              : isNativeWord
+                ? ("docx_output" as const)
+                : ("html_output" as const),
             filename: outputFilename(filename, outputTarget),
-            mimeType: isPowerPoint ? PPTX_MIME_TYPE : "text/html",
+            mimeType: isPowerPoint
+              ? PPTX_MIME_TYPE
+              : isNativeWord
+                ? DOCX_MIME_TYPE
+                : "text/html",
             storageKey: outputKey,
             fileSizeBytes: Buffer.byteLength(outputBody),
             previewSnippet: "html" in result ? result.html.slice(0, 500) : null,
           },
-          ...(isPowerPoint
+          ...(isNative
             ? [
                 {
                   artifactType: "review_metadata" as const,

@@ -1,5 +1,7 @@
 /** PDF and Word uploads keep their existing small-file envelope. */
 export const MAX_FILE_SIZE_BYTES = 4 * 1024 * 1024;
+/** Allow a small increase for semantic metadata in repaired Word packages. */
+export const MAX_DOCX_OUTPUT_SIZE_BYTES = 8 * 1024 * 1024;
 export const MAX_PPTX_FILE_SIZE_BYTES = 25 * 1024 * 1024;
 /** Generated slides and metadata may increase a presentation's saved size. */
 export const MAX_PPTX_OUTPUT_SIZE_BYTES = 30 * 1024 * 1024;

@@ -1,5 +1,6 @@
 import type { AccessibilityError } from "@/lib/convert";
 import type { OutputTarget } from "@/lib/output-formats";
+import type { OutputIntent } from "@/lib/output-intent";
 
 export type ConversionStatus =
   | "idle"
@@ -14,8 +15,10 @@ export interface UploadedDocument {
   /** documents.id. Present after the source is saved, before or during conversion. */
   documentId?: string;
   jobId?: string;
-  /** Existing saved HTML documents default to canvas_html. Fixed per upload. */
+  /** Implemented destination; fixed once processing starts. Legacy rows default to HTML. */
   outputTarget?: OutputTarget;
+  /** New local files retain the requested format even when it is unavailable. */
+  outputIntent?: OutputIntent;
   name: string;
   size: number;
   uploadedAt: Date;
