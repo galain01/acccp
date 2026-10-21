@@ -86,6 +86,7 @@ synthetic workshop PDF with the real pinned Java tools. The output retained
 identical page pixels and content. After missing title/language repair, its
 remaining PDF/UA-1 failure was the deliberately absent conformance declaration.
 This records measured local runtime behavior, not a conformance certificate.
-The container build could not be tested in that session because the local
-Docker daemon was unavailable; a container build and hosted smoke test remain
-release checks.
+The Vercel Linux container build also passed the authenticated prepare/repair
+smoke test on 2026-10-21, including both installed Java tools, the unprivileged
+application user and production process limits. The hosted app flow remains a
+separate release check.
