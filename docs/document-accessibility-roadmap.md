@@ -33,16 +33,16 @@ Only enable a destination after its repair and validation pipeline works.
 
 ## Implementation status
 
-The current branch implements the shared workflow and native Word repair.
-Native PDF remains planned. Production is unchanged until a separate release.
+The shared workflow and native Word repair were released on 2026-10-21.
+Native PDF remains planned.
 
 | Input | Keep original format | HTML |
 | --- | --- | --- |
 | `.pptx` | Existing native repair engine | Not implemented |
-| `.docx` | Native repair; local testing | Existing Canvas HTML engine |
+| `.docx` | Native repair engine | Existing Canvas HTML engine |
 | `.pdf` | Not implemented | Existing Canvas HTML engine |
 
-For the preparatory UI, requested `original`/`html` intent is distinct from
+In the UI, requested `original`/`html` intent is distinct from
 executable `OutputTarget`. The server accepts `accessible_docx`, `accessible_pptx` and
 `canvas_html`, with its existing input/target checks. An unavailable choice must
 never be submitted using the legacy Canvas default. Destination changes are
@@ -67,7 +67,7 @@ file, including content and visual preservation, rather than trusting the
 model's claim that it fixed something. PDF previews are evidence for native
 Office repairs; they are not the editable output.
 
-### Word: implemented on this branch
+### Word: available
 
 See [native Word repair](word-accessibility.md) for the pipeline, supported
 operations, limits, storage and migration. The engine patches original OOXML,
