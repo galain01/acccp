@@ -229,7 +229,9 @@ export async function getDocumentOutputDownload(
                 ? "pptx_output"
                 : outputTarget === "accessible_docx"
                   ? "docx_output"
-                  : "html_output"
+                  : outputTarget === "accessible_pdf"
+                    ? "pdf_output"
+                    : "html_output"
             ),
             eq(artifacts.artifactStatus, "available"),
             retainedDocumentCondition()

@@ -5,8 +5,11 @@
 ACCCP helps OSU instructors improve the accessibility of teaching materials and
 choose the format they need. Word and PowerPoint have native repair paths that
 return editable `.docx` and `.pptx` files. Word and PDF can also become
-Canvas-compatible HTML. Native PDF repair is planned. See the [implementation roadmap](docs/document-accessibility-roadmap.md)
-for the format-preserving direction and release gates.
+Canvas-compatible HTML. This branch adds [native PDF repair](docs/pdf-accessibility.md)
+with layout preservation, machine checks and an independent model audit; its
+hosted service and database migration have not been activated. See the
+[implementation roadmap](docs/document-accessibility-roadmap.md) for capabilities
+and release gates.
 
 This project was developed as part of a summer 2026 CSE 5911 capstone session
 at the Ohio State University by group members Adithya Balachandar, Braedon Salisbury,

@@ -46,8 +46,7 @@ export function getOutputChoice(
   if (isPdfFilename(filename))
     return {
       label: "PDF (.pdf)",
-      unavailableReason:
-        "PDF output is not available yet. You can choose HTML (Canvas), or keep your original file for a future release.",
+      target: "accessible_pdf",
     };
   return {
     label: "Original format",

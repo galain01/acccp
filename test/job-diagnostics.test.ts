@@ -10,6 +10,23 @@ import {
 } from "@/lib/job-diagnostics";
 
 describe("safe saved job diagnostics", () => {
+  it("explains native PDF preservation failures without leaking worker output or implying HTML conversion", () => {
+    const diagnostic = createJobDiagnostic({
+      stage: "native_pdf_repair",
+      code: "native_pdf_preservation",
+      pageNumber: 5,
+      message: "private document text",
+      workerOutput: "private path and output",
+    });
+    const message = describeJobDiagnostic(diagnostic);
+    expect(message).toContain("PDF");
+    expect(message).toContain("page 5");
+    expect(message).toContain("preserved the original pages and content");
+    expect(message).toContain("No repaired PDF was saved");
+    expect(message).not.toMatch(/Canvas|HTML|private/);
+    expect(JSON.stringify(diagnostic)).not.toContain("private");
+  });
+
   it("explains a full or expired PDF queue without document or infrastructure details", () => {
     const diagnostic = createJobDiagnostic({
       stage: "pdf_render",

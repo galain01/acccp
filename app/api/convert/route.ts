@@ -1,7 +1,7 @@
 /**
  * POST /api/convert
  *
- * Converts PDF/DOCX to Canvas HTML or repairs DOCX/PPTX in their native formats, preserving the
+ * Converts PDF/DOCX to Canvas HTML or repairs PDF/DOCX/PPTX in their native formats, preserving the
  * conversion job, its artifacts, and its accessibility findings.
  *
  * Request:  multipart/form-data
@@ -35,6 +35,7 @@ import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { verifyRoleOrUnauthorized } from "@/lib/auth";
 import { convertPowerPoint } from "@/lib/powerpoint-convert";
 import { convertWord } from "@/lib/word-convert";
+import { repairNativePdf } from "@/lib/native-pdf-convert";
 import { createStoredPowerPointRenderer } from "@/lib/powerpoint-render-storage";
 import {
   DEFAULT_OUTPUT_TARGET,
@@ -96,6 +97,7 @@ import {
   htmlOutputKey,
   pptxOutputKey,
   docxOutputKey,
+  pdfOutputKey,
   outputReviewKey,
   sourceDocxKey,
   sourcePdfKey,
@@ -453,7 +455,8 @@ async function convertRequest(req: NextRequest) {
   const isWord = isDocxFilename(filename);
   const isPowerPoint = isPptxFilename(filename);
   const isNativeWord = outputTarget === "accessible_docx";
-  const isNative = isPowerPoint || isNativeWord;
+  const isNativePdf = outputTarget === "accessible_pdf";
+  const isNative = isPowerPoint || isNativeWord || isNativePdf;
   const pdfFilename = isWord ? filename.replace(/\.docx$/i, ".pdf") : filename;
   let buffer: Buffer;
   try {
@@ -588,6 +591,17 @@ async function convertRequest(req: NextRequest) {
         attemptNumber: conversionJobs.attemptCount,
       });
     return savedJob;
+  }).catch(async (error) => {
+    // A new PDF without a job would lose its chosen native destination when
+    // listed again. Keep failed starts discoverable by the existing purge.
+    if (isNativePdf && !isReconversion) {
+      await db
+        .update(documents)
+        .set({ deletedAt: new Date().toISOString() })
+        .where(eq(documents.id, documentId));
+      await purgeDocumentIfEligible(documentId);
+    }
+    throw error;
   });
   const jobId = job.id;
 
@@ -605,7 +619,9 @@ async function convertRequest(req: NextRequest) {
       })
     : isNativeWord
       ? await convertWord(sourceBuffer, filename)
-      : await convertPdf(buffer, pdfFilename);
+      : isNativePdf
+        ? await repairNativePdf(sourceBuffer, filename)
+        : await convertPdf(buffer, pdfFilename);
 
   if ("error" in result) {
     const diagnostic = createJobDiagnostic({
@@ -636,18 +652,24 @@ async function convertRequest(req: NextRequest) {
     ? pptxOutputKey(sessionId, documentId, jobId)
     : isNativeWord
       ? docxOutputKey(sessionId, documentId, jobId)
-      : htmlOutputKey(sessionId, documentId);
+      : isNativePdf
+        ? pdfOutputKey(sessionId, documentId, jobId)
+        : htmlOutputKey(sessionId, documentId);
   const outputBody =
     "pptx" in result
       ? result.pptx
       : "docx" in result
         ? result.docx
-        : result.html;
+        : "pdf" in result
+          ? result.pdf
+          : result.html;
   const outputMimeType = isPowerPoint
     ? PPTX_MIME_TYPE
     : isNativeWord
       ? DOCX_MIME_TYPE
-      : "text/html; charset=utf-8";
+      : isNativePdf
+        ? PDF_MIME_TYPE
+        : "text/html; charset=utf-8";
   const changes = "changes" in result ? readOutputChanges(result.changes) : [];
   const reviewKey = outputReviewKey(sessionId, documentId, jobId);
   const reviewBody = JSON.stringify({
@@ -655,6 +677,9 @@ async function convertRequest(req: NextRequest) {
     profileVersion,
     changes,
     findings: result.errors,
+    ...("nativePdfChecks" in result
+      ? { nativePdfChecks: result.nativePdfChecks }
+      : {}),
     ...("revisions" in result ? { revisions: result.revisions } : {}),
     ...("reviewPreviews" in result
       ? { reviewPreviews: result.reviewPreviews }
@@ -753,13 +778,17 @@ async function convertRequest(req: NextRequest) {
               ? ("pptx_output" as const)
               : isNativeWord
                 ? ("docx_output" as const)
-                : ("html_output" as const),
+                : isNativePdf
+                  ? ("pdf_output" as const)
+                  : ("html_output" as const),
             filename: outputFilename(filename, outputTarget),
             mimeType: isPowerPoint
               ? PPTX_MIME_TYPE
               : isNativeWord
                 ? DOCX_MIME_TYPE
-                : "text/html",
+                : isNativePdf
+                  ? PDF_MIME_TYPE
+                  : "text/html",
             storageKey: outputKey,
             fileSizeBytes: Buffer.byteLength(outputBody),
             previewSnippet: "html" in result ? result.html.slice(0, 500) : null,

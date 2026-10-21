@@ -1,0 +1,316 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+vi.mock("server-only", () => ({}));
+import {
+  nativePdfRequest,
+  parseNativePdfState,
+  pdfSha256,
+} from "@/lib/native-pdf-worker";
+
+const source = Buffer.from("%PDF-1.7\nfixture source\n%%EOF");
+const candidate = Buffer.from("%PDF-1.7\nfixture candidate\n%%EOF");
+function response() {
+  return {
+    schemaVersion: 1,
+    sourceSha256: pdfSha256(source),
+    candidateSha256: pdfSha256(candidate),
+    pdfBase64: candidate.toString("base64"),
+    pageCount: 1,
+    inventory: {
+      title: "Test",
+      language: "en",
+      page_content: [
+        {
+          pageNumber: 1,
+          mcids: [0],
+          text_show_operators: 1,
+          untagged_text_operators: 0,
+          artifact_text_operators: 0,
+          artifactText: "",
+          artifactTextComplete: true,
+        },
+      ],
+      form_content: [] as Record<string, unknown>[],
+      forms: {},
+      tags: [
+        {
+          id: "tag-1",
+          parentId: null,
+          children: [],
+          role: "P",
+          pageNumber: 1,
+          text: "Test",
+          content: [{ pageNumber: 1 }],
+          editable: { role: true, alt: false, tableHeader: false },
+          snapshot: {
+            role: "P",
+            pageNumber: 1,
+            text: "Test",
+            mcids: [0],
+            alt: null,
+          },
+        },
+      ],
+    },
+    findings: [],
+    changes: [],
+    machineChecks: {
+      preservationPassed: true,
+      pixelsIdentical: true,
+      inspectionComplete: true,
+      structurePassed: true,
+      targetStandard: "PDF/UA-1 (ISO 14289-1:2014)",
+      veraPdf: {
+        completed: true,
+        compliant: false,
+        failedRules: 1,
+        failedChecks: 1,
+      },
+      conformanceClaim: false,
+    },
+  };
+}
+describe("native PDF service client", () => {
+  beforeEach(() => {
+    vi.stubEnv("NATIVE_PDF_URL", "https://private-worker.example");
+    vi.stubEnv("NATIVE_PDF_API_KEY", "s".repeat(40));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response(JSON.stringify(response())))
+    );
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+  });
+  it("binds candidate and source bytes and retained findings to the actual output", async () => {
+    const result = await nativePdfRequest("prepare", source, 90_000);
+    expect(result.pdf).toEqual(candidate);
+    expect(result.sourceSha256).toBe(pdfSha256(source));
+    expect(fetch).toHaveBeenCalledWith(
+      new URL("https://private-worker.example/prepare"),
+      expect.objectContaining({
+        redirect: "manual",
+        cache: "no-store",
+        body: new Uint8Array(source),
+        headers: {
+          Authorization: `Bearer ${"s".repeat(40)}`,
+          "Content-Type": "application/pdf",
+        },
+      })
+    );
+  });
+  it.each(["sourceSha256", "candidateSha256"])(
+    "rejects mismatched %s",
+    (key) => {
+      const raw = { ...response(), [key]: "0".repeat(64) };
+      expect(() => parseNativePdfState(raw, source)).toThrow(
+        "pdf_protocol_error"
+      );
+    }
+  );
+  it("rejects incomplete inspections and altered page pixels", () => {
+    for (const key of [
+      "preservationPassed",
+      "inspectionComplete",
+      "pixelsIdentical",
+    ] as const) {
+      const raw = response();
+      raw.machineChecks[key] = false;
+      expect(() => parseNativePdfState(raw, source)).toThrow(
+        "pdf_protocol_error"
+      );
+    }
+  });
+  it("rejects missing pages, duplicate tags, stale snapshots and parent cycles", () => {
+    const missing = response();
+    missing.inventory.page_content = [];
+    const duplicate = response();
+    duplicate.inventory.tags.push(duplicate.inventory.tags[0]);
+    const stale = response();
+    stale.inventory.tags[0].snapshot.text = "Different";
+    const cyclic = response() as unknown as Record<string, unknown>;
+    const ci = cyclic.inventory as { tags: { parentId: unknown }[] };
+    ci.tags[0].parentId = "tag-1";
+    for (const raw of [missing, duplicate, stale, cyclic])
+      expect(() => parseNativePdfState(raw, source)).toThrow(
+        "pdf_protocol_error"
+      );
+  });
+  it("requires page evidence in exact physical order with bounded complete excluded text", () => {
+    const page = response().inventory.page_content[0];
+    for (const changed of [
+      { pageNumber: 2 },
+      { pageNumber: "1" },
+      { artifactText: "x".repeat(16_001) },
+      { artifactText: undefined },
+      { artifactTextComplete: false },
+      { mcids: [0, 0] },
+      { mcids: [2, 1] },
+      { mcids: [-1] },
+      { text_show_operators: 200_001 },
+      { untagged_text_operators: -1 },
+      { artifact_text_operators: undefined },
+      { form_artifact_text_operators: "1" },
+    ]) {
+      const raw = response();
+      const inventory = raw.inventory as unknown as Record<string, unknown>;
+      inventory.page_content = [{ ...page, ...changed }];
+      expect(() => parseNativePdfState(raw, source)).toThrow(
+        "pdf_protocol_error"
+      );
+    }
+    for (const pageNumbers of [
+      [1, 1],
+      [2, 1],
+      [1, 3],
+    ]) {
+      const raw = response();
+      raw.pageCount = 2;
+      raw.inventory.page_content = pageNumbers.map((pageNumber) => ({
+        ...page,
+        pageNumber,
+      }));
+      expect(() => parseNativePdfState(raw, source)).toThrow(
+        "pdf_protocol_error"
+      );
+    }
+  });
+  it("requires complete uniquely identified nested-form scopes on known pages", () => {
+    const form = {
+      streamId: "form-1",
+      pageNumber: 1,
+      mcids: [0],
+      checksComplete: true,
+      gaps: [],
+    };
+    const good = response();
+    good.inventory.form_content = [form];
+    expect(parseNativePdfState(good, source).inventory.form_content).toEqual([
+      form,
+    ]);
+    for (const changed of [
+      { pageNumber: 2 },
+      { checksComplete: false },
+      { gaps: ["unresolved"] },
+      { streamId: "" },
+      { mcids: [0, 0] },
+    ]) {
+      const raw = response();
+      raw.inventory.form_content = [{ ...form, ...changed }];
+      expect(() => parseNativePdfState(raw, source)).toThrow(
+        "pdf_protocol_error"
+      );
+    }
+    const duplicated = response();
+    duplicated.inventory.form_content = [form, form];
+    expect(() => parseNativePdfState(duplicated, source)).toThrow(
+      "pdf_protocol_error"
+    );
+    const absent = response();
+    delete (absent.inventory as Partial<typeof absent.inventory>).form_content;
+    expect(() => parseNativePdfState(absent, source)).toThrow(
+      "pdf_protocol_error"
+    );
+  });
+  it("requires both directions of every parent/child relationship", () => {
+    const raw = response();
+    const parent = {
+      ...raw.inventory.tags[0],
+      role: "Document",
+      children: ["tag-2"],
+    };
+    parent.snapshot = { ...parent.snapshot, role: "Document" };
+    const child = { ...raw.inventory.tags[0], id: "tag-2", parentId: "tag-1" };
+    const inventory = raw.inventory as unknown as Record<string, unknown>;
+    inventory.tags = [parent, child];
+    expect(parseNativePdfState(raw, source).inventory.tags).toHaveLength(2);
+    parent.children = [];
+    expect(() => parseNativePdfState(raw, source)).toThrow(
+      "pdf_protocol_error"
+    );
+    parent.children = ["tag-2"];
+    inventory.tags = [parent, { ...child, parentId: null }];
+    expect(() => parseNativePdfState(raw, source)).toThrow(
+      "pdf_protocol_error"
+    );
+    inventory.tags = [parent, { ...child, parentId: "" }];
+    expect(() => parseNativePdfState(raw, source)).toThrow(
+      "pdf_protocol_error"
+    );
+  });
+  it("refuses redirects before credentials can go to another host", async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(null, {
+        status: 302,
+        headers: { Location: "https://other.example" },
+      })
+    );
+    await expect(nativePdfRequest("prepare", source, 1000)).rejects.toThrow(
+      "native_pdf_configuration"
+    );
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    "http://remote.example",
+    "https://user:secret@private-worker.example",
+    "https://private-worker.example?token=x",
+  ])("rejects unsafe endpoint %s", async (url) => {
+    vi.stubEnv("NATIVE_PDF_URL", url);
+    await expect(nativePdfRequest("prepare", source, 1000)).rejects.toThrow(
+      "native_pdf_configuration"
+    );
+    expect(fetch).not.toHaveBeenCalled();
+  });
+  it("requires a service key even on local development", async () => {
+    vi.stubEnv("NATIVE_PDF_API_KEY", "");
+    await expect(nativePdfRequest("prepare", source, 1000)).rejects.toThrow(
+      "native_pdf_configuration"
+    );
+  });
+  it("preserves a controlled busy error without leaking server error text", async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          error: { code: "native_pdf_busy", message: "private data" },
+        }),
+        { status: 503 }
+      )
+    );
+    await expect(nativePdfRequest("prepare", source, 1000)).rejects.toThrow(
+      /^native_pdf_busy$/
+    );
+  });
+  it("replaces arbitrary upstream messages and codes", async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          error: { code: "secret source contents", message: "private key" },
+        }),
+        { status: 500 }
+      )
+    );
+    await expect(nativePdfRequest("prepare", source, 1000)).rejects.toThrow(
+      /^native_pdf_worker_failed$/
+    );
+  });
+  it("bounds a streamed response even without Content-Length", async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(new Uint8Array(16 * 1024 * 1024 + 1))
+    );
+    await expect(nativePdfRequest("prepare", source, 1000)).rejects.toThrow(
+      "pdf_protocol_error"
+    );
+  });
+  it("checks candidate identity again before a repair request", async () => {
+    const state = parseNativePdfState(response(), source);
+    state.pdf = Buffer.from("%PDF-mutated");
+    await expect(
+      nativePdfRequest("repair", source, 1000, state, {
+        schemaVersion: 1,
+        candidateSha256: state.candidateSha256,
+        operations: [],
+      })
+    ).rejects.toThrow("pdf_protocol_error");
+    expect(fetch).not.toHaveBeenCalled();
+  });
+});

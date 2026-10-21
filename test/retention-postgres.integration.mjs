@@ -44,6 +44,8 @@ vi.mock("@/lib/storage", () => ({
     `${session}/${document}/${job}/output.pptx`,
   docxOutputKey: (session, document, job) =>
     `${session}/${document}/${job}/output.docx`,
+  pdfOutputKey: (session, document, job) =>
+    `${session}/${document}/${job}/output.pdf`,
   outputReviewKey: (session, document, job) =>
     `${session}/${document}/${job}/review.json`,
 }));
@@ -284,6 +286,12 @@ beforeAll(async () => {
       "utf8"
     )
   );
+  await pg.exec(
+    await readFile(
+      new URL("../drizzle/0016_native_pdf_outputs.sql", import.meta.url),
+      "utf8"
+    )
+  );
 });
 
 afterAll(async () => {
@@ -474,14 +482,12 @@ describe("retention against in-memory PostgreSQL", () => {
     });
     const failedAt = new Date().toISOString();
     await fixture.db.transaction(async (tx) => {
-      await tx
-        .insert(schema.jobEvents)
-        .values({
-          jobId: document.jobId,
-          eventType: "conversion_failed",
-          message: "Controlled Word repair explanation",
-          metadata: { diagnostic },
-        });
+      await tx.insert(schema.jobEvents).values({
+        jobId: document.jobId,
+        eventType: "conversion_failed",
+        message: "Controlled Word repair explanation",
+        metadata: { diagnostic },
+      });
       await recordFailureCount(tx, diagnostic, failedAt);
     });
     const before = await combinedMetrics();
@@ -529,6 +535,102 @@ describe("retention against in-memory PostgreSQL", () => {
       ownerId,
       "synthetic.docx",
       "native Word private content",
+      "Synthetic source excerpt",
+    ])
+      expect(archived).not.toContain(privateValue);
+    expect(await purgeDocumentIfEligible(document.id)).toBe("retained");
+    expect(await combinedMetrics()).toEqual(before);
+  });
+
+  it("supports native PDF artifacts and diagnostics, then purges PDF content while retaining all model usage", async () => {
+    const document = await seedDocument(360);
+    await pg.query(
+      "UPDATE documents SET original_filename='private-course.pdf', mime_type='application/pdf' WHERE id=$1",
+      [document.id]
+    );
+    await pg.query(
+      "UPDATE conversion_jobs SET output_target='accessible_pdf', profile_version='pdf-v1', model_name='synthetic-pdf', page_count=2, processing_duration_ms=15000 WHERE id=$1",
+      [document.jobId]
+    );
+    const base = `${sessionId}/${document.id}`;
+    const outputKey = `${base}/${document.jobId}/output.pdf`;
+    const reviewKey = `${base}/${document.jobId}/review.json`;
+    blobs.set(outputKey, "private repaired PDF");
+    blobs.set(reviewKey, "private PDF review");
+    await pg.query(
+      "INSERT INTO artifacts(job_id,artifact_type,filename,mime_type,storage_key) VALUES($1,'pdf_output','output.pdf','application/pdf',$2)",
+      [document.jobId, outputKey]
+    );
+    // Review bytes precede a failed artifact transaction: canonical purge must
+    // still discover this path even without its review_metadata row.
+    await pg.query(
+      "UPDATE model_calls SET model='synthetic-pdf', prompt_tokens=200, completion_tokens=50, cost_usd=0.004, cost_source='gateway' WHERE job_id=$1",
+      [document.jobId]
+    );
+    await pg.query(
+      "INSERT INTO model_calls(job_id,stage,model,prompt_tokens,completion_tokens,cost_usd,cost_source) VALUES($1,'validate','synthetic-pdf',100,20,0.002,'gateway')",
+      [document.jobId]
+    );
+    const diagnostic = createJobDiagnostic({
+      stage: "native_pdf_repair",
+      code: "native_pdf_preservation",
+      attemptNumber: 1,
+    });
+    await fixture.db.transaction(async (tx) => {
+      await tx.insert(schema.jobEvents).values({
+        jobId: document.jobId,
+        eventType: "conversion_failed",
+        message: "Controlled PDF repair explanation",
+        metadata: { diagnostic },
+      });
+      await recordFailureCount(tx, diagnostic, new Date().toISOString());
+    });
+    const before = await combinedMetrics();
+    const beforeStats = await combinedJobStats();
+    expect(await purgeDocumentIfEligible(document.id)).toBe("purged");
+    expect(blobs.size).toBe(0);
+    expect(fixture.remove.mock.calls[0][0]).toEqual(
+      expect.arrayContaining([`${base}/source.pdf`, outputKey, reviewKey])
+    );
+    expect(
+      Object.values(await linkedCounts(document.id, document.jobId)).every(
+        (count) => count === 0
+      )
+    ).toBe(true);
+    expect(await combinedMetrics()).toEqual(before);
+    expect(await combinedJobStats()).toEqual(beforeStats);
+    const totals = (
+      await pg.query(
+        "SELECT sum(prompt_tokens+completion_tokens)::int AS tokens, sum(cost_usd)::text AS cost FROM retained_model_metrics WHERE model='synthetic-pdf'"
+      )
+    ).rows[0];
+    expect(totals.tokens).toBe(370);
+    expect(Number(totals.cost)).toBe(0.006);
+    const failures = (
+      await pg.query(
+        "SELECT stage,code,failure_count::int FROM daily_failure_metrics"
+      )
+    ).rows;
+    expect(failures).toEqual([
+      {
+        stage: "native_pdf_repair",
+        code: "native_pdf_preservation",
+        failure_count: 1,
+      },
+    ]);
+    const archived = JSON.stringify({
+      ...(await archivedMetrics()),
+      ...(await archivedJobStats()),
+      failures,
+    });
+    for (const privateValue of [
+      document.id,
+      document.jobId,
+      sessionId,
+      ownerId,
+      "private-course.pdf",
+      "private repaired PDF",
+      "private PDF review",
       "Synthetic source excerpt",
     ])
       expect(archived).not.toContain(privateValue);

@@ -34,16 +34,16 @@ Only enable a destination after its repair and validation pipeline works.
 ## Implementation status
 
 The shared workflow and native Word repair were released on 2026-10-21.
-Native PDF remains planned.
+This branch adds native PDF repair; hosted activation has not occurred.
 
 | Input | Keep original format | HTML |
 | --- | --- | --- |
 | `.pptx` | Existing native repair engine | Not implemented |
 | `.docx` | Native repair engine | Existing Canvas HTML engine |
-| `.pdf` | Not implemented | Existing Canvas HTML engine |
+| `.pdf` | Native repair engine on this branch; not deployed | Existing Canvas HTML engine |
 
 In the UI, requested `original`/`html` intent is distinct from
-executable `OutputTarget`. The server accepts `accessible_docx`, `accessible_pptx` and
+executable `OutputTarget`. The server accepts `accessible_pdf`, `accessible_docx`, `accessible_pptx` and
 `canvas_html`, with its existing input/target checks. An unavailable choice must
 never be submitted using the legacy Canvas default. Destination changes are
 limited to local pending files; an attempted/saved file keeps its fixed target.
@@ -82,12 +82,15 @@ Local evaluation uses controlled and instructor files with independent OpenXML
 SDK, package-preservation and visual comparisons. Word Accessibility Checker
 and screen-reader verification remain part of the release review.
 
-### PDF: validate the native repair prototype
+### PDF: native repair integration
 
-The current PDF libraries render and inspect documents; they do not implement a
-complete native accessibility writer. A PDF repair engine must connect headings,
-paragraphs, tables, figures, forms, and reading order to the actual page content.
-Adding a detached structure tree or document metadata would not be sufficient.
+See [native PDF repair](pdf-accessibility.md) for the app pipeline, supported
+operations, bounds, storage and migration. The first general engine uses the
+private open-source worker to preserve existing tags, tag untagged files and
+apply bounded metadata, leaf text-role, missing-description and simple
+table-header changes. It preserves original pages, reopens the written output,
+and runs machine checks and an independent audit. Scans, font defects, complex
+forms and uncertain semantics remain visible when they need additional work.
 
 Evaluate native tag writing on the original PDF, including existing tags,
 reused content objects, multi-column layouts, links/forms, scans/OCR, fonts,
@@ -129,8 +132,12 @@ Other approaches researched, but not selected:
 
 OpenDataLoader and veraPDF run locally in the research setup. No paid license or
 new provider account has been purchased. Semantic experiments use the existing
-institutional LiteLLM configuration. The production PDF repair destination
-remains unavailable until preservation and accessibility release gates pass.
+institutional LiteLLM configuration. The branch now integrates a bounded
+general repair path; the broader fixture-specific OCR, font, form and appendix
+experiments remain research tools. The production PDF repair destination has
+not been activated. The final manual interactive review was stopped at the
+user's request, so the app makes no claim that such testing has been completed
+for arbitrary uploaded documents.
 
 ### HTML
 
@@ -142,10 +149,11 @@ without changing existing saved Canvas outputs.
 
 ## Shared persistence and rollout
 
-Explicit dispatch and typed results now separate Canvas HTML, native Word and
-native PowerPoint, including artifacts, MIME types, downloads and purge paths.
-The future `accessible_pdf` destination must add these together; it cannot
-fall through to the HTML branch.
+Explicit dispatch and typed results separate Canvas HTML, native Word, native
+PowerPoint and native PDF, including artifacts, MIME types, downloads and purge
+paths. The PDF target requires migration `0016_native_pdf_outputs` and its
+configured private worker before hosted activation; it cannot fall through to
+the HTML branch.
 
 One source should eventually own several independent result jobs. The current
 database still enforces legacy `UNIQUE(document_id)` alongside

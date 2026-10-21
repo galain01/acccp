@@ -28,6 +28,8 @@ vi.mock("@/lib/storage", () => ({
     `${session}/${id}/${job}/output.docx`,
   pptxOutputKey: (session: string, id: string, job: string) =>
     `${session}/${id}/${job}/output.pptx`,
+  pdfOutputKey: (session: string, id: string, job: string) =>
+    `${session}/${id}/${job}/output.pdf`,
   outputReviewKey: (session: string, id: string, job: string) =>
     `${session}/${id}/${job}/review.json`,
 }));
@@ -286,9 +288,11 @@ describe("document purge", () => {
       ...keys,
       `${root}/job-pptx/output.pptx`,
       `${root}/job-pptx/output.docx`,
+      `${root}/job-pptx/output.pdf`,
       `${root}/job-pptx/review.json`,
       `${root}/job-legacy/output.pptx`,
       `${root}/job-legacy/output.docx`,
+      `${root}/job-legacy/output.pdf`,
       `${root}/job-legacy/review.json`,
       "legacy/output.pptx",
     ]);
@@ -319,6 +323,37 @@ describe("document purge", () => {
     );
     expect(
       removed.filter((key) => key === `${prefix}/output.docx`)
+    ).toHaveLength(1);
+    expect(mocks.remove.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.db.delete.mock.invocationCallOrder[0]
+    );
+    expect(archiveQueries()).toHaveLength(4);
+  });
+
+  it("purges native PDF output after a failed metadata save and deletes legacy PDF artifacts", async () => {
+    queued(
+      [document],
+      [{ id: document.id }],
+      [
+        { jobId: "pdf-job", storageKey: null },
+        { jobId: "pdf-job", storageKey: "old-pdf-result.pdf" },
+        { jobId: "pdf-job", storageKey: "old-pdf-review.json" },
+      ]
+    );
+    expect(await purgeDocumentIfEligible(document.id)).toBe("purged");
+    const prefix = `${document.sessionId}/${document.id}/pdf-job`;
+    const removed = mocks.remove.mock.calls[0][0] as string[];
+    expect(removed).toEqual(
+      expect.arrayContaining([
+        keys[1],
+        `${prefix}/output.pdf`,
+        `${prefix}/review.json`,
+        "old-pdf-result.pdf",
+        "old-pdf-review.json",
+      ])
+    );
+    expect(
+      removed.filter((key) => key === `${prefix}/output.pdf`)
     ).toHaveLength(1);
     expect(mocks.remove.mock.invocationCallOrder[0]).toBeLessThan(
       mocks.db.delete.mock.invocationCallOrder[0]

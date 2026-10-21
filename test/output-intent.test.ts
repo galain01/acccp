@@ -8,11 +8,11 @@ import { isOutputTarget } from "@/lib/output-formats";
 
 describe("requested document output", () => {
   it.each(["article.pdf"])(
-    "never substitutes HTML for unavailable native %s output",
+    "offers native %s repair without substituting HTML",
     (filename) => {
       const choice = getOutputChoice(filename, "original");
-      expect(choice.target).toBeUndefined();
-      expect(choice.unavailableReason).toContain("not available yet");
+      expect(choice.target).toBe("accessible_pdf");
+      expect(choice.unavailableReason).toBeUndefined();
       // Even a stale resolved destination cannot override the user's current intent.
       expect(
         getDocumentOutputChoice({
@@ -20,7 +20,7 @@ describe("requested document output", () => {
           outputIntent: "original",
           outputTarget: "canvas_html",
         }).target
-      ).toBeUndefined();
+      ).toBe("accessible_pdf");
       expect(getOutputChoice(filename, "html").target).toBe("canvas_html");
     }
   );
@@ -58,8 +58,9 @@ describe("requested document output", () => {
   });
 
   it("does not widen the API contract to unsupported targets or UI intent values", () => {
-    for (const value of ["original", "html", "accessible_pdf"])
+    for (const value of ["original", "html", "accessible_rtf"])
       expect(isOutputTarget(value)).toBe(false);
+    expect(isOutputTarget("accessible_pdf")).toBe(true);
     expect(isOutputIntent("original")).toBe(true);
     expect(isOutputIntent("html")).toBe(true);
     expect(isOutputIntent("accessible_pdf")).toBe(false);
