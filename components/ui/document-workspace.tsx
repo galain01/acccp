@@ -19,6 +19,7 @@ import {
   type OutputIntent,
 } from "@/lib/output-intent";
 import type { UploadedDocument } from "@/lib/types/document";
+import { readPdfInteractionTestSummary } from "@/lib/pdf-interaction-summary";
 import { Button } from "./button";
 import DocumentTable from "./document-table";
 import FileUpload from "./file-upload";
@@ -188,6 +189,7 @@ export default function DocumentWorkspace({
         updateDocument(doc.id, {
           status: "error",
           errorMessage: "This document is no longer available. Re-upload it.",
+          interactionTestSummary: undefined,
         });
         return;
       }
@@ -204,6 +206,7 @@ export default function DocumentWorkspace({
         errorMessage: undefined,
         errors: undefined,
         changes: undefined,
+        interactionTestSummary: undefined,
       });
 
       try {
@@ -285,6 +288,10 @@ export default function DocumentWorkspace({
           jobId: data.jobId,
           html: target === "canvas_html" ? data.html : undefined,
           changes: data.changes,
+          interactionTestSummary:
+            target === "accessible_pdf"
+              ? readPdfInteractionTestSummary(data.interactionTestSummary)
+              : undefined,
           errorMessage: undefined,
           errors: data.errors,
         });

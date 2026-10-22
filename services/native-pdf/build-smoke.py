@@ -249,6 +249,15 @@ def main():
         assert_result(hybrid_repaired, hybrid_source)
         original_hybrid = PdfReader(io.BytesIO(hybrid_source))
         saved_hybrid = PdfReader(io.BytesIO(base64.b64decode(hybrid_repaired["pdfBase64"], validate=True)))
+        from form_interaction_fingerprint import form_interaction_fingerprint
+        interaction = form_interaction_fingerprint(saved_hybrid)
+        require(interaction is not None and interaction["schemaVersion"] == 1
+                and len(interaction["sha256"]) == 64, "Saved hybrid interaction fingerprint was unavailable")
+        require(hybrid_prepared["inventory"]["forms"]["interactionFingerprint"] == interaction
+                and hybrid_repaired["inventory"]["forms"]["interactionFingerprint"] == interaction,
+                "Prepare/repair did not fingerprint their actual saved interaction state")
+        require("interactionFingerprint" not in prepared["inventory"]["forms"],
+                "Unsupported non-hybrid PDF received interaction evidence identity")
         require("/Perms" not in saved_hybrid.trailer["/Root"], "Obsolete Reader rights remained in repaired copy")
         require(saved_hybrid.get_fields()["workshop[0].name[0]"]["/TU"] == "Fictional workshop name", "Authored form label was not saved")
         require(hybrid_info["speechPromptsEnabled"] == ["workshop[0].name[0]"]

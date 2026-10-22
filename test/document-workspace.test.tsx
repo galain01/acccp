@@ -257,6 +257,67 @@ afterEach(async () => {
 });
 
 describe("DocumentWorkspace conversion selection", () => {
+  it("shows a returned PDF test summary, then clears it through a failed reprocess and an unmatched retry", async () => {
+    const summary = {
+      evidenceId: "synthetic-form-test",
+      testedAt: "2026-10-22",
+      environment: "Acrobat and NVDA",
+      passedChecks: ["The name field announced its label."],
+      scopeNote:
+        "Earlier tests match this form; they were not rerun for this conversion.",
+    };
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        documentId: "form",
+        jobId: "job",
+        errors: [],
+        changes: [],
+        interactionTestSummary: summary,
+      }),
+    } as Response);
+    await mount();
+    await upload("form.pdf");
+    await click(button("Improve accessibility"));
+    await click(button("form.pdf"));
+    expect(
+      document.body.querySelector(
+        'section[aria-label="Previously tested form behavior"]'
+      )?.textContent
+    ).toContain(summary.passedChecks[0]);
+    await click(button("Close", document.body));
+
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      json: async () => ({ error: "Repair failed." }),
+    } as Response);
+    await click(button("Re-convert", row("form.pdf")));
+    await click(button("form.pdf"));
+    expect(
+      document.body.querySelector('[role="dialog"]')?.textContent
+    ).toContain("Repair failed.");
+    expect(
+      document.body.querySelector(
+        'section[aria-label="Previously tested form behavior"]'
+      )
+    ).toBeNull();
+    await click(button("Close", document.body));
+
+    await click(button("Improve accessibility"));
+    await click(button("form.pdf"));
+    expect(row("form.pdf").textContent).toContain("Ready to review");
+    expect(
+      document.body.querySelector(
+        'section[aria-label="Previously tested form behavior"]'
+      )
+    ).toBeNull();
+    expect(
+      requests()
+        .slice(1)
+        .map((form) => form.get("documentId"))
+    ).toEqual(["form", "form"]);
+  });
+
   it("keeps new Word files native by default and does not resend a completed repair in the next batch", async () => {
     fetchMock.mockImplementation(
       async () =>

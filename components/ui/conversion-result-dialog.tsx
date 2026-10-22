@@ -26,6 +26,7 @@ import {
   DialogTitle,
 } from "./dialog";
 import type { UploadedDocument } from "@/lib/types/document";
+import { readPdfInteractionTestSummary } from "@/lib/pdf-interaction-summary";
 import type { PowerPointReviewExport } from "@/lib/powerpoint-review-contract";
 import PowerPointChangeReview from "./powerpoint-change-review";
 
@@ -143,6 +144,10 @@ export default function ConversionResultDialog({
   const html = document.html ?? fetchedHtml ?? undefined;
   const isSuccess = document.status === "success";
   const isError = document.status === "error";
+  const interactionTestSummary =
+    isSuccess && isNativePdf
+      ? readPdfInteractionTestSummary(document.interactionTestSummary)
+      : undefined;
   const issues = (reviewedResult?.findings ?? document.errors ?? []).map(
     presentFinding
   );
@@ -261,9 +266,12 @@ export default function ConversionResultDialog({
               </span>{" "}
               before sharing it. The app checks the file and asks an independent
               AI reviewer to compare it with your original. Review the changes
-              and remaining questions below, including reading order, image
-              descriptions, and any form fields. Automatic checks do not certify
-              PDF accessibility. Page numbers count from the first page.
+              and remaining questions below
+              {interactionTestSummary
+                ? "."
+                : ", including reading order, image descriptions, and any form fields."}{" "}
+              Automatic checks do not certify PDF accessibility. Page numbers
+              count from the first page.
             </p>
           ) : (
             <p>
@@ -392,6 +400,29 @@ export default function ConversionResultDialog({
               </section>
             )}
           </div>
+        )}
+
+        {interactionTestSummary && (
+          <section aria-label="Previously tested form behavior">
+            <h2 className="mb-2 font-medium">
+              Previously tested form behavior
+            </h2>
+            <p className="text-sm">
+              Tested on{" "}
+              <time dateTime={interactionTestSummary.testedAt}>
+                {interactionTestSummary.testedAt}
+              </time>{" "}
+              with {interactionTestSummary.environment}.
+            </p>
+            <ul className="mt-2 list-disc space-y-1 pl-5 text-sm">
+              {interactionTestSummary.passedChecks.map((check) => (
+                <li key={check}>{check}</li>
+              ))}
+            </ul>
+            <p className="mt-2 text-sm text-muted-foreground">
+              {interactionTestSummary.scopeNote}
+            </p>
+          </section>
         )}
 
         {isSuccess && issues.length > 0 && (

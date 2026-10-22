@@ -41,6 +41,14 @@ import {
   NATIVE_PDF_REPAIR_PROMPT,
   NATIVE_PDF_AUDIT_PROMPT,
 } from "./prompts/native-pdf-accessibility";
+import {
+  getNativePdfInteractionTests,
+  nativePdfInteractionSummary,
+  reconcileNativePdfInteractionFindings,
+  validFormInteractionReview,
+  type MatchedNativePdfInteractionTests,
+} from "./native-pdf-interaction-evidence";
+import type { PdfInteractionTestSummary } from "./pdf-interaction-summary";
 
 interface Batch {
   pages: number[];
@@ -67,9 +75,11 @@ export interface NativePdfConversionResult {
   calls: ModelCallUsage[];
   extractionWarnings: string[];
   pageCount: number;
+  interactionTestSummary?: PdfInteractionTestSummary;
   nativePdfChecks: NativePdfState["machineChecks"] & {
     auditComplete: boolean;
     screenReaderTestPerformed: false;
+    priorMatchingInteractionTests?: MatchedNativePdfInteractionTests;
   };
 }
 const invalid = (): never => {
@@ -195,7 +205,8 @@ function parsed(value: string): Record<string, unknown> {
 }
 export function parseNativePdfFindings(
   raw: unknown,
-  batch: Batch
+  batch: Batch,
+  state?: NativePdfState
 ): NativePdfFinding[] {
   if (!Array.isArray(raw) || raw.length > 250) return invalid();
   return raw.map((f) => {
@@ -211,6 +222,7 @@ export function parseNativePdfFindings(
             "location",
             "message",
             "suggestion",
+            "interactionReview",
           ].includes(k)
       ) ||
       !text(f.code, 100) ||
@@ -228,6 +240,18 @@ export function parseNativePdfFindings(
       )
     )
       return invalid();
+    if (f.code === "form-interaction-review") {
+      if (
+        f.severity !== "warning" ||
+        f.tagId !== undefined ||
+        !validFormInteractionReview(
+          f.interactionReview,
+          state,
+          Number(f.pageNumber)
+        )
+      )
+        return invalid();
+    } else if (f.interactionReview !== undefined) return invalid();
     const tag =
       f.tagId === undefined
         ? undefined
@@ -248,6 +272,12 @@ export function parseNativePdfFindings(
       location: f.location,
       ...(typeof f.pageNumber === "number" ? { pageNumber: f.pageNumber } : {}),
       ...(tag ? { tagId: tag.id } : {}),
+      ...(f.code === "form-interaction-review"
+        ? {
+            interactionReview:
+              f.interactionReview as NativePdfFinding["interactionReview"],
+          }
+        : {}),
     };
   });
 }
@@ -369,7 +399,7 @@ export function parseNativePdfPlan(
   });
   return {
     operations,
-    findings: parseNativePdfFindings(raw.findings, batch),
+    findings: parseNativePdfFindings(raw.findings, batch, state),
     ...(typeof raw.language === "string" ? { language: raw.language } : {}),
     ...(typeof raw.title === "string" ? { title: raw.title } : {}),
   };
@@ -435,7 +465,8 @@ export function coalesceNativePdfOperations(
 }
 export function parseNativePdfAudit(
   raw: Record<string, unknown>,
-  batch: Batch
+  batch: Batch,
+  state?: NativePdfState
 ): NativePdfFinding[] {
   if (
     Object.keys(raw).some(
@@ -456,7 +487,7 @@ export function parseNativePdfAudit(
     )
   )
     return invalid();
-  const findings = parseNativePdfFindings(raw.findings, batch);
+  const findings = parseNativePdfFindings(raw.findings, batch, state);
   for (const key of ["artifactReviews", "textReviews"] as const) {
     const reviews = raw[key];
     const pass =
@@ -626,7 +657,8 @@ function scope(
   evidenceRole:
     | "current-saved-pdf"
     | "before-repair-comparison" = "current-saved-pdf",
-  headingReviewTargets: NativePdfHeadingReviewTarget[] = []
+  headingReviewTargets: NativePdfHeadingReviewTarget[] = [],
+  interactionTests?: MatchedNativePdfInteractionTests
 ): string {
   const structureCandidates = (state.inventory.structureCandidates ?? [])
     .filter((candidate) => batch.tags.some((tag) => tag.id === candidate.tagId))
@@ -668,12 +700,18 @@ function scope(
     ),
     nestedFormContent: state.inventory.form_content,
     forms: state.inventory.forms,
+    priorMatchingInteractionTests: interactionTests ?? null,
     // Earlier failures may already be repaired. Only checks reopened from the
     // delivered output are evidence of its remaining machine defects.
     ...(evidenceRole === "current-saved-pdf"
       ? {
           machineChecks: state.machineChecks,
-          findings: state.findings.filter(
+          findings: reconcileNativePdfInteractionFindings(
+            state.findings,
+            [],
+            state,
+            interactionTests
+          ).filter(
             (f) => !f.pageNumber || batch.visualPages.includes(f.pageNumber)
           ),
           outstandingRepairFindings: outstandingRepairFindings.filter(
@@ -726,6 +764,11 @@ export async function repairNativePdf(
     if (validatePdfInput(source, filename))
       throw new NativePdfError("pdf_invalid");
     const prepared = await nativePdfRequest("prepare", source, time());
+    const sourceSha256 = pdfSha256(source);
+    const preparedInteractionTests = getNativePdfInteractionTests(
+      prepared,
+      sourceSha256
+    );
     const rendered: RenderedPdf = await renderPdfPages(source, {
       timeoutMs: Math.min(90_000, time()),
     });
@@ -752,7 +795,7 @@ export async function repairNativePdf(
           [
             {
               type: "text",
-              text: `Untrusted saved PDF inventory:\n${scope(prepared, batch)}\nThe attached excerpt maps pages in this order: ${batch.visualPages.join(", ")}.`,
+              text: `Untrusted saved PDF inventory:\n${scope(prepared, batch, [], "current-saved-pdf", [], preparedInteractionTests)}\nThe attached excerpt maps pages in this order: ${batch.visualPages.join(", ")}.`,
             },
             {
               type: "file",
@@ -807,6 +850,10 @@ export async function repairNativePdf(
     );
     if (repaired.pageCount !== prepared.pageCount)
       throw new NativePdfError("native_pdf_preservation");
+    const repairedInteractionTests = getNativePdfInteractionTests(
+      repaired,
+      sourceSha256
+    );
     stage = "native_pdf_audit";
     const actualDoc = await PDFDocument.load(repaired.pdf, {
       updateMetadata: false,
@@ -911,7 +958,7 @@ export async function repairNativePdf(
           [
             {
               type: "text",
-              text: `Untrusted exact saved output evidence:\n${scope(repaired, batch, mappedRetained, "current-saved-pdf", reviewTargets)}\nPrior inventory for comparison:\n${scope(prepared, historicalBatch, [], "before-repair-comparison")}\nRepairs: ${JSON.stringify(repaired.changes)}\nBoth excerpts map physical pages ${batch.visualPages.join(", ")} in that order.`,
+              text: `Untrusted exact saved output evidence:\n${scope(repaired, batch, mappedRetained, "current-saved-pdf", reviewTargets, repairedInteractionTests)}\nPrior inventory for comparison:\n${scope(prepared, historicalBatch, [], "before-repair-comparison", [], preparedInteractionTests)}\nRepairs: ${JSON.stringify(repaired.changes)}\nBoth excerpts map physical pages ${batch.visualPages.join(", ")} in that order.`,
             },
             ...excerpts.map(
               (pdf, i): LiteLLMContentPart => ({
@@ -938,7 +985,7 @@ export async function repairNativePdf(
         );
         const data = parsed(call.content);
         if (call.finishReason && call.finishReason !== "stop") return invalid();
-        const findings = parseNativePdfAudit(data, batch);
+        const findings = parseNativePdfAudit(data, batch, repaired);
         const resolvedFindingIds = parseNativePdfHeadingReviews(
           data.repairFindingReviews,
           reviewTargets
@@ -971,7 +1018,8 @@ export async function repairNativePdf(
     const skippedCandidateDiscovery = prepared.findings.find(
       (finding) => finding.code === "structure_candidates_limited"
     );
-    const findings = [
+    const modelFindings: NativePdfFinding[] = [];
+    const workerFindings = [
       ...repaired.findings,
       ...(skippedCandidateDiscovery &&
       !repaired.findings.some(
@@ -979,16 +1027,19 @@ export async function repairNativePdf(
       )
         ? [skippedCandidateDiscovery]
         : []),
+    ];
+    modelFindings.push(
       ...retainedRecords
         .filter((record) => !resolvedFindingIds.has(record.findingId))
-        .map((record) => record.finding),
-    ];
+        .map((record) => record.finding)
+    );
     let auditComplete = true;
     audits.forEach((audit, index) => {
-      if (audit.status === "fulfilled") findings.push(...audit.value.findings);
+      if (audit.status === "fulfilled")
+        modelFindings.push(...audit.value.findings);
       else {
         auditComplete = false;
-        findings.push({
+        modelFindings.push({
           code: "audit-incomplete",
           severity: "warning",
           pageNumber: batches[index].pages[0],
@@ -1000,6 +1051,12 @@ export async function repairNativePdf(
         });
       }
     });
+    const findings = reconcileNativePdfInteractionFindings(
+      workerFindings,
+      modelFindings,
+      repaired,
+      repairedInteractionTests
+    );
     if (
       !repaired.machineChecks.veraPdf.completed &&
       !findings.some((f) => f.code === "validation-incomplete")
@@ -1056,10 +1113,20 @@ export async function repairNativePdf(
         .filter((e) => e.severity === "warning")
         .map((e) => e.message),
       pageCount: repaired.pageCount,
+      ...(repairedInteractionTests
+        ? {
+            interactionTestSummary: nativePdfInteractionSummary(
+              repairedInteractionTests
+            ),
+          }
+        : {}),
       nativePdfChecks: {
         ...repaired.machineChecks,
         auditComplete,
         screenReaderTestPerformed: false,
+        ...(repairedInteractionTests
+          ? { priorMatchingInteractionTests: repairedInteractionTests }
+          : {}),
       },
     };
   } catch (error) {

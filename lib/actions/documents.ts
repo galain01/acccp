@@ -32,6 +32,7 @@ import {
   type OutputTarget,
 } from "@/lib/output-formats";
 import type { UploadedDocument } from "@/lib/types/document";
+import { readPdfInteractionTestSummary } from "@/lib/pdf-interaction-summary";
 
 // RLS is enabled but has no policies, so ownership is enforced here: every
 // query joins `sessions` and constrains owner_user_id.
@@ -56,6 +57,9 @@ export async function listDocuments(
       errorMessage: conversionJobs.errorMessage,
       outputTarget: conversionJobs.outputTarget,
       changes: sql<unknown>`(select metadata -> 'changes' from job_events where job_events.job_id = ${conversionJobs.id} and event_type in ('conversion_completed', 'powerpoint_review_finished') and metadata ? 'changes' order by created_at desc, id desc limit 1)`,
+      // Read the current attempt's latest completion even when it has no
+      // summary, so a retry cannot revive evidence from an older output.
+      interactionTestSummary: sql<unknown>`(select metadata -> 'interactionTestSummary' from job_events where job_events.job_id = ${conversionJobs.id} and event_type = 'conversion_completed' and metadata ->> 'attemptNumber' = ${conversionJobs.attemptCount}::text and created_at >= ${conversionJobs.startedAt} order by created_at desc, id desc limit 1)`,
     })
     .from(documents)
     .innerJoin(sessions, eq(sessions.id, documents.sessionId))
@@ -148,6 +152,11 @@ export async function listDocuments(
       jobId: row.jobId ?? undefined,
       outputTarget: row.outputTarget ?? getOutputTargetForFilename(row.name),
       changes: readOutputChanges(row.changes),
+      interactionTestSummary:
+        row.outputTarget === "accessible_pdf" &&
+        toConversionStatus(row.status) === "success"
+          ? readPdfInteractionTestSummary(row.interactionTestSummary)
+          : undefined,
       name: row.name,
       size: row.size,
       uploadedAt: new Date(row.uploadedAt),

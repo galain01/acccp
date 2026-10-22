@@ -31,6 +31,7 @@ from pdf_safety import reject_signed_pdf, resolved
 from hybrid_forms import HybridFormError, inspect_hybrid, prepare_hybrid
 from hybrid_form_verification import HybridVerificationError, verify_hybrid_preparation
 from native_form_inventory import NativeFormInventoryError, native_form_inventory
+from form_interaction_fingerprint import form_interaction_fingerprint
 from native_structure_repairs import (NoteIdError, note_id_snapshot, repair_note_ids,
     verify_note_ids, verify_authored_ids, authored_id_bindings, verify_authored_id_bindings)
 from bounded_semantic_structure import discover_candidates, apply_operations, SemanticStructureError
@@ -379,6 +380,9 @@ def enrich_inventory(reader, original):
     except NativeFormInventoryError as error:
         fail(str(error) if str(error) in ERRORS else "native_pdf_preservation")
     inventory["forms"] = {**verify_pdf.form_inventory(reader), **controls}
+    interaction = form_interaction_fingerprint(reader)
+    if interaction is not None:
+        inventory["forms"]["interactionFingerprint"] = interaction
     try:
         inventory["structureCandidates"] = discover_candidates(reader)
     except SemanticStructureError as error:

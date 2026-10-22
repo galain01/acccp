@@ -71,6 +71,24 @@ function response() {
   };
 }
 describe("native PDF service client", () => {
+  it("accepts only the versioned worker fingerprint shape", () => {
+    const raw = response();
+    raw.inventory.forms = {
+      interactionFingerprint: { schemaVersion: 1, sha256: "a".repeat(64) },
+    };
+    expect(parseNativePdfState(raw, source).inventory.forms).toEqual(
+      raw.inventory.forms
+    );
+    for (const bad of [
+      null,
+      { schemaVersion: 2, sha256: "a".repeat(64) },
+      { schemaVersion: 1, sha256: "claimed-passed" },
+      { schemaVersion: 1, sha256: "a".repeat(64), passed: true },
+    ]) {
+      raw.inventory.forms = { interactionFingerprint: bad };
+      expect(() => parseNativePdfState(raw, source)).toThrow();
+    }
+  });
   beforeEach(() => {
     vi.stubEnv("NATIVE_PDF_URL", "https://private-worker.example");
     vi.stubEnv("NATIVE_PDF_API_KEY", "s".repeat(40));

@@ -12,6 +12,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import NameObject, TextStringObject
 
 import worker
+from form_interaction_fingerprint import form_interaction_fingerprint
 
 
 spec = importlib.util.spec_from_file_location("native_pdf_build_fixture", Path(__file__).with_name("build-smoke.py"))
@@ -72,6 +73,8 @@ class HybridWorkerTests(unittest.TestCase):
         self.assertTrue(hybrid["verifiedMetadataOnly"])
         self.assertNotIn("xfaPreserved", hybrid)
         form = prepared["inventory"]["forms"]
+        self.assertEqual(form["interactionFingerprint"], form_interaction_fingerprint(output))
+        self.assertRegex(form["interactionFingerprint"]["sha256"], r"^[a-f0-9]{64}$")
         self.assertEqual(form["field_count"], 1)
         self.assertEqual(len(form["fields"]), 1)
         self.assertFalse(form["fields"][0]["speech"]["disabled"])
@@ -83,6 +86,9 @@ class HybridWorkerTests(unittest.TestCase):
         self.assertEqual(repaired["sourceSha256"], worker.digest(self.source))
         self.assertTrue(repaired["machineChecks"]["preservationPassed"])
         self.assertTrue(repaired["inventory"]["forms"]["hybrid"]["verification"]["passed"])
+        saved_reader = PdfReader(io.BytesIO(base64.b64decode(repaired["pdfBase64"])), strict=True)
+        self.assertEqual(repaired["inventory"]["forms"]["interactionFingerprint"], form_interaction_fingerprint(saved_reader))
+        self.assertEqual(form["interactionFingerprint"], repaired["inventory"]["forms"]["interactionFingerprint"])
         source_packets = PdfReader(io.BytesIO(self.source)).trailer["/Root"]["/AcroForm"]["/XFA"]
         result_packets = PdfReader(io.BytesIO(base64.b64decode(repaired["pdfBase64"]))).trailer["/Root"]["/AcroForm"]["/XFA"]
         for index in range(1, len(source_packets), 2):
@@ -98,6 +104,13 @@ class HybridWorkerTests(unittest.TestCase):
         packet.set_data(packet.get_data().replace(b'disable="0"', b'disable="1"'))
         with self.assertRaisesRegex(worker.WorkerError, "native_pdf_preservation"):
             self.repair(prepared, result_bytes(writer))
+
+    def test_unavailable_optional_fingerprint_leaves_conversion_and_review_intact(self):
+        with patch.object(worker, "form_interaction_fingerprint", return_value=None):
+            prepared = self.prepared()
+            self.assertNotIn("interactionFingerprint", prepared["inventory"]["forms"])
+            self.assertIn("legacy_form_interaction_review", [item["code"] for item in prepared["findings"]])
+            self.assertTrue(prepared["machineChecks"]["preservationPassed"])
 
     def test_changed_native_tooltip_rejected_even_with_matching_candidate_hash(self):
         prepared = self.prepared()
