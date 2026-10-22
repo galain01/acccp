@@ -1,5 +1,16 @@
 # Native PDF worker protocol, version 1
 
+Preparation also fills missing annotation descriptions on eligible simple text
+links using verified original tagged text, up to 200 per document. Additional
+links remain unchanged for normal validation and review. Untagged sources are
+ineligible for this repair. Existing description properties are
+preserved, including empty values. Ambiguous ownership, unsupported structures,
+text overrides or uninformative labels prevent this automatic repair. It adds
+no model operation and changes no link action, destination or visible content.
+Changes include a page and tag location; saved-output checks independently
+verify the source-derived description. Discovery is capped at 200 paint checks
+and one million scanned page operations, with parsed page streams reused.
+
 The private service accepts `Authorization: Bearer NATIVE_PDF_API_KEY`. It has
 no public route, storage credentials or model credentials.
 `GET /health` requires authentication. `POST /prepare` takes `application/pdf`

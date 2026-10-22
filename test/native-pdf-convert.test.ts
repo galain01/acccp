@@ -463,6 +463,47 @@ describe("native PDF orchestration", () => {
     }
   });
 
+  it("carries an automatic link description through both model reviews and the saved change summary", async () => {
+    const prepared = await makeState();
+    const description = "W3C introduction to accessibility";
+    prepared.inventory.tags[0].role = "Link";
+    prepared.inventory.tags[0].snapshot.role = "Link";
+    prepared.inventory.tags[0].contentSequence = [
+      {
+        kind: "objectReference",
+        annotationId: "p1-a1",
+        subtype: "Link",
+        resolved: true,
+        parentTreeVerified: true,
+        description,
+      },
+    ];
+    prepared.changes = [
+      {
+        code: "link_description_added",
+        message: "Added the link's existing visible text as its description.",
+        pageNumber: 1,
+        tagId: "tag-1",
+      },
+    ];
+    useState(prepared);
+    mocks.worker
+      .mockResolvedValueOnce(prepared)
+      .mockResolvedValueOnce({ ...prepared, changes: [] });
+
+    const result = await repairNativePdf(prepared.pdf, "lecture.pdf");
+    if ("error" in result) throw Error(result.error);
+    expect(mocks.call).toHaveBeenCalledTimes(2);
+    for (const [, parts] of mocks.call.mock.calls) {
+      expect(scope(parts).tags[0].contentSequence).toEqual(
+        prepared.inventory.tags[0].contentSequence
+      );
+    }
+    expect(result.changes).toContain(
+      "Page 1: Added the link's existing visible text as its description."
+    );
+  });
+
   it("audits current machine evidence without carrying resolved diagnostics into historical comparison", async () => {
     const prepared = await makeState();
     prepared.inventory.title = "";
@@ -526,7 +567,9 @@ describe("native PDF orchestration", () => {
       ],
     };
     useState(prepared);
-    mocks.worker.mockResolvedValueOnce(prepared).mockResolvedValueOnce(repaired);
+    mocks.worker
+      .mockResolvedValueOnce(prepared)
+      .mockResolvedValueOnce(repaired);
     const result = await repairNativePdf(prepared.pdf, "lecture.pdf");
     if ("error" in result) throw Error(result.error);
 
@@ -548,9 +591,7 @@ describe("native PDF orchestration", () => {
     expect(repairPrompt).toContain(
       "Report additional semantic, ambiguous or unsupported concerns only."
     );
-    expect(repairPrompt).toContain(
-      "Never add a PDF/UA declaration."
-    );
+    expect(repairPrompt).toContain("Never add a PDF/UA declaration.");
     const auditParts = mocks.call.mock.calls[1][1] as LiteLLMContentPart[];
     const evidence = auditParts.find((p) => p.type === "text");
     if (!evidence || evidence.type !== "text") throw Error("Missing evidence");
