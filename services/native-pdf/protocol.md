@@ -119,6 +119,40 @@ on that content. Existing authored descriptions and ActualText are preserved.
 Simple table cells may gain `TH` plus `Scope` (`Column` or `Row`); merged or
 complex cells are left for review. No arbitrary PDF/XML/paths are accepted.
 
+`inventory.structureCandidates` lists bounded, source-derived proposals with
+`candidateId`, `kind`, `tagId`, `pageNumber`, `text`, `preview`, and
+`relatedTagIds`. The candidate identifier binds the exact prepared PDF and its
+verified structure/painting boundaries. A planner may select
+`{type:"repair_structure", tagId, expected, candidateId}`; only a
+`split_heading` candidate also accepts `role:"H2"` through `"H6"`.
+The other candidate kinds are `convert_list`, `join_list_continuation` and
+`mark_note_reference`. List candidates retain each original paragraph and its
+visible label inside native list items. They do not invent labels or move
+intervening content. The worker independently discovers the candidates again
+and rejects forged, stale, overlapping or unsupported operations. It never
+accepts replacement text or arbitrary content offsets. Candidate discovery is
+optional: reaching its bounded work limit returns no candidates and a visible
+`structure_candidates_limited` warning, while the ordinary checks and supported
+metadata/role repairs continue. A selected structural repair still fails closed
+if its proof cannot be completed.
+
+Structure edits preserve original nodes and painting. A reference candidate may
+partition a trailing `*` or `**` from a `Tj` string only with verified simple
+Type1/TrueType, explicit WinAnsi encoding and no Unicode override. The adjacent
+fragments must concatenate to the exact original bytes without any intervening
+state change; the ordinary text/resource/pixel checks still apply. Unknown
+graphics-state font overrides make the candidate ineligible. The model never
+supplies the partition or replacement bytes. Added nodes may
+change preorder IDs, so a repaired inventory supplies `sourceTagLineage`
+(prepared ID to saved original-node ID) and each saved tag's `sourceTagId`.
+New child tags can share a source ID. Audit comparison and retained findings
+must use this lineage rather than assuming ordinal IDs are stable.
+
+Preparation and the final write add missing Note identifiers and their IDTree
+entries only when existing IDs and associations are valid. Reopening verifies
+the exact additions and preserves existing identifiers. Ambiguous ID metadata
+is left for review, and fonts are not changed by these repairs.
+
 For large repair bodies, the app uploads those exact JSON bytes to a tracked,
 short-lived private storage object, then sends this exact envelope to
 `POST /repair-stored` with `Content-Type: application/json`:

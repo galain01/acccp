@@ -5,6 +5,7 @@ import { createJobDiagnostic, type DiagnosticCode } from "./job-diagnostics";
 
 export interface NativePdfTag {
   id: string;
+  sourceTagId?: string | null;
   parentId: string | null;
   children: string[];
   role: string;
@@ -21,6 +22,19 @@ export interface NativePdfTag {
     alt: string | null;
   };
   [key: string]: unknown;
+}
+export interface NativePdfStructureCandidate {
+  candidateId: string;
+  kind:
+    | "split_heading"
+    | "join_list_continuation"
+    | "mark_note_reference"
+    | "convert_list";
+  tagId: string;
+  pageNumber: number;
+  text: string;
+  preview: string;
+  relatedTagIds: string[];
 }
 export interface NativePdfFinding {
   code: string;
@@ -43,6 +57,8 @@ export interface NativePdfState {
     title?: string;
     page_content: Record<string, unknown>[];
     forms: unknown;
+    structureCandidates?: NativePdfStructureCandidate[];
+    sourceTagLineage?: Record<string, string>;
     [key: string]: unknown;
   };
   findings: NativePdfFinding[];
@@ -74,6 +90,11 @@ export type NativePdfOperation = {
   | { type: "set_role"; role: string }
   | { type: "set_alt"; alt: string }
   | { type: "set_table_header"; scope: "Column" | "Row" }
+  | {
+      type: "repair_structure";
+      candidateId: string;
+      role?: "H2" | "H3" | "H4" | "H5" | "H6";
+    }
 );
 export interface NativePdfPlan {
   schemaVersion: 1;
@@ -242,6 +263,10 @@ export function parseNativePdfState(
       typeof tag.id !== "string" ||
       !/^tag-[1-9]\d{0,5}$/.test(tag.id) ||
       ids.has(tag.id) ||
+      (tag.sourceTagId !== undefined &&
+        tag.sourceTagId !== null &&
+        (typeof tag.sourceTagId !== "string" ||
+          !/^tag-[1-9]\d{0,5}$/.test(tag.sourceTagId))) ||
       !(tag.parentId === null || typeof tag.parentId === "string") ||
       !Array.isArray(tag.children) ||
       tag.children.some((id) => typeof id !== "string") ||
@@ -273,6 +298,47 @@ export function parseNativePdfState(
     ids.add(tag.id);
   }
   const tags = inv.tags as unknown as NativePdfTag[];
+  if (inv.structureCandidates !== undefined) {
+    const candidates = inv.structureCandidates;
+    const candidateIds = new Set<string>();
+    if (!Array.isArray(candidates) || candidates.length > 500) return fail();
+    for (const candidate of candidates) {
+      if (
+        !objectRecord(candidate) ||
+        typeof candidate.candidateId !== "string" ||
+        !/^[a-f0-9]{64}$/.test(candidate.candidateId) ||
+        candidateIds.has(candidate.candidateId) ||
+        ![
+          "split_heading",
+          "join_list_continuation",
+          "mark_note_reference",
+          "convert_list",
+        ].includes(String(candidate.kind)) ||
+        !ids.has(String(candidate.tagId)) ||
+        !pageNumber(candidate.pageNumber, pages) ||
+        !boundedText(candidate.text, 20_000) ||
+        !boundedText(candidate.preview, 20_000) ||
+        !Array.isArray(candidate.relatedTagIds) ||
+        candidate.relatedTagIds.length > 20 ||
+        candidate.relatedTagIds.some((id) => !ids.has(String(id))) ||
+        new Set(candidate.relatedTagIds).size !== candidate.relatedTagIds.length
+      )
+        return fail();
+      candidateIds.add(candidate.candidateId);
+    }
+  }
+  if (
+    inv.sourceTagLineage !== undefined &&
+    (!objectRecord(inv.sourceTagLineage) ||
+      Object.keys(inv.sourceTagLineage).length > 5000 ||
+      Object.entries(inv.sourceTagLineage).some(
+        ([sourceId, currentId]) =>
+          !/^tag-[1-9]\d{0,5}$/.test(sourceId) ||
+          typeof currentId !== "string" ||
+          !ids.has(currentId)
+      ))
+  )
+    return fail();
   const byId = new Map(tags.map((t) => [t.id, t]));
   for (const tag of tags) {
     if (

@@ -18,6 +18,15 @@ The reusable independent checker is copied explicitly from
 are disabled in the worker process. Fixture-specific repair plans, fonts,
 OCR overlays and form rewrites are not imported into this service.
 
+The worker can also add missing note identifiers and expose verified candidates
+for heading splits, numbered/lettered lists, list continuations and isolated
+footnote markers. The model chooses from these source-derived candidates;
+the writer independently rederives their boundaries and preserves the original
+encoded text, rendered pages and native form. This includes narrowly verified
+one-byte asterisk suffix partitions without changing text state or spacing.
+An optional discovery limit
+leaves a review warning while other checks and supported repairs continue.
+
 ## Fixed-layout hybrid forms
 
 The worker accepts a conservative subset of legacy forms that contain both
@@ -136,3 +145,13 @@ The Vercel Linux container build also passed the authenticated prepare/repair
 smoke test on 2026-10-21, including both installed Java tools, the unprivileged
 application user and production process limits. The hosted app flow remains a
 separate release check.
+
+On 2026-10-22 the local application pipeline repaired the original six-page W-9
+using the configured repair model and independent auditor. Fifteen independent
+saved-file assertions passed for headings, lists, numeric/asterisk note
+references, source text, page pixels and all 23 native fields with their XFA
+data. The audit reported no remaining document-structure findings. The two
+original font failures remained in veraPDF, and the review retained the legacy
+form interaction, field-label, required-status and signing concerns. Fonts and
+form behavior were deliberately unchanged. These are local verification results;
+hosted release checks are recorded separately.

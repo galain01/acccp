@@ -30,6 +30,9 @@ import verify_pdf
 from pdf_safety import reject_signed_pdf, resolved
 from hybrid_forms import HybridFormError, inspect_hybrid, prepare_hybrid
 from hybrid_form_verification import HybridVerificationError, verify_hybrid_preparation
+from native_structure_repairs import (NoteIdError, note_id_snapshot, repair_note_ids,
+    verify_note_ids, verify_authored_ids, authored_id_bindings, verify_authored_id_bindings)
+from bounded_semantic_structure import discover_candidates, apply_operations, SemanticStructureError
 
 # No research-only source hash exceptions authorize changes in the app.
 verify_pdf.REVIEWED_WHITESPACE_ARTIFACTS = {}
@@ -329,9 +332,13 @@ def enrich_inventory(reader, original):
         fail("pdf_complexity_limit")
     by_id = {tag["id"]: tag for tag in tags}
     original_inventory = verify_pdf.structure_inventory(original)
-    # Existing tagged PDFs retain their native nodes and order. For untagged
-    # sources there are no authored StructElem descriptions to replace.
-    authored = {tag["id"] for tag in original_inventory["tags"] if "alt" in tag or "actualText" in tag}
+    # New heading/reference children can shift preorder IDs. Bind authored
+    # descriptions to their native content scope rather than an ordinal ID.
+    def content_key(tag):
+        return tuple((part.get("pageNumber"), part.get("streamId"), part.get("mcid"))
+                     for part in tag.get("content", []))
+    authored = {content_key(tag) for tag in original_inventory["tags"]
+                if ("alt" in tag or "actualText" in tag) and tag.get("content")}
     for tag in tags:
         tag["children"] = []
     for tag in tags:
@@ -362,7 +369,7 @@ def enrich_inventory(reader, original):
             for item in tag.get("contentSequence", []))
         tag["editable"] = {
             "role": text_block_eligible(tag, by_id),
-            "alt": native_leaf and tag["role"] == "Figure" and tag["sourceRole"] == "Figure" and tag["id"] not in authored and "actualText" not in tag and (not str(tag.get("alt", "")).strip() or bool(PLACEHOLDER.fullmatch(str(tag.get("alt", ""))))),
+            "alt": native_leaf and tag["role"] == "Figure" and tag["sourceRole"] == "Figure" and content_key(tag) not in authored and "actualText" not in tag and (not str(tag.get("alt", "")).strip() or bool(PLACEHOLDER.fullmatch(str(tag.get("alt", ""))))),
             "tableHeader": simple_cell(tag, by_id),
         }
         tag["snapshot"] = snapshot(tag)
@@ -377,6 +384,15 @@ def enrich_inventory(reader, original):
             fail("pdf_complexity_limit")
         fields.append(row)
     inventory["forms"] = {**verify_pdf.form_inventory(reader), "fields": fields}
+    try:
+        inventory["structureCandidates"] = discover_candidates(reader)
+    except SemanticStructureError as error:
+        if str(error) != "pdf_complexity_limit":
+            fail(str(error) if str(error) in {"native_pdf_invalid_plan", "native_pdf_preservation"} else "native_pdf_worker_failed")
+        # Candidate discovery is optional assistance. The completed native
+        # checks and model audit still run, and this limitation remains visible.
+        inventory["structureCandidates"] = []
+        inventory["findings"].append({"code": "structure_candidates_limited", "severity": "warning"})
     if len(json.dumps(inventory, ensure_ascii=True).encode()) > 7 * 1024 * 1024:
         fail("pdf_complexity_limit")
     return inventory
@@ -700,13 +716,17 @@ def set_metadata(writer, title=None, language=None):
     return changes
 
 
-def apply_plan(original, candidate, plan, output):
+def apply_plan(original, candidate, plan, output, *, lineage=None):
     if not isinstance(plan, dict) or set(plan) - {"schemaVersion", "candidateSha256", "language", "title", "operations"} or type(plan.get("schemaVersion")) is not int or plan["schemaVersion"] != 1 or plan.get("candidateSha256") != digest(candidate.stream.getvalue()):
         fail("native_pdf_invalid_plan")
     operations = plan.get("operations")
     if not isinstance(operations, list) or len(operations) > MAX_OPS:
         fail("native_pdf_invalid_plan")
     verify_added_link_descriptions(original, candidate)
+    try:
+        verify_authored_ids(original, candidate)
+    except NoteIdError:
+        fail("native_pdf_preservation")
     inventory = enrich_inventory(candidate, original)
     nodes = native_nodes(candidate)
     if len(nodes) != len(inventory["tags"]) or any(str(node.get("/S", "")).lstrip("/") != tag["sourceRole"] for node, tag in zip(nodes, inventory["tags"])):
@@ -716,13 +736,11 @@ def apply_plan(original, candidate, plan, output):
     changes = add_link_descriptions(original, candidate, writer)
     changes.extend(set_metadata(writer, plan.get("title"), plan.get("language")))
     used = set()
+    structure_operations = []
     for operation in operations:
-        if not isinstance(operation, dict) or operation.get("type") not in ("set_role", "set_alt", "set_table_header"):
+        if not isinstance(operation, dict) or operation.get("type") not in ("set_role", "set_alt", "set_table_header", "repair_structure"):
             fail("native_pdf_invalid_plan")
-        value_key, edit_key = {"set_role": ("role", "role"), "set_alt": ("alt", "alt"), "set_table_header": ("scope", "tableHeader")}[operation["type"]]
-        if set(operation) != {"type", "tagId", "expected", value_key}:
-            fail("native_pdf_invalid_plan")
-        identifier = operation["tagId"]
+        identifier = operation.get("tagId")
         if not isinstance(identifier, str) or not re.fullmatch(r"tag-[1-9][0-9]{0,4}", identifier) or identifier in used:
             fail("native_pdf_invalid_plan")
         used.add(identifier)
@@ -730,7 +748,16 @@ def apply_plan(original, candidate, plan, output):
         if index >= len(targets):
             fail("native_pdf_invalid_plan")
         tag, target = inventory["tags"][index], targets[index]
-        if operation["expected"] != tag["snapshot"] or not tag["editable"][edit_key]:
+        if operation.get("expected") != tag["snapshot"]:
+            fail("native_pdf_invalid_plan")
+        if operation["type"] == "repair_structure":
+            if (set(operation) - {"type", "tagId", "expected", "candidateId", "role"}
+                    or not isinstance(operation.get("candidateId"), str)):
+                fail("native_pdf_invalid_plan")
+            structure_operations.append({key: value for key, value in operation.items() if key != "expected"})
+            continue
+        value_key, edit_key = {"set_role": ("role", "role"), "set_alt": ("alt", "alt"), "set_table_header": ("scope", "tableHeader")}[operation["type"]]
+        if set(operation) != {"type", "tagId", "expected", value_key} or not tag["editable"][edit_key]:
             fail("native_pdf_invalid_plan")
         value = operation[value_key]
         if operation["type"] == "set_role":
@@ -755,13 +782,44 @@ def apply_plan(original, candidate, plan, output):
             target[NameObject("/A")] = ArrayObject(attributes)
             message = "Identified this table cell as a header for its row or column."
         changes.append({"code": operation["type"], "message": message, "tagId": identifier, "pageNumber": tag["pageNumber"]})
+    try:
+        authored_bindings = authored_id_bindings(writer)
+        structural = apply_operations(candidate, writer, structure_operations) if structure_operations else {
+            "changes": [], "lineage": [{"node": node, "sourceTagId": f"tag-{index + 1}"} for index, node in enumerate(targets)]}
+        verify_authored_id_bindings(authored_bindings, writer)
+    except SemanticStructureError as error:
+        fail(str(error) if str(error) in {"native_pdf_invalid_plan", "native_pdf_preservation", "pdf_complexity_limit"} else "native_pdf_worker_failed")
+    except NoteIdError:
+        fail("native_pdf_preservation")
+    changes.extend(structural["changes"])
+    final_positions = {id(node): f"tag-{index + 1}" for index, node in enumerate(native_nodes(writer))}
+    source_lineage = {f"tag-{index + 1}": final_positions[id(node)]
+                      for index, node in enumerate(targets) if id(node) in final_positions}
+    for change in changes:
+        if change.get("tagId") in source_lineage:
+            change["tagId"] = source_lineage[change["tagId"]]
+        if "relatedTagIds" in change:
+            change["relatedTagIds"] = [source_lineage[tag_id] for tag_id in change["relatedTagIds"]]
+    if lineage is not None:
+        lineage["sourceTagLineage"] = source_lineage
+        lineage["sourceTagIds"] = {final_positions[id(entry["node"])]: entry["sourceTagId"]
+                                   for entry in structural["lineage"] if id(entry["node"]) in final_positions}
+    note_before = note_id_snapshot(writer)
+    changes.extend(repair_note_ids(writer))
     reopened = write_pdf(writer, output)
+    try:
+        verify_note_ids(note_before, reopened)
+        verify_authored_ids(original, reopened)
+    except NoteIdError:
+        fail("native_pdf_preservation")
     verify_saved_annotations(original, candidate, reopened)
     actual = enrich_inventory(reopened, original)
-    if len(actual["tags"]) != len(inventory["tags"]):
+    if len(actual["tags"]) != len(final_positions):
         fail("native_pdf_preservation")
     for operation in operations:
-        tag = actual["tags"][int(operation["tagId"][4:]) - 1]
+        if operation["type"] == "repair_structure":
+            continue
+        tag = actual["tags"][int(source_lineage[operation["tagId"]][4:]) - 1]
         expected = operation["expected"]
         if any(tag.get(key) != expected[key] for key in ("pageNumber", "text", "mcids")):
             fail("native_pdf_preservation")
@@ -826,6 +884,7 @@ def normalized_finding(item, inventory):
         "placeholder_alternative": f"This {subject} has a generic label rather than a useful description.",
         "artifact_text_needs_semantic_review": "Some text is excluded from screen-reader reading order. Check that it is only repeated headers, footers or decoration.",
         "missing_structure_tree": "The PDF does not contain the tags needed to identify its reading order and headings.",
+        "structure_candidates_limited": "Automatic heading, list and footnote repair suggestions could not be completed within the processing limit. Review those parts of the PDF; the other document checks still ran.",
     }.get(code, "A saved-PDF structure check still needs attention: " + code.replace("_", " ") + ".")
     row = {"code": code, "severity": "error" if item.get("severity") == "error" else "warning", "message": text,
            "suggestion": "Review the indicated content in a PDF accessibility editor and run its accessibility checker.", "location": "Document"}
@@ -857,7 +916,7 @@ def normalized_finding(item, inventory):
     return row
 
 
-def response(original_path, candidate_path, changes, toolchain, *, preservation_source_path=None, hybrid_summary=None):
+def response(original_path, candidate_path, changes, toolchain, *, preservation_source_path=None, hybrid_summary=None, lineage=None):
     before = open_pdf(original_path.read_bytes())
     after = open_pdf(candidate_path.read_bytes())
     verify_added_link_descriptions(before, after)
@@ -867,6 +926,10 @@ def response(original_path, candidate_path, changes, toolchain, *, preservation_
     if checks.get("inspection_incomplete") or not checks.get("preservation", {}).get("passed") or checks.get("findings"):
         fail("native_pdf_preservation")
     inventory = enrich_inventory(after, before)
+    if lineage is not None:
+        inventory["sourceTagLineage"] = lineage["sourceTagLineage"]
+        for tag in inventory["tags"]:
+            tag["sourceTagId"] = lineage["sourceTagIds"].get(tag["id"])
     if hybrid_summary is not None:
         inventory["forms"]["hybrid"] = hybrid_summary
     if inventory.get("checks_complete") is not True:
@@ -960,6 +1023,7 @@ def prepared_source(source, source_path, directory):
 
 def process(mode, request_path, directory, toolchain):
     source_path, output_path = directory / "source.pdf", directory / "output.pdf"
+    lineage = None
     if mode == "prepare":
         source = request_path.read_bytes()
         original, reference_path, changes, hybrid_summary = prepared_source(source, source_path, directory)
@@ -978,7 +1042,14 @@ def process(mode, request_path, directory, toolchain):
         writer = PdfWriter(clone_from=candidate)
         changes.extend(add_link_descriptions(original, candidate, writer))
         changes.extend(set_metadata(writer))
+        note_before = note_id_snapshot(writer)
+        changes.extend(repair_note_ids(writer))
         reopened = write_pdf(writer, output_path)
+        try:
+            verify_note_ids(note_before, reopened)
+            verify_authored_ids(original, reopened)
+        except NoteIdError:
+            fail("native_pdf_preservation")
         verify_saved_annotations(original, candidate, reopened)
     elif mode == "repair":
         try:
@@ -997,11 +1068,12 @@ def process(mode, request_path, directory, toolchain):
         comparison = verify_pdf.compare_pdfs(reference_path, baseline)
         if comparison.get("inspection_incomplete") or not comparison.get("preservation", {}).get("passed") or comparison.get("findings"):
             fail("native_pdf_preservation")
-        changes = apply_plan(original, candidate, data["plan"], output_path)
+        lineage = {}
+        changes = apply_plan(original, candidate, data["plan"], output_path, lineage=lineage)
     else:
         fail("native_pdf_invalid_plan")
     return response(source_path, output_path, changes, toolchain,
-                    preservation_source_path=reference_path, hybrid_summary=hybrid_summary)
+                    preservation_source_path=reference_path, hybrid_summary=hybrid_summary, lineage=lineage)
 
 
 def main():

@@ -13,6 +13,8 @@ RUN python /opt/install-native-pdf-tools.py && rm /opt/install-native-pdf-tools.
 COPY research/native-pdf/verify_pdf.py research/native-pdf/pdf_safety.py /app/research/native-pdf/
 COPY services/native-pdf/server.py services/native-pdf/worker.py services/native-pdf/stored_transport.py services/native-pdf/build-smoke.py /app/services/native-pdf/
 COPY services/native-pdf/hybrid_forms.py services/native-pdf/hybrid_form_verification.py /app/services/native-pdf/
+COPY services/native-pdf/native_structure_repairs.py /app/services/native-pdf/
+COPY services/native-pdf/bounded_semantic_structure.py /app/services/native-pdf/
 COPY --chmod=0555 services/native-pdf/start-worker.sh /usr/local/bin/start-native-pdf.sh
 RUN useradd --create-home --uid 10001 pdfworker \
     && chmod -R a-w /app /opt/native-pdf

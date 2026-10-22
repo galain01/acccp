@@ -41,6 +41,34 @@ ActualText are preserved. The model cannot replace arbitrary PDF content, change
 form behavior or create external references. Complex tables and uncertain
 relationships remain findings.
 
+The worker also offers narrowly verified structure candidates. The model may
+separate a heading from the beginning of a paragraph at an existing text-show
+boundary, group verified numbered or lettered paragraphs into list items,
+join an immediately following continuation to its list item, or
+identify a separately painted superscript as a reference to an unambiguous
+nearby note. A trailing single or double asterisk may also be separated from a
+text-show string when an explicit simple one-byte font makes its exact encoded
+boundary verifiable. Only the original bytes are partitioned; text state and
+spacing remain unchanged and saved-page preservation is independently checked.
+These operations reuse original text and drawing instructions;
+they do not rewrite wording or redraw pages. Unsupported boundaries and unclear
+relationships remain for review. Saved tag lineage keeps historical and current
+inventories aligned when a repair adds structure nodes. If optional candidate
+discovery reaches its work limit, other repairs and checks continue with a
+visible warning that the heading/list/note suggestions need review.
+
+Missing Note identifiers are added automatically when the existing identifier
+tree is unambiguous. Decorative marked content and literally empty markers do
+not require content tags, but meaningful unowned text or graphics still fail
+the structure check. The independent auditor remains responsible for checking
+whether content marked decorative actually carries meaning.
+
+Model batches keep a page's tags together where possible. Dense pages have one
+owner for page-wide reviews, while every tag still receives review. A retained
+heading concern can be cleared only by a complete independent review with
+matching saved-tag evidence of the relevant repair. Machine findings and
+unsupported form concerns cannot be cleared this way.
+
 During preparation, the worker can also fill an absent link-annotation
 description from the original link's verified text. This is a bounded automatic
 repair for up to 200 simple text links in an already-tagged original PDF, each
