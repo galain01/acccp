@@ -45,6 +45,34 @@ def synthetic_pdf():
     return result.getvalue()
 
 
+def synthetic_heading_pdf():
+    writer = PdfWriter(clone_from=PdfReader(io.BytesIO(synthetic_pdf())))
+    page = writer.pages[0]
+    font = DictionaryObject({NameObject("/Type"): NameObject("/Font"),
+        NameObject("/Subtype"): NameObject("/Type1"), NameObject("/BaseFont"): NameObject("/Helvetica-Bold"),
+        NameObject("/Encoding"): NameObject("/WinAnsiEncoding")})
+    page["/Resources"]["/Font"][NameObject("/F2")] = writer._add_object(font)
+    content = DecodedStreamObject()
+    content.set_data(b"BT 72 720 Td /P <</MCID 0>> BDC /F2 12 Tf (Native PDF build check. ) Tj "
+                     b"/F1 12 Tf (Instructions stay in the original layout.) Tj EMC ET")
+    page[NameObject("/Contents")] = writer._add_object(content)
+    root = DictionaryObject({NameObject("/Type"): NameObject("/StructTreeRoot")})
+    root_ref = writer._add_object(root)
+    paragraph = DictionaryObject({NameObject("/Type"): NameObject("/StructElem"),
+        NameObject("/S"): NameObject("/P"), NameObject("/P"): root_ref,
+        NameObject("/Pg"): page.indirect_reference, NameObject("/K"): NumberObject(0)})
+    paragraph_ref = writer._add_object(paragraph)
+    root[NameObject("/K")] = ArrayObject([paragraph_ref])
+    root[NameObject("/ParentTree")] = DictionaryObject({NameObject("/Nums"):
+        ArrayObject([NumberObject(0), ArrayObject([paragraph_ref])])})
+    page[NameObject("/StructParents")] = NumberObject(0)
+    writer.root_object[NameObject("/StructTreeRoot")] = root_ref
+    writer.root_object[NameObject("/MarkInfo")] = DictionaryObject({NameObject("/Marked"): BooleanObject(True)})
+    result = io.BytesIO()
+    writer.write(result)
+    return result.getvalue()
+
+
 def synthetic_hybrid_pdf():
     """A wholly synthetic tagged form, including synthetic Reader-rights data."""
     writer = PdfWriter(clone_from=PdfReader(io.BytesIO(synthetic_pdf())))
@@ -189,6 +217,23 @@ def main():
         require(any(item["id"] == tag["id"] and item["role"] == target_role
                     for item in repaired["inventory"]["tags"]), "Requested native tag edit was not saved")
         require(any(change["code"] == "set_role" for change in repaired["changes"]), "Native edit was not recorded")
+        heading_source = synthetic_heading_pdf()
+        status, heading_prepared = request(service, "/prepare", heading_source)
+        require(status == 200, "Installed structure preparation failed")
+        choices = heading_prepared["inventory"]["structureCandidates"]
+        choice = next((item for item in choices if item["kind"] == "split_heading"), None)
+        require(choice is not None, "Native heading boundary was not discovered")
+        tag = next(item for item in heading_prepared["inventory"]["tags"] if item["id"] == choice["tagId"])
+        heading_payload = {"sourcePdfBase64": base64.b64encode(heading_source).decode("ascii"),
+            "candidatePdfBase64": heading_prepared["pdfBase64"],
+            "plan": {"schemaVersion": 1, "candidateSha256": heading_prepared["candidateSha256"],
+                "operations": [{"type": "repair_structure", "tagId": tag["id"], "expected": tag["snapshot"],
+                    "candidateId": choice["candidateId"], "role": "H2"}]}}
+        status, heading_repaired = request(service, "/repair", json.dumps(heading_payload).encode())
+        require(status == 200, "Installed structure repair failed")
+        assert_result(heading_repaired, heading_source)
+        require(any(item["role"] == "H2" and item["text"].strip() == "Native PDF build check."
+                    for item in heading_repaired["inventory"]["tags"]), "Saved heading split was missing")
         hybrid_source = synthetic_hybrid_pdf()
         status, hybrid_prepared = request(service, "/prepare", hybrid_source)
         require(status == 200, "Installed hybrid preparation failed: " + str(hybrid_prepared.get("error", {}).get("code", status)))
@@ -206,9 +251,19 @@ def main():
         saved_hybrid = PdfReader(io.BytesIO(base64.b64decode(hybrid_repaired["pdfBase64"], validate=True)))
         require("/Perms" not in saved_hybrid.trailer["/Root"], "Obsolete Reader rights remained in repaired copy")
         require(saved_hybrid.get_fields()["workshop[0].name[0]"]["/TU"] == "Fictional workshop name", "Authored form label was not saved")
+        require(hybrid_info["speechPromptsEnabled"] == ["workshop[0].name[0]"]
+                and hybrid_info["verifiedMetadataOnly"] is True,
+                "Supported form speech metadata was not repaired and verified")
+        require(hybrid_repaired["inventory"]["forms"]["field_count"] == 1
+                and hybrid_repaired["inventory"]["forms"]["fields"][0]["speech"]["disabled"] is False,
+                "Current terminal field inventory did not include repaired speech")
         original_packets, saved_packets = (pdf.trailer["/Root"]["/AcroForm"]["/XFA"] for pdf in (original_hybrid, saved_hybrid))
-        require(all(original_packets[i].get_object().get_data() == saved_packets[i].get_object().get_data()
-                    for i in range(1, len(original_packets), 2)), "Hybrid XFA packets changed")
+        for index in range(1, len(original_packets), 2):
+            expected = original_packets[index].get_object().get_data()
+            if str(original_packets[index - 1]) == "template":
+                expected = expected.replace(b'<speak disable="1">', b'<speak disable="0">')
+            require(expected == saved_packets[index].get_object().get_data(),
+                    "Hybrid XFA changed beyond the exact authorized speech attribute")
         # Counts, tool versions and success states are safe build diagnostics.
         print("Native PDF build smoke passed: authenticated HTTP, OpenDataLoader tagging, "
               "native repair, static hybrid form preservation, veraPDF validation, identical page pixels and preserved content.")

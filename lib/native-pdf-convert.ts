@@ -44,9 +44,19 @@ import {
 
 interface Batch {
   pages: number[];
+  /** This batch alone reviews page-wide concerns when a dense page is split. */
+  pageReviewPages: number[];
   tags: NativePdfTag[];
   visualPages: number[];
   first: boolean;
+}
+export interface NativePdfHeadingReviewTarget {
+  findingId: string;
+  finding: NativePdfFinding;
+  tagId: string;
+  beforeRole: string;
+  currentRole: string;
+  eligibleForResolution: boolean;
 }
 export interface NativePdfConversionResult {
   pdf: Buffer;
@@ -81,33 +91,89 @@ function pagesOf(tag: NativePdfTag): number[] {
     ),
   ].sort((a, b) => a - b);
 }
+function originalTagId(tag: NativePdfTag): string | undefined {
+  return tag.sourceTagId === undefined
+    ? tag.id
+    : (tag.sourceTagId ?? undefined);
+}
 /** Every actual tag is assigned once; cross-page content receives companion pages. */
 export function nativePdfBatches(state: NativePdfState): Batch[] {
   const groups: Batch[] = [];
-  for (let start = 1; start <= state.pageCount; start += 4) {
-    const pages = Array.from(
-      { length: Math.min(4, state.pageCount - start + 1) },
-      (_, n) => n + start
-    );
-    const tags = state.inventory.tags.filter((tag) =>
-      pages.includes(pagesOf(tag)[0] ?? 1)
-    );
-    for (let offset = 0; offset < Math.max(1, tags.length); offset += 200) {
-      const assigned = tags.slice(offset, offset + 200);
-      const visualPages = [
-        ...new Set([...pages, ...assigned.flatMap(pagesOf)]),
-      ].sort((a, b) => a - b);
-      // Two PDF excerpts plus PNGs still fit the gateway image allowance.
-      if (visualPages.length > 12 || JSON.stringify(assigned).length > 350_000)
-        throw new NativePdfError("pdf_complexity_limit");
-      groups.push({
-        pages,
-        tags: assigned,
-        visualPages,
-        first: groups.length === 0,
-      });
-    }
+  const byId = new Map(state.inventory.tags.map((tag) => [tag.id, tag]));
+  const owners = new Map<string, number | undefined>();
+  const active = new Set<string>();
+  const owner = (tag: NativePdfTag, depth = 0): number | undefined => {
+    if (owners.has(tag.id)) return owners.get(tag.id);
+    if (depth > 128 || active.has(tag.id))
+      throw new NativePdfError("pdf_complexity_limit");
+    active.add(tag.id);
+    const direct = pagesOf(tag);
+    const descendants = direct.length
+      ? []
+      : (tag.children ?? [])
+          .map((id) => {
+            const child = byId.get(id);
+            if (!child) throw new NativePdfError("pdf_protocol_error");
+            return owner(child, depth + 1);
+          })
+          .filter((page): page is number => page !== undefined);
+    const page =
+      direct[0] ?? (descendants.length ? Math.min(...descendants) : undefined);
+    active.delete(tag.id);
+    owners.set(tag.id, page);
+    return page;
+  };
+  const tagsByPage = new Map<number, NativePdfTag[]>();
+  for (const tag of state.inventory.tags) {
+    const page = owner(tag) ?? 1;
+    const assigned = tagsByPage.get(page) ?? [];
+    assigned.push(tag);
+    tagsByPage.set(page, assigned);
   }
+  const add = (
+    pages: number[],
+    assigned: NativePdfTag[],
+    pageReviewPages = pages
+  ) => {
+    const visualPages = [
+      ...new Set([...pages, ...assigned.flatMap(pagesOf)]),
+    ].sort((a, b) => a - b);
+    // Two PDF excerpts plus PNGs still fit the gateway image allowance.
+    if (visualPages.length > 12 || JSON.stringify(assigned).length > 350_000)
+      throw new NativePdfError("pdf_complexity_limit");
+    groups.push({
+      pages,
+      pageReviewPages,
+      tags: assigned,
+      visualPages,
+      first: groups.length === 0,
+    });
+  };
+  let pendingPages: number[] = [];
+  let pendingTags: NativePdfTag[] = [];
+  const flush = () => {
+    if (pendingPages.length) add(pendingPages, pendingTags);
+    pendingPages = [];
+    pendingTags = [];
+  };
+  for (let page = 1; page <= state.pageCount; page++) {
+    const tags = tagsByPage.get(page) ?? [];
+    if (tags.length > 200) {
+      flush();
+      for (let offset = 0; offset < tags.length; offset += 200)
+        add(
+          [page],
+          tags.slice(offset, offset + 200),
+          offset === 0 ? [page] : []
+        );
+      continue;
+    }
+    if (pendingPages.length === 4 || pendingTags.length + tags.length > 200)
+      flush();
+    pendingPages.push(page);
+    pendingTags.push(...tags);
+  }
+  flush();
   if (
     groups.length > 40 ||
     groups.reduce((n, b) => n + b.tags.length, 0) !==
@@ -156,7 +222,9 @@ export function parseNativePdfFindings(
       !(
         (f.pageNumber === null && batch.first) ||
         (Number.isInteger(f.pageNumber) &&
-          batch.visualPages.includes(Number(f.pageNumber)))
+          batch.visualPages.includes(Number(f.pageNumber)) &&
+          (f.tagId !== undefined ||
+            batch.pageReviewPages.includes(Number(f.pageNumber))))
       )
     )
       return invalid();
@@ -166,6 +234,7 @@ export function parseNativePdfFindings(
         : batch.tags.find((t) => t.id === f.tagId);
     if (
       (f.tagId !== undefined && !tag) ||
+      (f.code === "heading-structure" && !tag) ||
       (tag &&
         pagesOf(tag).length &&
         !pagesOf(tag).includes(Number(f.pageNumber)))
@@ -269,6 +338,33 @@ export function parseNativePdfPlan(
         type: "set_table_header",
         scope: op.scope as "Column" | "Row",
       };
+    if (
+      op.type === "repair_structure" &&
+      Object.keys(op).every((key) =>
+        ["type", "tagId", "candidateId", "role"].includes(key)
+      )
+    ) {
+      const candidate = state.inventory.structureCandidates?.find(
+        (c) => c.tagId === tag.id && c.candidateId === op.candidateId
+      );
+      if (!candidate) return invalid();
+      if (candidate.kind === "split_heading") {
+        if (!["H2", "H3", "H4", "H5", "H6"].includes(String(op.role)))
+          return invalid();
+        return {
+          ...common,
+          type: "repair_structure",
+          candidateId: candidate.candidateId,
+          role: op.role as "H2" | "H3" | "H4" | "H5" | "H6",
+        };
+      }
+      if (op.role !== undefined) return invalid();
+      return {
+        ...common,
+        type: "repair_structure",
+        candidateId: candidate.candidateId,
+      };
+    }
     return invalid();
   });
   return {
@@ -311,6 +407,32 @@ async function pool<T, R>(
       }
   );
 }
+/** Atomic reference repair already assigns its verified related note this role. */
+export function coalesceNativePdfOperations(
+  operations: NativePdfOperation[],
+  state: NativePdfState
+): NativePdfOperation[] {
+  const noteTargets = new Set(
+    operations.flatMap((operation) => {
+      if (operation.type !== "repair_structure") return [];
+      const candidate = state.inventory.structureCandidates?.find(
+        (candidate) =>
+          candidate.candidateId === operation.candidateId &&
+          candidate.tagId === operation.tagId &&
+          candidate.kind === "mark_note_reference"
+      );
+      return candidate?.relatedTagIds ?? [];
+    })
+  );
+  return operations.filter(
+    (operation) =>
+      !(
+        operation.type === "set_role" &&
+        operation.role === "Note" &&
+        noteTargets.has(operation.tagId)
+      )
+  );
+}
 export function parseNativePdfAudit(
   raw: Record<string, unknown>,
   batch: Batch
@@ -324,6 +446,7 @@ export function parseNativePdfAudit(
           "artifactReviews",
           "textReviews",
           "findings",
+          "repairFindingReviews",
         ].includes(k)
     ) ||
     !exact(raw.reviewedPages, batch.pages) ||
@@ -348,7 +471,7 @@ export function parseNativePdfAudit(
       !Array.isArray(reviews) ||
       !exact(
         reviews.map((r) => (objectRecord(r) ? r.pageNumber : undefined)),
-        batch.pages
+        batch.pageReviewPages
       )
     )
       return invalid();
@@ -375,6 +498,102 @@ export function parseNativePdfAudit(
     }
   }
   return findings;
+}
+/** Only an explicit current-state review can retire a targeted heading concern. */
+export function parseNativePdfHeadingReviews(
+  raw: unknown,
+  targets: NativePdfHeadingReviewTarget[]
+): string[] {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw) || raw.length > targets.length) return invalid();
+  const seen = new Set<string>();
+  const resolved: string[] = [];
+  for (const review of raw) {
+    if (
+      !objectRecord(review) ||
+      Object.keys(review).some(
+        (key) =>
+          !["findingId", "decision", "explanation", "currentTag"].includes(key)
+      ) ||
+      typeof review.findingId !== "string" ||
+      seen.has(review.findingId) ||
+      !["still-present", "resolved", "uncertain"].includes(
+        String(review.decision)
+      ) ||
+      !text(review.explanation, 1500) ||
+      !objectRecord(review.currentTag) ||
+      Object.keys(review.currentTag).some(
+        (key) => !["tagId", "role"].includes(key)
+      )
+    )
+      return invalid();
+    const target = targets.find(
+      (target) => target.findingId === review.findingId
+    );
+    if (
+      !target ||
+      review.currentTag.tagId !== target.tagId ||
+      review.currentTag.role !== target.currentRole
+    )
+      return invalid();
+    seen.add(review.findingId);
+    if (review.decision === "resolved") {
+      if (!target.eligibleForResolution) return invalid();
+      resolved.push(target.findingId);
+    }
+  }
+  return resolved;
+}
+
+function headingOutline(state: NativePdfState) {
+  const stack: { tagId: string; level: number }[] = [];
+  return state.inventory.tags
+    .filter((tag) => /^H[1-6]?$/.test(tag.role))
+    .map((tag) => {
+      const level = Number(tag.role.slice(1)) || null;
+      if (level === null) stack.length = 0;
+      else
+        while (stack.length && stack[stack.length - 1].level >= level)
+          stack.pop();
+      const row = {
+        tagId: tag.id,
+        role: tag.role,
+        level,
+        text: tag.text,
+        pageNumber: tag.pageNumber,
+        precedingLowerLevelHeadingId: stack.at(-1)?.tagId ?? null,
+      };
+      if (level !== null) stack.push({ tagId: tag.id, level });
+      return row;
+    });
+}
+function nearbyHeadingContext(state: NativePdfState, tagId: string) {
+  const candidates = new Map(
+    (state.inventory.structureCandidates ?? [])
+      .filter((candidate) => candidate.kind === "split_heading")
+      .map((candidate) => [candidate.tagId, candidate])
+  );
+  const tagIndex = state.inventory.tags.findIndex((tag) => tag.id === tagId);
+  const events = state.inventory.tags.flatMap((tag, index) => {
+    const candidate = candidates.get(tag.id);
+    if (!/^H[1-6]?$/.test(tag.role) && !candidate) return [];
+    // These bounded excerpts are context only. The complete candidate and its
+    // original text remain in the assigned inventory for the actual decision.
+    return [
+      {
+        index,
+        tagId: tag.id,
+        pageNumber: tag.pageNumber,
+        currentRole: tag.role,
+        kind: candidate ? "possible-run-in-heading" : "saved-heading",
+        excerpt: (candidate?.preview ?? tag.text).slice(0, 800),
+      },
+    ];
+  });
+  return {
+    preceding: events.filter((event) => event.index < tagIndex).slice(-4),
+    following: events.filter((event) => event.index > tagIndex).slice(0, 4),
+  };
 }
 async function subset(doc: PDFDocument, pages: number[]): Promise<Buffer> {
   const part = await PDFDocument.create();
@@ -404,11 +623,26 @@ function scope(
   state: NativePdfState,
   batch: Batch,
   outstandingRepairFindings: NativePdfFinding[] = [],
-  evidenceRole: "current-saved-pdf" | "before-repair-comparison" = "current-saved-pdf"
+  evidenceRole:
+    | "current-saved-pdf"
+    | "before-repair-comparison" = "current-saved-pdf",
+  headingReviewTargets: NativePdfHeadingReviewTarget[] = []
 ): string {
+  const structureCandidates = (state.inventory.structureCandidates ?? [])
+    .filter((candidate) => batch.tags.some((tag) => tag.id === candidate.tagId))
+    .map((candidate) => ({
+      ...candidate,
+      ...(candidate.kind === "split_heading"
+        ? { headingContext: nearbyHeadingContext(state, candidate.tagId) }
+        : {}),
+    }));
+  const relatedTagIds = new Set(
+    structureCandidates.flatMap((candidate) => candidate.relatedTagIds)
+  );
   const payload = {
     evidenceRole,
     assignedPages: batch.pages,
+    pageReviewPages: batch.pageReviewPages,
     assignedTagIds: batch.tags.map((t) => t.id),
     companionPages: batch.visualPages,
     firstBatch: batch.first,
@@ -416,6 +650,11 @@ function scope(
     language: state.inventory.language,
     title: state.inventory.title,
     tags: batch.tags,
+    structureCandidates,
+    relatedTagContext: state.inventory.tags.filter((tag) =>
+      relatedTagIds.has(tag.id)
+    ),
+    headingOutline: headingOutline(state),
     // Every hierarchy link remains available; only assigned tags may change.
     hierarchy: state.inventory.tags.map((t) => ({
       id: t.id,
@@ -440,6 +679,7 @@ function scope(
           outstandingRepairFindings: outstandingRepairFindings.filter(
             (f) => !f.pageNumber || batch.visualPages.includes(f.pageNumber)
           ),
+          repairFindingReviewTargets: headingReviewTargets,
         }
       : {}),
   };
@@ -550,6 +790,7 @@ export async function repairNativePdf(
       if (result.value.language) plan.language = result.value.language;
       if (result.value.title) plan.title = result.value.title;
     }
+    plan.operations = coalesceNativePdfOperations(plan.operations, prepared);
     if (
       plan.operations.length > 500 ||
       new Set(plan.operations.map((o) => o.tagId)).size !==
@@ -571,6 +812,84 @@ export async function repairNativePdf(
       updateMetadata: false,
     });
     const batches = nativePdfBatches(repaired);
+    const preparedById = new Map(
+      prepared.inventory.tags.map((tag) => [tag.id, tag])
+    );
+    const retainedRecords = retained.map((finding, index) => {
+      const mappedId =
+        finding.tagId === undefined
+          ? undefined
+          : (repaired.inventory.sourceTagLineage?.[finding.tagId] ??
+            repaired.inventory.tags.find(
+              (tag) => originalTagId(tag) === finding.tagId
+            )?.id);
+      const located = { ...finding };
+      delete located.tagId;
+      return {
+        findingId: `repair-finding-${index + 1}`,
+        sourceFinding: finding,
+        finding: { ...located, ...(mappedId ? { tagId: mappedId } : {}) },
+      };
+    });
+    const mappedRetained = retainedRecords.map((record) => record.finding);
+    const headingTargets = (batch: Batch): NativePdfHeadingReviewTarget[] =>
+      retainedRecords.flatMap((record) => {
+        const before = record.sourceFinding.tagId
+          ? preparedById.get(record.sourceFinding.tagId)
+          : undefined;
+        const preserved = repaired.inventory.tags.find(
+          (tag) => tag.id === record.finding.tagId
+        );
+        if (
+          record.finding.code !== "heading-structure" ||
+          !before ||
+          !preserved
+        )
+          return [];
+        const splitOperation = plan.operations.find(
+          (op) =>
+            op.tagId === before.id &&
+            op.type === "repair_structure" &&
+            prepared.inventory.structureCandidates?.some(
+              (candidate) =>
+                candidate.tagId === before.id &&
+                candidate.candidateId === op.candidateId &&
+                candidate.kind === "split_heading"
+            )
+        );
+        // The verified helper inserts the new heading immediately before the
+        // preserved paragraph, with both nodes retaining the same source lineage.
+        const preceding =
+          repaired.inventory.tags[
+            repaired.inventory.tags.indexOf(preserved) - 1
+          ];
+        const splitHeading =
+          splitOperation?.type === "repair_structure" &&
+          preceding &&
+          preceding.sourceTagId === before.id &&
+          preserved.sourceTagId === before.id &&
+          preceding.parentId === preserved.parentId &&
+          preceding.role === splitOperation.role &&
+          /^H[2-6]$/.test(preceding.role)
+            ? preceding
+            : undefined;
+        const after = splitHeading ?? preserved;
+        if (!batch.tags.some((tag) => tag.id === after.id)) return [];
+        return [
+          {
+            findingId: record.findingId,
+            finding: record.finding,
+            tagId: after.id,
+            beforeRole: before.role,
+            currentRole: after.role,
+            eligibleForResolution:
+              !!splitHeading ||
+              (before.role !== after.role &&
+                (/^H[1-6]?$/.test(before.role) ||
+                  /^H[1-6]?$/.test(after.role))),
+          },
+        ];
+      });
     const auditUsages: ModelCallUsage[] = [];
     const audits = await pool(
       batches,
@@ -581,12 +900,18 @@ export async function repairNativePdf(
           subset(actualDoc, batch.visualPages),
         ]);
         const auditConfig = getLiteLLMConfig("validate");
+        const reviewTargets = headingTargets(batch);
+        const priorIds = new Set(batch.tags.map(originalTagId).filter(Boolean));
+        const historicalBatch = {
+          ...batch,
+          tags: prepared.inventory.tags.filter((tag) => priorIds.has(tag.id)),
+        };
         const call = await callLiteLLM(
           NATIVE_PDF_AUDIT_PROMPT,
           [
             {
               type: "text",
-              text: `Untrusted exact saved output evidence:\n${scope(repaired, batch, retained)}\nPrior inventory for comparison:\n${scope(prepared, { ...batch, tags: prepared.inventory.tags.filter((t) => batch.tags.some((a) => a.id === t.id)) }, [], "before-repair-comparison")}\nRepairs: ${JSON.stringify(repaired.changes)}\nBoth excerpts map physical pages ${batch.visualPages.join(", ")} in that order.`,
+              text: `Untrusted exact saved output evidence:\n${scope(repaired, batch, mappedRetained, "current-saved-pdf", reviewTargets)}\nPrior inventory for comparison:\n${scope(prepared, historicalBatch, [], "before-repair-comparison")}\nRepairs: ${JSON.stringify(repaired.changes)}\nBoth excerpts map physical pages ${batch.visualPages.join(", ")} in that order.`,
             },
             ...excerpts.map(
               (pdf, i): LiteLLMContentPart => ({
@@ -613,15 +938,54 @@ export async function repairNativePdf(
         );
         const data = parsed(call.content);
         if (call.finishReason && call.finishReason !== "stop") return invalid();
-        return parseNativePdfAudit(data, batch);
+        const findings = parseNativePdfAudit(data, batch);
+        const resolvedFindingIds = parseNativePdfHeadingReviews(
+          data.repairFindingReviews,
+          reviewTargets
+        );
+        if (
+          resolvedFindingIds.some((id) => {
+            const target = reviewTargets.find(
+              (target) => target.findingId === id
+            )!;
+            return findings.some(
+              (finding) =>
+                finding.code === "heading-structure" &&
+                finding.tagId === target.tagId
+            );
+          })
+        )
+          return invalid();
+        return { findings, resolvedFindingIds };
       },
       false
     );
     calls.push(...auditUsages.filter(Boolean));
-    const findings = [...repaired.findings, ...retained];
+    const resolvedFindingIds = new Set(
+      audits.flatMap((audit) =>
+        audit.status === "fulfilled" ? audit.value.resolvedFindingIds : []
+      )
+    );
+    // Later role repairs can make discovery fit its limit, but cannot restore
+    // candidates that were unavailable when the repair plan was proposed.
+    const skippedCandidateDiscovery = prepared.findings.find(
+      (finding) => finding.code === "structure_candidates_limited"
+    );
+    const findings = [
+      ...repaired.findings,
+      ...(skippedCandidateDiscovery &&
+      !repaired.findings.some(
+        (finding) => finding.code === "structure_candidates_limited"
+      )
+        ? [skippedCandidateDiscovery]
+        : []),
+      ...retainedRecords
+        .filter((record) => !resolvedFindingIds.has(record.findingId))
+        .map((record) => record.finding),
+    ];
     let auditComplete = true;
     audits.forEach((audit, index) => {
-      if (audit.status === "fulfilled") findings.push(...audit.value);
+      if (audit.status === "fulfilled") findings.push(...audit.value.findings);
       else {
         auditComplete = false;
         findings.push({

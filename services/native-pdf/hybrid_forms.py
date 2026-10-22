@@ -1,6 +1,6 @@
 """Conservative support for static XFA PDFs with a complete AcroForm fallback.
 
-Nothing here evaluates JavaScript, renders XFA, or rewrites its packets. The
+Nothing here evaluates JavaScript or renders XFA. The
 small set of accepted legacy programs is retained exactly. Other documents
 continue through the worker's ordinary active-content and signature checks.
 """
@@ -67,6 +67,9 @@ class HybridField:
     authored_label: str | None
     needs_tooltip: bool
     needs_speech_enable: bool = False
+    speech_supported: bool = False
+    speech_disabled: bool | None = None
+    speech_priority: str | None = None
 
 
 @dataclass(frozen=True)
@@ -335,7 +338,7 @@ def _native_fields(pdf, form):
     _require(isinstance(fields, ArrayObject))
     result, widgets, seen = {}, {}, set()
 
-    def walk(reference, prefix, inherited_type, depth):
+    def walk(reference, prefix, inherited_type, inherited_flags, depth):
         field = _resolve(reference)
         _require(isinstance(field, DictionaryObject) and id(field) not in seen and depth <= 32)
         seen.add(id(field))
@@ -345,23 +348,25 @@ def _native_fields(pdf, form):
         _require(isinstance(partial, TextStringObject) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*\[\d+\]", str(partial)))
         name = ".".join((*prefix, str(partial)))
         kind = field.get("/FT", inherited_type)
+        flags = _resolve(field["/Ff"]) if "/Ff" in field else inherited_flags
+        _require(isinstance(flags, int) and not isinstance(flags, (bool, BooleanObject))
+                 and 0 <= flags <= 0xffffffff)
         children = _resolve(field.get("/Kids", ArrayObject()))
         _require(isinstance(children, ArrayObject))
         if children:
             _require(field.get("/Subtype") != "/Widget" and kind is None)
             for child in children:
                 _require(_resolve(_resolve(child).get("/Parent")) is field)
-                walk(child, (*prefix, str(partial)), kind, depth + 1)
+                walk(child, (*prefix, str(partial)), kind, flags, depth + 1)
         else:
             _require(kind in {"/Tx", "/Btn"} and field.get("/Subtype") == "/Widget" and name not in result)
-            flags = int(field.get("/Ff", 0))
             _require(not flags & ((1 << 15) | (1 << 16)) if kind == "/Btn" else True)
             result[name] = field
             widgets[id(field)] = name
             _require(len(result) <= MAX_FIELDS, "pdf_complexity_limit")
 
     for field in fields:
-        walk(field, (), None, 0)
+        walk(field, (), None, 0, 0)
     observed = set()
     for page in pdf.pages:
         for reference in _resolve(page.get("/Annots", ArrayObject())):
@@ -376,10 +381,16 @@ def _native_fields(pdf, form):
 def _template_fields(template, native):
     unsupported = {"occur", "subformSet", "instanceManager", "connectionSet", "connect", "connection", "sourceSet", "submit", "execute", "calculate", "validate", "bindItems", "exclGroup", "variables", "signature", "signData", "exObject", "image", "barcode", "externalObject", "wsdlConnection", "xmlConnection", "xsdConnection"}
     result, script_count, all_names = [], 0, set()
+    namespace = template.tag.rsplit("}", 1)[0] + "}"
+    evidence_elements = {"subform", "field", "draw", "assist", "speak", "ui", "textEdit", "checkButton", "comb",
+                         "traversal", "traverse", "bind", "event", "script"}
 
-    def walk(element, path, parent=None, field_type=None):
+    def walk(element, path, parent=None, field_type=None, foreign_ancestor=False):
         nonlocal script_count
         tag = _local(element)
+        _require(tag not in evidence_elements or (not foreign_ancestor and element.tag == namespace + tag))
+        if tag in {"field", "subform"}:
+            _require(parent is not None and parent.tag in {namespace + "template", namespace + "subform"})
         _require(tag not in unsupported)
         if tag in {"subform", "field"} and element.get("name"):
             name = element.get("name")
@@ -410,7 +421,16 @@ def _template_fields(template, native):
                 _require(len(text) <= MAX_LABEL, "pdf_complexity_limit")
                 _require(not any(ord(c) < 32 and c not in "\t\r\n" for c in text))
                 label = text if text.strip() else None
-            result.append(HybridField(name, native[name], name, label, label is not None and "/TU" not in native[name]))
+            speech = speaks[0] if speaks else None
+            supported = bool(speech is not None and label is not None
+                             and set(speech.attrib) <= {"disable", "priority"}
+                             and speech.get("disable", "0") in {"0", "1"}
+                             and speech.get("priority", "custom") == "custom"
+                             and ("/TU" not in native[name] or native[name].get("/TU") == label))
+            disabled = None if speech is None or speech.get("disable", "0") not in {"0", "1"} else speech.get("disable", "0") == "1"
+            priority = speech.get("priority", "custom") if speech is not None else None
+            result.append(HybridField(name, native[name], name, label, label is not None and "/TU" not in native[name],
+                                      supported and disabled is True, supported, disabled, priority))
         if tag == "script":
             script_count += 1
             _require(script_count <= 32, "pdf_complexity_limit")
@@ -422,7 +442,7 @@ def _template_fields(template, native):
         if tag == "event":
             _require(set(element.attrib) <= {"activity", "name"} and len(element) == 1 and _local(element[0]) == "script")
         for child in element:
-            walk(child, path, element, field_type)
+            walk(child, path, element, field_type, foreign_ancestor or element.tag != namespace + tag)
 
     walk(template, ())
     _require(all_names == set(native))
@@ -453,10 +473,11 @@ def inspect_hybrid(pdf):
 
 
 def prepare_hybrid(writer):
-    """Apply only verified Reader-rights removal and missing native tooltips.
+    """Apply source-derived form descriptions and speech accessibility metadata.
 
-    Return the original context as a change ledger. All XFA packet bytes,
-    scripts, values, bindings, fields, appearances and SigFlags remain intact.
+    Return the original context as a change ledger. Only narrowly verified
+    speak text/disable attributes may change within XFA; scripts, values,
+    bindings, fields, appearances, validation and flags remain intact.
     """
     _require(isinstance(writer, PdfWriter))
     context = inspect_hybrid(writer)
@@ -467,4 +488,6 @@ def prepare_hybrid(writer):
     for field in context.fields:
         if field.needs_tooltip:
             field.native_field[NameObject("/TU")] = TextStringObject(field.authored_label)
+    from hybrid_form_accessibility import prepare_accessibility
+    prepare_accessibility(writer, context)
     return context

@@ -32,6 +32,8 @@ import {
   parseNativePdfFindings,
   parseNativePdfPlan,
   parseNativePdfAudit,
+  parseNativePdfHeadingReviews,
+  coalesceNativePdfOperations,
   repairNativePdf,
 } from "../lib/native-pdf-convert";
 import { NativePdfError, pdfSha256 } from "../lib/native-pdf-worker";
@@ -111,8 +113,10 @@ function scope(parts: LiteLLMContentPart[]) {
   if (!part || part.type !== "text") throw Error("No scoped evidence");
   return JSON.parse(part.text.split("\n")[1]) as {
     assignedPages: number[];
+    pageReviewPages: number[];
     assignedTagIds: string[];
     tags: NativePdfTag[];
+    repairFindingReviewTargets: import("../lib/native-pdf-convert").NativePdfHeadingReviewTarget[];
   };
 }
 function response(content: unknown) {
@@ -132,12 +136,12 @@ function validContent(prompt: string, parts: LiteLLMContentPart[]) {
     reviewedTagIds: assigned.assignedTagIds,
     ...(prompt === NATIVE_PDF_AUDIT_PROMPT
       ? {
-          artifactReviews: assigned.assignedPages.map((pageNumber) => ({
+          artifactReviews: assigned.pageReviewPages.map((pageNumber) => ({
             pageNumber,
             decision: "decorative-or-redundant",
             explanation: "The page has no excluded meaningful text.",
           })),
-          textReviews: assigned.assignedPages.map((pageNumber) => ({
+          textReviews: assigned.pageReviewPages.map((pageNumber) => ({
             pageNumber,
             decision: "matches-visible-text",
             explanation:
@@ -156,6 +160,193 @@ beforeEach(() => {
 });
 
 describe("native PDF model contracts", () => {
+  it("assigns unpaged wrappers by descendant content without attaching sixty companion pages to the root", async () => {
+    const state = await makeState(60);
+    const leaves = state.inventory.tags;
+    const wrappers = leaves.map((leaf, index) => ({
+      ...tag(1, index + 100),
+      pageNumber: null,
+      content: [],
+      role: "Sect",
+      children: [leaf.id],
+      parentId: "tag-1000",
+    }));
+    leaves.forEach((leaf, index) => {
+      leaf.parentId = wrappers[index].id;
+    });
+    const root = {
+      ...tag(1, 1000),
+      pageNumber: null,
+      content: [],
+      role: "Document",
+      children: wrappers.map((wrapper) => wrapper.id),
+    };
+    state.inventory.tags = [
+      root,
+      ...wrappers.flatMap((wrapper, index) => [wrapper, leaves[index]]),
+    ];
+    const batches = nativePdfBatches(state);
+    expect(batches).toHaveLength(15);
+    expect(batches.every((batch) => batch.visualPages.length === 4)).toBe(true);
+    expect(batches[1].tags.map((tag) => tag.id)).toContain("tag-104");
+    expect(batches[0].tags.map((tag) => tag.id)).not.toContain("tag-104");
+    expect(
+      new Set(batches.flatMap((batch) => batch.tags.map((tag) => tag.id))).size
+    ).toBe(121);
+    const empty = {
+      ...tag(1, 2000),
+      pageNumber: null,
+      content: [],
+      parentId: "tag-104",
+    };
+    wrappers[4].children.unshift(empty.id);
+    state.inventory.tags.push(empty);
+    const withEmpty = nativePdfBatches(state);
+    expect(withEmpty[0].tags.map((tag) => tag.id)).not.toContain("tag-104");
+    expect(withEmpty[1].tags.map((tag) => tag.id)).toContain("tag-104");
+  });
+
+  it("gives a dense page one owner for page-wide findings while every chunk reviews its tags", async () => {
+    const state = await makeState();
+    state.inventory.tags = Array.from({ length: 201 }, (_, i) => tag(1, i + 1));
+    const [owner, secondary] = nativePdfBatches(state);
+    expect(owner.pageReviewPages).toEqual([1]);
+    expect(secondary.pageReviewPages).toEqual([]);
+    const finding = {
+      code: "form-review",
+      severity: "warning",
+      pageNumber: 1,
+      location: "Name field",
+      message: "Check the field's announcement.",
+      suggestion: "Check it in Acrobat.",
+    };
+    expect(parseNativePdfFindings([finding], owner)).toHaveLength(1);
+    expect(() => parseNativePdfFindings([finding], secondary)).toThrow();
+    expect(
+      parseNativePdfFindings([{ ...finding, tagId: "tag-201" }], secondary)
+    ).toHaveLength(1);
+    expect(() =>
+      parseNativePdfFindings([{ ...finding, code: "heading-structure" }], owner)
+    ).toThrow();
+    expect(
+      parseNativePdfAudit(
+        {
+          reviewedPages: [1],
+          reviewedTagIds: ["tag-201"],
+          artifactReviews: [],
+          textReviews: [],
+          findings: [],
+        },
+        secondary
+      )
+    ).toEqual([]);
+  });
+
+  it.each([
+    "split_heading",
+    "join_list_continuation",
+    "mark_note_reference",
+    "convert_list",
+  ] as const)(
+    "binds %s to a supplied candidate and rejects arbitrary changes",
+    async (kind) => {
+      const state = await makeState();
+      const candidateId = "a".repeat(64);
+      state.inventory.structureCandidates = [
+        {
+          candidateId,
+          kind,
+          tagId: "tag-1",
+          pageNumber: 1,
+          text: "Source heading and paragraph",
+          preview: "Source-bound structural change",
+          relatedTagIds: [],
+        },
+      ];
+      const batch = nativePdfBatches(state)[0];
+      const operation = {
+        type: "repair_structure",
+        tagId: "tag-1",
+        candidateId,
+        ...(kind === "split_heading" ? { role: "H3" } : {}),
+      };
+      const base = {
+        reviewedPages: [1],
+        reviewedTagIds: ["tag-1"],
+        findings: [],
+        operations: [operation],
+      };
+      expect(parseNativePdfPlan(base, batch, state).operations).toEqual([
+        { ...operation, expected: state.inventory.tags[0].snapshot },
+      ]);
+      for (const change of [
+        { candidateId: "b".repeat(64) },
+        { tagId: "tag-2" },
+        { text: "Invented replacement" },
+        { offset: 7 },
+        { role: kind === "split_heading" ? "H1" : "H3" },
+      ])
+        expect(() =>
+          parseNativePdfPlan(
+            { ...base, operations: [{ ...operation, ...change }] },
+            batch,
+            state
+          )
+        ).toThrow();
+    }
+  );
+
+  it("retains omitted heading reviews and accepts only explicit evidence from an eligible current tag", () => {
+    const target = {
+      findingId: "repair-finding-1",
+      finding: {
+        code: "heading-structure",
+        severity: "warning" as const,
+        message: "Check heading level.",
+      },
+      tagId: "tag-2",
+      beforeRole: "H4",
+      currentRole: "H3",
+      eligibleForResolution: true,
+    };
+    const review = {
+      findingId: target.findingId,
+      decision: "resolved",
+      explanation: "The saved H3 is a child of the current H2.",
+      currentTag: { tagId: "tag-2", role: "H3" },
+    };
+    expect(parseNativePdfHeadingReviews(undefined, [target])).toEqual([]);
+    expect(parseNativePdfHeadingReviews([], [target])).toEqual([]);
+    expect(parseNativePdfHeadingReviews([review], [target])).toEqual([
+      target.findingId,
+    ]);
+    expect(
+      parseNativePdfHeadingReviews(
+        [{ ...review, decision: "uncertain" }],
+        [target]
+      )
+    ).toEqual([]);
+    for (const change of [
+      { findingId: "machine-finding" },
+      { currentTag: { tagId: "tag-1", role: "H3" } },
+      { currentTag: { tagId: "tag-2", role: "H4" } },
+      { explanation: "" },
+      { operation: "set_role" },
+    ])
+      expect(() =>
+        parseNativePdfHeadingReviews([{ ...review, ...change }], [target])
+      ).toThrow();
+    expect(() =>
+      parseNativePdfHeadingReviews([review, review], [target])
+    ).toThrow();
+    expect(() =>
+      parseNativePdfHeadingReviews(
+        [review],
+        [{ ...target, eligibleForResolution: false }]
+      )
+    ).toThrow();
+  });
+
   it("binds supported changes to exact worker snapshots and refuses locked descriptions", async () => {
     const state = await makeState();
     const batch = nativePdfBatches(state)[0];
@@ -229,6 +420,17 @@ describe("native PDF model contracts", () => {
         ],
       },
       { operations: [{ type: "set_role", tagId: "tag-2", role: "H1" }] },
+      {
+        operations: [
+          { type: "set_form_label", tagId: "tag-1", label: "Invented label" },
+        ],
+      },
+      {
+        operations: [
+          { type: "set_form_required", tagId: "tag-1", required: true },
+        ],
+      },
+      { operations: [{ type: "enable_xfa_speech", tagId: "tag-1" }] },
       {
         operations: Array.from({ length: 2 }, () => ({
           type: "set_role",
@@ -419,6 +621,321 @@ describe("native PDF model contracts", () => {
 });
 
 describe("native PDF orchestration", () => {
+  it.each([false, true])(
+    "retains an initial candidate-discovery limit once without reviving resolved defects (still limited: %s)",
+    async (stillLimited) => {
+      const prepared = await makeState();
+      const limit = {
+        code: "structure_candidates_limited",
+        severity: "warning" as const,
+        message:
+          "Automatic heading, list and footnote suggestions could not be completed.",
+      };
+      prepared.findings = [
+        limit,
+        {
+          code: "metadata-missing",
+          severity: "error",
+          message: "The original title was missing.",
+        },
+      ];
+      const currentLimit = {
+        ...limit,
+        message:
+          "Some structure repair suggestions exceeded the processing limit.",
+      };
+      const repaired = {
+        ...prepared,
+        findings: stillLimited ? [currentLimit] : [],
+      };
+      useState(prepared);
+      mocks.worker
+        .mockResolvedValueOnce(prepared)
+        .mockResolvedValueOnce(repaired);
+      const result = await repairNativePdf(prepared.pdf, "lecture.pdf");
+      if ("error" in result) throw Error(result.error);
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0]).toMatchObject({
+        severity: "warning",
+        message: stillLimited ? currentLimit.message : limit.message,
+      });
+      expect(result.nativePdfChecks.auditComplete).toBe(true);
+    }
+  );
+
+  it("supplies parallel existing and run-in heading context across tag batches without granting edit ownership", async () => {
+    const state = await makeState(2);
+    state.inventory.tags = Array.from({ length: 201 }, (_, index) =>
+      tag(1, index + 1)
+    );
+    state.inventory.tags.push(tag(2, 202));
+    const preceding = state.inventory.tags[197];
+    preceding.role = preceding.snapshot.role = "H3";
+    preceding.text = preceding.snapshot.text = "Student eligibility";
+    const following = state.inventory.tags[200];
+    following.role = following.snapshot.role = "H3";
+    following.text = following.snapshot.text = "Staff eligibility";
+    state.inventory.structureCandidates = [
+      {
+        candidateId: "e".repeat(64),
+        kind: "split_heading",
+        tagId: "tag-200",
+        pageNumber: 1,
+        text: "Visitor eligibility. Visitors qualify under these conditions.",
+        preview:
+          "Heading: Visitor eligibility.\nParagraph: Visitors qualify under these conditions.",
+        relatedTagIds: [],
+      },
+      {
+        candidateId: "f".repeat(64),
+        kind: "split_heading",
+        tagId: "tag-202",
+        pageNumber: 2,
+        text: "Volunteer eligibility. Volunteers qualify under these conditions.",
+        preview:
+          "Heading: Volunteer eligibility.\nParagraph: Volunteers qualify under these conditions.",
+        relatedTagIds: [],
+      },
+    ];
+    useState(state);
+    const result = await repairNativePdf(state.pdf, "lecture.pdf");
+    if ("error" in result) throw Error(result.error);
+    const [prompt, parts] = mocks.call.mock.calls[0];
+    const evidence = parts.find(
+      (part: LiteLLMContentPart) => part.type === "text"
+    ).text;
+    const current = JSON.parse(evidence.split("\n")[1]);
+    expect(current.assignedTagIds).toContain("tag-200");
+    expect(current.assignedTagIds).not.toContain("tag-201");
+    expect(current.structureCandidates).toHaveLength(1);
+    expect(current.structureCandidates[0].headingContext.preceding).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          tagId: "tag-198",
+          currentRole: "H3",
+          kind: "saved-heading",
+          excerpt: "Student eligibility",
+        }),
+      ])
+    );
+    expect(current.structureCandidates[0].headingContext.following).toEqual([
+      expect.objectContaining({
+        tagId: "tag-201",
+        currentRole: "H3",
+        kind: "saved-heading",
+      }),
+      expect.objectContaining({
+        tagId: "tag-202",
+        kind: "possible-run-in-heading",
+      }),
+    ]);
+    expect(prompt).toContain(
+      "use set_role P on the separate number-only label when editable.role permits"
+    );
+    expect(prompt).toContain(
+      "do not blindly inherit the nearest preceding heading's rank plus one"
+    );
+    expect(prompt).toContain(
+      "including set_role on any paragraph participating in convert_list"
+    );
+  });
+
+  it.each(["role", "split", "omitted", "invalid", "unchanged"] as const)(
+    "reconciles a retained heading concern only with a verified change and complete current evidence: %s",
+    async (mode) => {
+      const prepared = await makeState();
+      prepared.inventory.tags = [tag(1, 1), tag(1, 2), tag(1, 3)];
+      prepared.inventory.tags[0].role =
+        prepared.inventory.tags[0].snapshot.role = "H2";
+      prepared.inventory.tags[1].role =
+        prepared.inventory.tags[1].snapshot.role =
+          mode === "split" ? "P" : "H4";
+      prepared.inventory.tags[2].role =
+        prepared.inventory.tags[2].snapshot.role = "H4";
+      const candidateId = "c".repeat(64);
+      prepared.inventory.structureCandidates = [
+        {
+          candidateId,
+          kind: "split_heading",
+          tagId: "tag-2",
+          pageNumber: 1,
+          text: prepared.inventory.tags[1].text,
+          preview: "Heading: Existing section\nParagraph: Existing body",
+          relatedTagIds: [],
+        },
+      ];
+      const repaired = structuredClone(prepared) as NativePdfState;
+      repaired.pdf = prepared.pdf;
+      repaired.inventory.tags = prepared.inventory.tags.map((tag) =>
+        structuredClone(tag)
+      );
+      if (mode === "split") {
+        const original = repaired.inventory.tags[1];
+        const heading = {
+          ...structuredClone(original),
+          id: "tag-4",
+          sourceTagId: "tag-2",
+          role: "H3",
+        };
+        heading.snapshot.role = "H3";
+        original.sourceTagId = "tag-2";
+        original.id = "tag-5";
+        repaired.inventory.tags.splice(1, 1, heading, original);
+        repaired.inventory.sourceTagLineage = {
+          "tag-1": "tag-1",
+          "tag-2": "tag-5",
+          "tag-3": "tag-3",
+        };
+      } else if (mode !== "unchanged") {
+        repaired.inventory.tags[1].role =
+          repaired.inventory.tags[1].snapshot.role = "H3";
+      }
+      const machineMessage = "An original font still needs review.";
+      repaired.findings = [
+        { code: "font", severity: "error", message: machineMessage },
+      ];
+      useState(prepared);
+      mocks.worker
+        .mockResolvedValueOnce(prepared)
+        .mockResolvedValueOnce(repaired);
+      const headingMessage = "The section heading may be too deep.";
+      const formMessage = "Check whether Acrobat announces this form field.";
+      mocks.call.mockImplementation((prompt, parts) => {
+        const content = validContent(prompt, parts);
+        if (prompt !== NATIVE_PDF_AUDIT_PROMPT)
+          return response({
+            ...content,
+            operations:
+              mode === "unchanged"
+                ? []
+                : [
+                    mode === "split"
+                      ? {
+                          type: "repair_structure",
+                          tagId: "tag-2",
+                          candidateId,
+                          role: "H3",
+                        }
+                      : { type: "set_role", tagId: "tag-2", role: "H3" },
+                  ],
+            findings: [
+              {
+                code: "heading-structure",
+                severity: "warning",
+                pageNumber: 1,
+                tagId: "tag-2",
+                location: "Section heading",
+                message: headingMessage,
+                suggestion: "Check the heading relationship.",
+              },
+              {
+                code: "form-interaction",
+                severity: "warning",
+                pageNumber: 1,
+                location: "Name field",
+                message: formMessage,
+                suggestion: "Check announcements in Acrobat.",
+              },
+            ],
+          });
+        const [target] = scope(parts).repairFindingReviewTargets;
+        expect(target).toMatchObject({
+          tagId: mode === "split" ? "tag-4" : "tag-2",
+          currentRole: mode === "unchanged" ? "H4" : "H3",
+          eligibleForResolution: mode !== "unchanged",
+        });
+        return response({
+          ...content,
+          ...(mode === "omitted"
+            ? {}
+            : {
+                repairFindingReviews: [
+                  {
+                    findingId: target.findingId,
+                    decision: "resolved",
+                    explanation:
+                      "The saved section is directly below its H2 parent.",
+                    currentTag: {
+                      tagId: target.tagId,
+                      role: mode === "invalid" ? "H5" : target.currentRole,
+                    },
+                  },
+                ],
+              }),
+        });
+      });
+      const result = await repairNativePdf(prepared.pdf, "lecture.pdf");
+      if ("error" in result) throw Error(result.error);
+      const messages = result.errors.map((finding) => finding.message);
+      expect(messages).toContain(machineMessage);
+      expect(messages).toContain(formMessage);
+      expect(messages.includes(headingMessage)).toBe(
+        !["role", "split"].includes(mode)
+      );
+      expect(result.nativePdfChecks.auditComplete).toBe(
+        !["invalid", "unchanged"].includes(mode)
+      );
+      const evidence = mocks.call.mock.calls[1][1].find(
+        (part: LiteLLMContentPart) => part.type === "text"
+      ).text;
+      const current = JSON.parse(evidence.split("\n")[1]);
+      expect(current.headingOutline[0]).toMatchObject({
+        tagId: "tag-1",
+        role: "H2",
+        precedingLowerLevelHeadingId: null,
+      });
+      if (mode === "split") {
+        const historical = JSON.parse(evidence.split("\n")[3]);
+        expect(historical.tags.map((tag: NativePdfTag) => tag.id)).toEqual([
+          "tag-1",
+          "tag-2",
+          "tag-3",
+        ]);
+        expect(current.outstandingRepairFindings[0].tagId).toBe("tag-5");
+      }
+    }
+  );
+
+  it("coalesces only an exact Note role already applied by a selected reference candidate", async () => {
+    const state = await makeState();
+    const candidateId = "d".repeat(64);
+    state.inventory.structureCandidates = [
+      {
+        candidateId,
+        kind: "mark_note_reference",
+        tagId: "tag-1",
+        pageNumber: 1,
+        text: "An existing footnote marker",
+        preview: "The existing note",
+        relatedTagIds: ["tag-2"],
+      },
+    ];
+    const expected = state.inventory.tags[0].snapshot;
+    const reference = {
+      type: "repair_structure" as const,
+      tagId: "tag-1",
+      candidateId,
+      expected,
+    };
+    const redundant = {
+      type: "set_role" as const,
+      tagId: "tag-2",
+      role: "Note",
+      expected,
+    };
+    const unrelated = { ...redundant, tagId: "tag-3" };
+    expect(
+      coalesceNativePdfOperations([reference, redundant, unrelated], state)
+    ).toEqual([reference, unrelated]);
+    const conflicting = { ...redundant, role: "P" };
+    expect(
+      coalesceNativePdfOperations([reference, conflicting], state)
+    ).toEqual([reference, conflicting]);
+    expect(coalesceNativePdfOperations([redundant], state)).toEqual([
+      redundant,
+    ]);
+  });
+
   it("uses the immutable source and exact saved PDF, preserving all model-call costs and explicit review limits", async () => {
     const state = await makeState();
     useState(state);
@@ -664,7 +1181,7 @@ describe("native PDF orchestration", () => {
       fields: [{ name: "Applicant name", alternativeName: "Full name" }],
       hybrid: {
         type: "static-xfa-with-acroform",
-        xfaPreserved: true,
+        xfaStructurePreserved: true,
         formLogicPreserved: true,
         nativeFieldDescriptionsAdded: 1,
         readerUsageRightsRemoved: true,
@@ -716,6 +1233,139 @@ describe("native PDF orchestration", () => {
       conformanceClaim: false,
     });
     expect(result.pdf).toEqual(state.pdf);
+  });
+
+  it("reviews saved hybrid names and speech without reviving repaired labels or inferring required/signing barriers", async () => {
+    const state = await makeState();
+    const segmentName = "form[0].identifier[0].segment[1]";
+    const currentLabel = "Membership number. Last 4 digits.";
+    const requiredLabel = "Applicant name. An entry is required.";
+    const fields = [
+      {
+        fieldId: "field-" + "1".repeat(64),
+        name: "form[0].name[0]",
+        type: "Tx",
+        label: requiredLabel,
+        required: false,
+        value: "",
+        pageNumbers: [1],
+        widgets: [{ widgetId: "p1-a1", pageNumber: 1, rect: [10, 10, 80, 20] }],
+        speech: {
+          supported: true,
+          text: requiredLabel,
+          disabled: false,
+          priority: "custom",
+          source: "xfa-assist",
+        },
+      },
+      {
+        fieldId: "field-" + "2".repeat(64),
+        name: segmentName,
+        type: "Tx",
+        label: currentLabel,
+        required: false,
+        value: "",
+        pageNumbers: [1],
+        widgets: [{ widgetId: "p1-a2", pageNumber: 1, rect: [10, 30, 80, 40] }],
+        speech: {
+          supported: true,
+          text: currentLabel,
+          disabled: false,
+          priority: "custom",
+          source: "xfa-assist",
+        },
+      },
+      {
+        fieldId: "field-" + "3".repeat(64),
+        name: "form[0].special[0]",
+        type: "Btn",
+        label: "Special option",
+        required: false,
+        value: "Off",
+        pageNumbers: [1],
+        widgets: [{ widgetId: "p1-a3", pageNumber: 1, rect: [10, 50, 20, 60] }],
+        speech: {
+          supported: false,
+          text: null,
+          disabled: null,
+          priority: null,
+          source: "xfa-assist",
+        },
+      },
+    ];
+    state.inventory.forms = {
+      field_count: fields.length,
+      widget_count: fields.length,
+      fields,
+      hybrid: {
+        type: "static-xfa-with-acroform",
+        formLogicPreserved: true,
+        interactiveViewerReviewRequired: true,
+        verification: {
+          accessibleNameChanges: [
+            {
+              fieldName: segmentName,
+              oldText: "Last 4 digits.",
+              newText: currentLabel,
+            },
+          ],
+          speechPromptsEnabled: fields.slice(0, 2).map((field) => field.name),
+        },
+      },
+    };
+    const unresolved =
+      "The special option's announcement still needs an interaction check.";
+    state.findings = [
+      {
+        code: "legacy_form_interaction_review",
+        severity: "warning",
+        message: unresolved,
+      },
+    ];
+    state.changes = [
+      {
+        code: "form_name_context_added",
+        message: "Added the existing group name to a segment description.",
+      },
+      {
+        code: "form_speech_enabled",
+        message: "Enabled the existing direct field descriptions.",
+      },
+    ];
+    useState(state);
+    const result = await repairNativePdf(state.pdf, "fillable-form.pdf");
+    if ("error" in result) throw Error(result.error);
+
+    for (const [prompt, parts] of mocks.call.mock.calls) {
+      expect(scope(parts)).toMatchObject({ forms: state.inventory.forms });
+      expect(prompt).toContain(
+        "Inspect the current field labels, speech settings and preparation records"
+      );
+      expect(prompt).toContain(
+        "A required:false native flag alone is not a demonstrated accessibility defect"
+      );
+      expect(prompt).toContain(
+        "The absence of a signature field, date field or dedicated cross-out control alone does not prove"
+      );
+      expect(prompt).toContain(
+        "Actual keyboard and signing behavior requires interaction evidence"
+      );
+      expect(prompt).not.toContain("The XFA speech settings remain unchanged");
+    }
+    expect(mocks.call.mock.calls[1][0]).toContain(
+      "Do not repeat the original short-label or disabled-speech concern"
+    );
+    expect(result.errors.map((finding) => finding.message)).toEqual([
+      unresolved,
+    ]);
+    expect(result.nativePdfChecks).toMatchObject({
+      auditComplete: true,
+      screenReaderTestPerformed: false,
+      conformanceClaim: false,
+    });
+    expect(result.changes).toEqual(
+      state.changes.map((change) => change.message)
+    );
   });
 
   it.each(["metadata-missing", "display-title-missing"])(

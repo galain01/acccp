@@ -18,6 +18,15 @@ The reusable independent checker is copied explicitly from
 are disabled in the worker process. Fixture-specific repair plans, fonts,
 OCR overlays and form rewrites are not imported into this service.
 
+The worker can also add missing note identifiers and expose verified candidates
+for heading splits, numbered/lettered lists, list continuations and isolated
+footnote markers. The model chooses from these source-derived candidates;
+the writer independently rederives their boundaries and preserves the original
+encoded text, rendered pages and native form. This includes narrowly verified
+one-byte asterisk suffix partitions without changing text state or spacing.
+An optional discovery limit
+leaves a review warning while other checks and supported repairs continue.
+
 ## Fixed-layout hybrid forms
 
 The worker accepts a conservative subset of legacy forms that contain both
@@ -33,20 +42,26 @@ never executed by the worker.
 Only a structurally verified Adobe Reader usage-rights signature (`UR3`) can be
 removed from the generated copy, because rewriting invalidates those legacy
 rights. User signatures and other permissions remain unsupported. The immutable
-source retains its original bytes. The generated copy keeps the XFA packets,
-data, bindings, speech settings, signature flags, native fields, values,
-appearances and page content. If a native field has no `TU` property, the worker
-can copy its existing authored XFA description exactly into that native label;
-existing labels, including blank labels, are preserved. These are source-bound
-preparation changes, not model-editable operations or form flattening.
+source retains its original bytes. The generated copy keeps XFA data, bindings,
+recognized scripts, signature flags, native fields, values, appearances and
+page content. If a native field has no `TU` property, the worker can copy its
+existing authored XFA description into that native label. It can also add a
+verified source group name to a supported segment label in both the native
+label and XFA speech text, and enable a supported existing direct speech prompt.
+Other authored labels and unsupported speech settings stay unchanged. Required
+validation flags, form actions and controls are never changed by these repairs.
+These are source-bound preparation changes, not model-editable operations or
+form flattening.
 
 An independent comparison verifies this narrowly approved preparation before
 the ordinary page/content/pixel comparison runs. The original source hash
-remains the request identity. Machine findings and form interaction warnings
-remain visible. In particular, an XFA field with speech disabled keeps that
-setting: adding a native label does not prove Acrobat will announce it. Users
-must check field announcements and checkbox choices in Acrobat before sharing
-an affected form. Support for this subset does not establish PDF/UA conformance.
+remains the request identity. The reopened inventory exposes actual field
+labels and speech settings alongside exact old/new metadata changes; the audit
+must not repeat an original defect after that evidence establishes its repair.
+Machine findings and unresolved interaction warnings remain visible. Useful
+labels and enabled speech prompts do not prove that Acrobat announced them or
+operated a checkbox correctly. Those behaviors require real viewer checks.
+Support for this subset does not establish PDF/UA conformance.
 
 ## Running locally
 
@@ -136,3 +151,13 @@ The Vercel Linux container build also passed the authenticated prepare/repair
 smoke test on 2026-10-21, including both installed Java tools, the unprivileged
 application user and production process limits. The hosted app flow remains a
 separate release check.
+
+On 2026-10-22 the local application pipeline repaired the original six-page W-9
+using the configured repair model and independent auditor. Fifteen independent
+saved-file assertions passed for headings, lists, numeric/asterisk note
+references, source text, page pixels and all 23 native fields with their XFA
+data. The audit reported no remaining document-structure findings. The two
+original font failures remained in veraPDF, and the review retained the legacy
+form interaction, field-label, required-status and signing concerns. Fonts and
+form behavior were deliberately unchanged. These are local verification results;
+hosted release checks are recorded separately.

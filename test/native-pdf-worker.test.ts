@@ -122,6 +122,89 @@ describe("native PDF service client", () => {
       );
     }
   });
+  it("accepts bounded source-derived structure candidates and non-bijective source lineage", () => {
+    const raw = response();
+    const inventory = raw.inventory as unknown as Record<string, unknown>;
+    inventory.tags = [
+      { ...raw.inventory.tags[0], sourceTagId: "tag-1" },
+      { ...raw.inventory.tags[0], id: "tag-2", sourceTagId: "tag-1" },
+      { ...raw.inventory.tags[0], id: "tag-3", sourceTagId: null },
+    ];
+    inventory.structureCandidates = [
+      {
+        candidateId: "a".repeat(64),
+        kind: "mark_note_reference",
+        tagId: "tag-1",
+        pageNumber: 1,
+        text: "Original marker",
+        preview: "Matching original note",
+        relatedTagIds: ["tag-2"],
+      },
+    ];
+    inventory.sourceTagLineage = { "tag-1": "tag-2" };
+    const parsed = parseNativePdfState(raw, source);
+    expect(parsed.inventory.tags.map((tag) => tag.sourceTagId)).toEqual([
+      "tag-1",
+      "tag-1",
+      null,
+    ]);
+    expect(parsed.inventory.sourceTagLineage).toEqual({ "tag-1": "tag-2" });
+    expect(parsed.inventory.structureCandidates).toHaveLength(1);
+    inventory.structureCandidates = [
+      {
+        candidateId: "b".repeat(64),
+        kind: "convert_list",
+        tagId: "tag-1",
+        pageNumber: 1,
+        text: "A—First existing item",
+        preview: "A—First existing item\nB—Second existing item",
+        relatedTagIds: ["tag-2"],
+      },
+    ];
+    expect(
+      parseNativePdfState(raw, source).inventory.structureCandidates?.[0].kind
+    ).toBe("convert_list");
+  });
+  it("rejects malformed structure candidates and lineage before supplying them to the model", () => {
+    const candidate = {
+      candidateId: "a".repeat(64),
+      kind: "split_heading",
+      tagId: "tag-1",
+      pageNumber: 1,
+      text: "Source",
+      preview: "Heading and body",
+      relatedTagIds: [],
+    };
+    for (const changed of [
+      { candidateId: "invented" },
+      { tagId: "tag-99" },
+      { pageNumber: 2 },
+      { kind: "replace_text" },
+      { text: "x".repeat(20_001) },
+      { relatedTagIds: ["tag-99"] },
+      { relatedTagIds: ["tag-1", "tag-1"] },
+    ]) {
+      const raw = response();
+      (
+        raw.inventory as unknown as Record<string, unknown>
+      ).structureCandidates = [{ ...candidate, ...changed }];
+      expect(() => parseNativePdfState(raw, source)).toThrow(
+        "pdf_protocol_error"
+      );
+    }
+    for (const lineage of [
+      { "tag-1": "tag-99" },
+      { invalid: "tag-1" },
+      { "tag-1": null },
+    ]) {
+      const raw = response();
+      (raw.inventory as unknown as Record<string, unknown>).sourceTagLineage =
+        lineage;
+      expect(() => parseNativePdfState(raw, source)).toThrow(
+        "pdf_protocol_error"
+      );
+    }
+  });
   it("rejects missing pages, duplicate tags, stale snapshots and parent cycles", () => {
     const missing = response();
     missing.inventory.page_content = [];

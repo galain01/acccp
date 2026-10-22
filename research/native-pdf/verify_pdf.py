@@ -795,6 +795,40 @@ class LocalDestinations:
         return result
 
 
+def ownership_required_mcids(ops: list[tuple[Any, bytes]], properties: Any = None) -> set[int]:
+    """Separate real content from authored artifacts and literally empty scopes.
+
+    Keep every MCID in the ordinary syntax/uniqueness checks. Only the final
+    ownership requirement changes: an artifact need not belong to the logical
+    structure, and an immediate BDC/EMC pair with MCID-only properties contains
+    nothing to assign. Unknown properties, ActualText, and any intervening
+    operator prevent the empty-scope exception.
+    """
+    properties = resolved(properties) or {}
+    stack: list[tuple[bool, bool]] = []
+    required: set[int] = set()
+    artifact_properties = {"/MCID", "/Type", "/Subtype", "/Attached", "/BBox"}
+    for index, (operands, operator) in enumerate(ops):
+        if operator in (b"BMC", b"BDC"):
+            props = resolved(operands[1]) if operator == b"BDC" and len(operands) == 2 else {}
+            if isinstance(props, NameObject):
+                props = resolved(properties.get(props)) if isinstance(properties, dict) else None
+            supported_props = isinstance(props, dict) and set(props) <= artifact_properties
+            artifact = bool(operands) and str(operands[0]) == "/Artifact"
+            if len(stack) >= MAX_DEPTH:
+                raise InspectionError("structure_complexity_limit")
+            stack.append((artifact, supported_props))
+            mcid = integer(props.get("/MCID")) if isinstance(props, dict) else None
+            if mcid is not None:
+                explicitly_artifact = any(flag for flag, _ in stack) and all(safe for _, safe in stack)
+                empty = all(safe for _, safe in stack) and set(props) == {"/MCID"} and index + 1 < len(ops) and ops[index + 1] == ([], b"EMC")
+                if not explicitly_artifact and not empty:
+                    required.add(mcid)
+        elif operator == b"EMC" and stack:
+            stack.pop()
+    return required
+
+
 def structure_inventory(reader: PdfReader) -> dict[str, Any]:
     """Read actual saved tags; do not infer associations from visual proximity."""
     pages = list(reader.pages)
@@ -935,7 +969,7 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
                 decoded_text_chars += len(artifact_text)
                 artifact_complete &= len(artifact_text) <= MAX_ARTIFACT_TEXT_CHARS and decoded_text_chars <= MAX_TEXT_CHARS
                 artifact_text = artifact_text[:MAX_ARTIFACT_TEXT_CHARS] if decoded_text_chars <= MAX_TEXT_CHARS else ""
-        info["page_content"].append({"pageNumber": page_number, "mcids": sorted(page_mcids), "text_show_operators": text_index, "untagged_text_operators": unowned, "artifact_text_operators": artifacts, "artifactText": artifact_text, "artifactTextComplete": artifact_complete, "occurrence_ids_by_mcid": occurrence_ids})
+        info["page_content"].append({"pageNumber": page_number, "mcids": sorted(page_mcids), "ownership_required_mcids": sorted(ownership_required_mcids(ops, properties)), "text_show_operators": text_index, "untagged_text_operators": unowned, "artifact_text_operators": artifacts, "artifactText": artifact_text, "artifactTextComplete": artifact_complete, "occurrence_ids_by_mcid": occurrence_ids})
         for mcid in page_mcids:
             extraction_work += len(ops)
             if extraction_work > MAX_TEXT_EXTRACTION_OPERATORS:
@@ -1020,7 +1054,7 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
             gaps.add("ambiguous_form_content_invocation")
         if unowned:
             gaps.add("form_text_without_native_mcid")
-        scope = {"id": f"form-{len(info['form_content']) + 1}", "pageNumber": pn, "mcids": sorted(mcids), "stream": form, "text": {}, "gaps": gaps}
+        scope = {"id": f"form-{len(info['form_content']) + 1}", "pageNumber": pn, "mcids": sorted(mcids), "ownership_required_mcids": sorted(ownership_required_mcids(ops, props)), "stream": form, "text": {}, "gaps": gaps}
         for selected_mcid in [None, *sorted(mcids)]:
             extraction_work += len(ops)
             if extraction_work > MAX_TEXT_EXTRACTION_OPERATORS:
@@ -1099,6 +1133,8 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
         native_objects[tag['id']] = item
         if "/ID" in item:
             tag["nativeId"], tag["nativeIdHex"] = native_string(item["/ID"])
+        if tag["role"] == "Note" and not tag.get("nativeIdHex"):
+            info["findings"].append({"code": "missing_note_identifier", "severity": "error", "tagId": tag["id"], "page": page_number})
         if "/Lang" in item:
             tag["language"], _ = native_string(item["/Lang"], 100)
         tag["effectiveLanguage"] = tag.get("language", inherited_language or info["language"])
@@ -1338,10 +1374,10 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
     info['table_header_graph'] = {'cycleDetected': bool(affected),
         'resolvedEdgeCount': sum(len(headers) for headers in header_graph.values())}
     for page in info["page_content"]:
-        if any((page["pageNumber"], mcid) not in content_seen for mcid in page["mcids"]):
+        if any((page["pageNumber"], mcid) not in content_seen for mcid in page["ownership_required_mcids"]):
             info["findings"].append({"code": "unowned_marked_content", "severity": "error", "page": page["pageNumber"]})
     for scope in form_scopes.values():
-        if any((scope["id"], mcid) not in content_seen for mcid in scope["mcids"]):
+        if any((scope["id"], mcid) not in content_seen for mcid in scope["ownership_required_mcids"]):
             info["findings"].append({"code": "unowned_form_marked_content", "severity": "error", "page": scope["pageNumber"]})
     info["findings"] = info["findings"][:MAX_FINDINGS]
     info["tag_count"] = len(info["tags"])

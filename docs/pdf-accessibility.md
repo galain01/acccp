@@ -41,6 +41,34 @@ ActualText are preserved. The model cannot replace arbitrary PDF content, change
 form behavior or create external references. Complex tables and uncertain
 relationships remain findings.
 
+The worker also offers narrowly verified structure candidates. The model may
+separate a heading from the beginning of a paragraph at an existing text-show
+boundary, group verified numbered or lettered paragraphs into list items,
+join an immediately following continuation to its list item, or
+identify a separately painted superscript as a reference to an unambiguous
+nearby note. A trailing single or double asterisk may also be separated from a
+text-show string when an explicit simple one-byte font makes its exact encoded
+boundary verifiable. Only the original bytes are partitioned; text state and
+spacing remain unchanged and saved-page preservation is independently checked.
+These operations reuse original text and drawing instructions;
+they do not rewrite wording or redraw pages. Unsupported boundaries and unclear
+relationships remain for review. Saved tag lineage keeps historical and current
+inventories aligned when a repair adds structure nodes. If optional candidate
+discovery reaches its work limit, other repairs and checks continue with a
+visible warning that the heading/list/note suggestions need review.
+
+Missing Note identifiers are added automatically when the existing identifier
+tree is unambiguous. Decorative marked content and literally empty markers do
+not require content tags, but meaningful unowned text or graphics still fail
+the structure check. The independent auditor remains responsible for checking
+whether content marked decorative actually carries meaning.
+
+Model batches keep a page's tags together where possible. Dense pages have one
+owner for page-wide reviews, while every tag still receives review. A retained
+heading concern can be cleared only by a complete independent review with
+matching saved-tag evidence of the relevant repair. Machine findings and
+unsupported form concerns cannot be cleared this way.
+
 During preparation, the worker can also fill an absent link-annotation
 description from the original link's verified text. This is a bounded automatic
 repair for up to 200 simple text links in an already-tagged original PDF, each
@@ -68,19 +96,37 @@ them. Forms that change layout, reference external resources, contain unknown
 scripts or use unsupported controls remain unsupported.
 
 Preparation can copy an existing authored XFA field description into a missing
-standard PDF field label. It preserves existing labels, including empty ones.
+standard PDF field label. For a supported segmented entry, it can add the
+source-proven group name to an incomplete segment description in both layers,
+so a label such as "Middle 2 digits" identifies which number it belongs to.
+It can enable an existing direct XFA field speech prompt when that prompt and
+its settings are supported. Other authored labels, including unsupported or
+ambiguous cases, remain unchanged. These are deterministic preparation repairs;
+the model cannot supply arbitrary form-label text or change form behavior.
 It also removes verified legacy Adobe Reader usage rights from the repaired
 copy because rewriting the PDF invalidates those rights. These rights are
 distinct from a person's digital signature; digitally signed documents remain
 unsupported. The original upload stays unchanged. A separate comparison checks
 each permitted change against the source before ordinary preservation checks.
 
-The XFA layer and its speech settings remain unchanged. If that layer disables
-field announcements, adding a standard PDF label may not change what Acrobat
-announces. The app retains a warning to check field announcements and checkbox
-choices in Acrobat before sharing the form. Machine checks, an AI audit and
-unchanged appearance cannot establish those interactive behaviors or PDF/UA
-conformance.
+The saved inventory records the current labels and XFA speech settings, along
+with each verified metadata change. The audit uses that evidence so completed
+repairs are not reported again as original defects. The service preserves
+scripts, data, bindings, values, validation flags, widget positions and page
+appearance. Field announcements, checkbox choices and save/reopen behavior
+still require interaction checks in Acrobat; enabled speech metadata does not
+establish those results or PDF/UA conformance.
+
+Required information and required-field validation are separate. The service
+keeps explicit source instructions in the accessible description and does not
+change validation flags or add new mandatory rules. A false native required
+flag alone does not establish an accessibility failure when the requirement is
+already clearly communicated. Conditional choices must retain their source
+conditions. See [W3C PDF5](https://www.w3.org/WAI/WCAG22/Techniques/pdf/PDF5).
+The absence of a signature, date or cross-out widget likewise does not establish
+that a viewer lacks an accessible completion method. The audit reports a
+specific demonstrated barrier or accurately describes an unverified method;
+it does not create signing controls or substitute a typed name for a signature.
 
 The local research tools have broader, fixture-specific experiments for OCR,
 font substitution, broader form repairs and appended descriptions. Those experiments are
@@ -219,3 +265,27 @@ unchanged destinations and annotation properties, and preserved footnote
 descriptions. Repeated preparation and a normal repair round-trip preserved
 the addition without duplicating the change. This follow-up used no model calls
 or new desktop screen-reader tests and made no font changes or conformance claim.
+
+## W-9 form metadata verification, 2026-10-22
+
+Local verification passed 187 Python worker tests, 60 focused app tests,
+TypeScript, ESLint and the authenticated worker HTTP smoke test. A complete
+worker/model run on the six-page W-9 enabled 23 existing field speech prompts
+and added authored SSN/EIN group context to three segmented-field descriptions.
+Independent checks confirmed unchanged original page pixels, fonts, form
+scripts, values and control behavior. The earlier heading, list and footnote
+repairs also passed their 15 semantic assertions.
+
+Acrobat with portable NVDA 2026.2 announced the name field's required-entry
+instruction, classification checkbox labels/states and all three revised
+segment labels. Keyboard selection of a second classification cleared the
+first. A separate copy containing fictional test values was saved, closed and
+reopened; the values, checkbox state and descriptions persisted. Fifteen
+independent saved-copy checks matched native values, XFA datasets and visible
+appearances. The blank output and original file remained unchanged.
+
+Acrobat displayed a Font Capture application error during opening. The test
+continued after dismissing it; no font or Acrobat configuration changes were
+made. Keyboard signing, dating and certification strikeout were not established
+by these checks, so their specific interaction-review concerns remain. These
+local results do not claim PDF/UA conformance or activate a hosted release.
