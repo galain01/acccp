@@ -18,6 +18,36 @@ The reusable independent checker is copied explicitly from
 are disabled in the worker process. Fixture-specific repair plans, fonts,
 OCR overlays and form rewrites are not imported into this service.
 
+## Fixed-layout hybrid forms
+
+The worker accepts a conservative subset of legacy forms that contain both
+XFA and native AcroForm fields, including the structure used by the W-9 test
+document. It requires a static XFA layout and a complete, unambiguous mapping
+between the named XFA fields and native text fields or checkboxes. Dynamic
+forms, external resources, unsupported controls and unknown active features
+remain unsupported. Document scripts must match the recognized Adobe viewer
+bootstrap programs in their expected locations; XFA scripts are limited to
+recognized checkbox handlers. Accepted scripts are preserved exactly and are
+never executed by the worker.
+
+Only a structurally verified Adobe Reader usage-rights signature (`UR3`) can be
+removed from the generated copy, because rewriting invalidates those legacy
+rights. User signatures and other permissions remain unsupported. The immutable
+source retains its original bytes. The generated copy keeps the XFA packets,
+data, bindings, speech settings, signature flags, native fields, values,
+appearances and page content. If a native field has no `TU` property, the worker
+can copy its existing authored XFA description exactly into that native label;
+existing labels, including blank labels, are preserved. These are source-bound
+preparation changes, not model-editable operations or form flattening.
+
+An independent comparison verifies this narrowly approved preparation before
+the ordinary page/content/pixel comparison runs. The original source hash
+remains the request identity. Machine findings and form interaction warnings
+remain visible. In particular, an XFA field with speech disabled keeps that
+setting: adding a native label does not prove Acrobat will announce it. Users
+must check field announcements and checkbox choices in Acrobat before sharing
+an affected form. Support for this subset does not establish PDF/UA conformance.
+
 ## Running locally
 
 Use a trusted toolchain JSON with absolute paths for `openDataLoader` and
@@ -88,8 +118,9 @@ python -m unittest discover -s services/native-pdf -p "test_*.py"
 
 The worker tests cover saved-file changes and pixel/content preservation,
 authored alternatives, simple native table headers with paragraph children,
-stale or arbitrary plans, source-bound snapshots, signed/active/XFA/embedded
-files, precise form-control findings, complete validator evidence, and honest
+stale or arbitrary plans, source-bound snapshots, unsupported signatures,
+active features, XFA forms and embedded files, precise form-control findings,
+complete validator evidence, and honest
 evidence for pages without selectable text. HTTP tests exercise authentication,
 ambiguous headers, input limits, capacity, subprocess credential isolation,
 actual timeout cleanup and controlled failures.

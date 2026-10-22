@@ -28,6 +28,8 @@ from pypdf.generic import (ArrayObject, BooleanObject, DecodedStreamObject,
                           DictionaryObject, NameObject, TextStringObject)
 import verify_pdf
 from pdf_safety import reject_signed_pdf, resolved
+from hybrid_forms import HybridFormError, inspect_hybrid, prepare_hybrid
+from hybrid_form_verification import HybridVerificationError, verify_hybrid_preparation
 
 # No research-only source hash exceptions authorize changes in the app.
 verify_pdf.REVIEWED_WHITESPACE_ARTIFACTS = {}
@@ -134,10 +136,19 @@ def open_pdf(data):
             fail("pdf_password")
         if not 1 <= len(reader.pages) <= 60:
             fail("pdf_page_limit")
+        hybrid = inspect_hybrid(reader)
+        # A verified Reader usage-rights signature is distinct from a user's
+        # signature. Recheck every field for actual signatures with only that
+        # catalog entry temporarily absent; retain the immutable source bytes.
+        root = reader.trailer["/Root"]
+        rights = root.pop(NameObject("/Perms")) if hybrid and hybrid.has_reader_rights else None
         try:
             reject_signed_pdf(reader)
         except ValueError:
             fail("native_pdf_unsupported")
+        finally:
+            if rights is not None:
+                root[NameObject("/Perms")] = rights
         # Walk the reachable graph without decoding streams. Even hidden or
         # orphaned actions in an annotation/field cause rejection.
         pending, seen, count = [(reader.trailer["/Root"], 0)], set(), 0
@@ -147,15 +158,25 @@ def open_pdf(data):
             count += 1
             if count > 100_000 or depth > 128:
                 fail("pdf_complexity_limit")
+            if hybrid and id(value) in hybrid.usage_rights_node_ids:
+                continue
             if not isinstance(value, (DictionaryObject, ArrayObject)) or id(value) in seen:
                 continue
             seen.add(id(value))
             if isinstance(value, DictionaryObject):
-                if any(key in value for key in ("/XFA", "/JavaScript", "/JS", "/EmbeddedFiles", "/EF", "/AF", "/AA", "/OpenAction")):
+                exceptions = {
+                    "/XFA": hybrid.xfa_owner_ids if hybrid else set(),
+                    "/JavaScript": hybrid.javascript_owner_ids if hybrid else set(),
+                    "/JS": hybrid.javascript_action_ids if hybrid else set(),
+                }
+                if any(key in value and id(value) not in exceptions.get(key, set())
+                       for key in ("/XFA", "/JavaScript", "/JS", "/EmbeddedFiles", "/EF", "/AF", "/AA", "/OpenAction")):
                     fail("native_pdf_unsupported")
-                if value.get("/Type") == "/EmbeddedFile" or value.get("/Subtype") in ("/FileAttachment", "/RichMedia", "/Movie", "/Sound", "/3D"):
+                if ((value.get("/Type") == "/EmbeddedFile" and not (hybrid and id(value) in hybrid.xfa_packet_stream_ids))
+                        or value.get("/Subtype") in ("/FileAttachment", "/RichMedia", "/Movie", "/Sound", "/3D")):
                     fail("native_pdf_unsupported")
-                if value.get("/S") in ("/JavaScript", "/Launch", "/SubmitForm", "/ImportData", "/GoToR", "/GoToE", "/Rendition", "/Sound", "/Movie", "/ResetForm"):
+                if (value.get("/S") in ("/JavaScript", "/Launch", "/SubmitForm", "/ImportData", "/GoToR", "/GoToE", "/Rendition", "/Sound", "/Movie", "/ResetForm")
+                        and not (value.get("/S") == "/JavaScript" and hybrid and id(value) in hybrid.javascript_action_ids)):
                     fail("native_pdf_unsupported")
                 if value.get("/S") == "/URI":
                     # Retain normal links; never execute or fetch them.
@@ -168,6 +189,8 @@ def open_pdf(data):
         return reader
     except WorkerError:
         raise
+    except HybridFormError:
+        fail("native_pdf_unsupported")
     except Exception:
         fail("pdf_invalid")
 
@@ -834,20 +857,28 @@ def normalized_finding(item, inventory):
     return row
 
 
-def response(original_path, candidate_path, changes, toolchain):
+def response(original_path, candidate_path, changes, toolchain, *, preservation_source_path=None, hybrid_summary=None):
     before = open_pdf(original_path.read_bytes())
     after = open_pdf(candidate_path.read_bytes())
     verify_added_link_descriptions(before, after)
-    checks = verify_pdf.compare_pdfs(original_path, candidate_path)
+    checks = verify_pdf.compare_pdfs(preservation_source_path or original_path, candidate_path)
     # Preservation failures cannot be waived by a model or converted to a
     # normal warning. Incomplete semantic inspection remains a visible issue.
     if checks.get("inspection_incomplete") or not checks.get("preservation", {}).get("passed") or checks.get("findings"):
         fail("native_pdf_preservation")
     inventory = enrich_inventory(after, before)
+    if hybrid_summary is not None:
+        inventory["forms"]["hybrid"] = hybrid_summary
     if inventory.get("checks_complete") is not True:
         fail("native_pdf_preservation")
     vera = validate_ua(candidate_path, toolchain)
     findings = [normalized_finding(item, inventory) for item in inventory.get("findings", [])]
+    if hybrid_summary is not None:
+        findings.append({
+            "code": "legacy_form_interaction_review", "severity": "warning", "location": "Fillable form fields",
+            "message": "This PDF uses an older Adobe form format. Its fillable fields and existing form logic have been kept, and available field descriptions were copied into the standard PDF fields. Some PDF viewers use the older form's own screen-reader settings instead.",
+            "suggestion": "Open the downloaded PDF in Adobe Acrobat Reader. Check that each field announces a useful name, checkbox choices work as expected, and entered values remain after saving and reopening."
+        })
     if len(findings) > 300:
         fail("pdf_complexity_limit")
     for page_number, page in enumerate(after.pages, 1):
@@ -896,19 +927,48 @@ def response(original_path, candidate_path, changes, toolchain):
                               "targetStandard": "PDF/UA-1 (ISO 14289-1:2014)", "veraPdf": vera, "conformanceClaim": False}}
 
 
+def prepared_source(source, source_path, directory):
+    """Derive and independently verify the sole hybrid-form exception.
+
+    Model repair requests repeat this derivation from immutable source bytes;
+    a caller's prepared PDF or ledger can never authorize a form change.
+    """
+    original = open_pdf(source)
+    source_path.write_bytes(source)
+    context = inspect_hybrid(original)
+    if context is None:
+        return original, source_path, [], None
+    writer = PdfWriter(clone_from=original)
+    prepare_hybrid(writer)
+    reference_path = directory / "verified-form-source.pdf"
+    reference = write_pdf(writer, reference_path)
+    try:
+        verification = verify_hybrid_preparation(source, reference_path.read_bytes())
+    except HybridVerificationError:
+        fail("native_pdf_preservation")
+    added = sum(field.needs_tooltip for field in context.fields)
+    changes = []
+    if context.has_reader_rights:
+        changes.append({"code": "legacy_reader_rights_removed", "message": "Removed obsolete Adobe Reader usage rights from the repaired copy so it can be edited. The original PDF was kept."})
+    if added:
+        changes.append({"code": "authored_form_labels_added", "message": f"Copied existing descriptions into {added} standard PDF form fields without changing their values or positions."})
+    summary = {"type": "static-xfa-with-acroform", "xfaPreserved": True, "formLogicPreserved": True,
+               "nativeFieldDescriptionsAdded": added, "readerUsageRightsRemoved": context.has_reader_rights,
+               "interactiveViewerReviewRequired": True, "verification": verification}
+    return reference, reference_path, changes, summary
+
+
 def process(mode, request_path, directory, toolchain):
     source_path, output_path = directory / "source.pdf", directory / "output.pdf"
     if mode == "prepare":
         source = request_path.read_bytes()
-        original = open_pdf(source)
-        source_path.write_bytes(source)
-        changes = []
+        original, reference_path, changes, hybrid_summary = prepared_source(source, source_path, directory)
         if original.trailer["/Root"].get("/StructTreeRoot") is None:
             tool = toolchain["openDataLoader"]
             tag_directory = directory / "tagged"
             tag_directory.mkdir()
-            code, _ = run_bounded(java_command(tool, ["--quiet", "--format", "tagged-pdf", "--hybrid", "off", "--threads", "1", "--image-output", "off", "--include-header-footer", "--output-dir", str(tag_directory), str(source_path)], directory), directory=directory, timeout=40)
-            tagged = tag_directory / "source_tagged.pdf"
+            code, _ = run_bounded(java_command(tool, ["--quiet", "--format", "tagged-pdf", "--hybrid", "off", "--threads", "1", "--image-output", "off", "--include-header-footer", "--output-dir", str(tag_directory), str(reference_path)], directory), directory=directory, timeout=40)
+            tagged = tag_directory / f"{reference_path.stem}_tagged.pdf"
             if code != 0 or not tagged.is_file() or tagged.stat().st_size > MAX_PDF:
                 fail("native_pdf_worker_failed")
             candidate = open_pdf(tagged.read_bytes())
@@ -929,18 +989,19 @@ def process(mode, request_path, directory, toolchain):
             fail("native_pdf_invalid_plan")
         source = decode_pdf(data["sourcePdfBase64"])
         candidate_bytes = decode_pdf(data["candidatePdfBase64"])
-        original, candidate = open_pdf(source), open_pdf(candidate_bytes)
-        source_path.write_bytes(source)
+        original, reference_path, _, hybrid_summary = prepared_source(source, source_path, directory)
+        candidate = open_pdf(candidate_bytes)
         baseline = directory / "baseline.pdf"
         baseline.write_bytes(candidate_bytes)
         # Validate the caller-provided prepared file before using its IDs.
-        comparison = verify_pdf.compare_pdfs(source_path, baseline)
+        comparison = verify_pdf.compare_pdfs(reference_path, baseline)
         if comparison.get("inspection_incomplete") or not comparison.get("preservation", {}).get("passed") or comparison.get("findings"):
             fail("native_pdf_preservation")
         changes = apply_plan(original, candidate, data["plan"], output_path)
     else:
         fail("native_pdf_invalid_plan")
-    return response(source_path, output_path, changes, toolchain)
+    return response(source_path, output_path, changes, toolchain,
+                    preservation_source_path=reference_path, hybrid_summary=hybrid_summary)
 
 
 def main():

@@ -10,6 +10,21 @@ import {
 } from "@/lib/job-diagnostics";
 
 describe("safe saved job diagnostics", () => {
+  it("explains unsupported PDF features without rejecting every fillable or XFA form", () => {
+    const diagnostic = createJobDiagnostic({
+      stage: "native_pdf_prepare",
+      code: "native_pdf_unsupported",
+      message: "private form contents",
+      workerOutput: "private script or path",
+    });
+    const message = describeJobDiagnostic(diagnostic);
+    expect(message).toContain("some advanced forms or scripts");
+    expect(message).toContain("digital signatures");
+    expect(message).toContain("The original file has been kept");
+    expect(message).not.toMatch(/without scripts|XFA forms|private/);
+    expect(JSON.stringify(diagnostic)).not.toContain("private");
+  });
+
   it("explains native PDF preservation failures without leaking worker output or implying HTML conversion", () => {
     const diagnostic = createJobDiagnostic({
       stage: "native_pdf_repair",

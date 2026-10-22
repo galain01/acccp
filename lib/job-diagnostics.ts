@@ -197,7 +197,7 @@ const EXPLANATIONS: Record<DiagnosticCode, string> = {
   native_pdf_configuration:
     "The PDF repair service is not configured. Contact the app administrator.",
   native_pdf_unsupported:
-    "This PDF contains a feature the repair service cannot safely change. Use an unsigned, unprotected PDF without scripts, embedded files or XFA forms. The original file has been kept.",
+    "This PDF contains a feature the repair service cannot safely change. Password protection, digital signatures, embedded files, and some advanced forms or scripts are not supported. The original file has been kept.",
   native_pdf_preservation:
     "The app could not verify that the proposed repair preserved the original pages and content. No repaired PDF was saved. Try exporting a fresh PDF from the original document.",
   native_pdf_invalid_plan:

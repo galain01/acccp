@@ -56,6 +56,33 @@ and completeness flags. No tag/text inventory is silently truncated. The
 auditor must cover every page/tag and assess excluded text. Forms remain
 interactive and are inventoried; this version does not edit form behavior.
 
+Preparation also accepts a bounded subset of static hybrid XFA/AcroForm forms.
+The original must have a complete, unambiguous indexed mapping of its named XFA
+fields to supported native text and checkbox controls. Dynamic layouts,
+external resources and unknown active features are rejected. Only recognized
+Adobe viewer bootstrap programs in their expected document-script positions
+and recognized XFA checkbox handlers are accepted; the worker preserves their
+bytes and never executes them.
+
+For this subset, preparation may remove a verified `UR3` Reader usage-rights
+signature from a permissions dictionary containing no other permissions.
+It never removes a user signature. It may also copy an existing authored XFA
+description exactly into a missing native field `TU`; an existing `TU`, even
+empty, remains unchanged. The XFA packets, speech settings, data, scripts,
+bindings, signature flags, field values, widgets and appearances remain intact.
+An independent source-bound comparison permits only those exact changes before
+the standard preservation checks. `sourceSha256` continues to identify the
+immutable uploaded PDF, and the preparation changes appear in `changes`.
+`inventory.forms.hybrid` identifies this path as `static-xfa-with-acroform`
+and reports preserved XFA/logic, native label additions, Reader-rights removal
+and the need for interactive viewer review. This evidence reaches both model
+stages alongside the native field inventory.
+
+Preserved form structure and added native labels do not prove Acrobat's XFA
+field announcements or checkbox behavior. Disabled XFA speech remains disabled
+and produces a review warning. These warnings and all remaining validator
+findings stay visible; they cannot be dismissed by the semantic auditor.
+
 The repair request is exactly:
 
 ```json
@@ -131,7 +158,9 @@ not an automatic defect or a mandatory faculty review item.
 
 Native inspection must be complete before any candidate is returned. Known
 machine defects are returned as findings; incomplete evidence is a controlled
-failure. The worker does not run generic OCR, font substitution or form editing.
+failure. The worker does not run generic OCR, font substitution or arbitrary
+form editing. Hybrid-form preparation is restricted to the verified changes
+described above.
 
 Failures return `{"error":{"code":"controlled_code"}}`, never native tool
 stderr, source text or filesystem paths. HTTP 400 means unsupported input or
