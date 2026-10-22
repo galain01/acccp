@@ -42,20 +42,26 @@ never executed by the worker.
 Only a structurally verified Adobe Reader usage-rights signature (`UR3`) can be
 removed from the generated copy, because rewriting invalidates those legacy
 rights. User signatures and other permissions remain unsupported. The immutable
-source retains its original bytes. The generated copy keeps the XFA packets,
-data, bindings, speech settings, signature flags, native fields, values,
-appearances and page content. If a native field has no `TU` property, the worker
-can copy its existing authored XFA description exactly into that native label;
-existing labels, including blank labels, are preserved. These are source-bound
-preparation changes, not model-editable operations or form flattening.
+source retains its original bytes. The generated copy keeps XFA data, bindings,
+recognized scripts, signature flags, native fields, values, appearances and
+page content. If a native field has no `TU` property, the worker can copy its
+existing authored XFA description into that native label. It can also add a
+verified source group name to a supported segment label in both the native
+label and XFA speech text, and enable a supported existing direct speech prompt.
+Other authored labels and unsupported speech settings stay unchanged. Required
+validation flags, form actions and controls are never changed by these repairs.
+These are source-bound preparation changes, not model-editable operations or
+form flattening.
 
 An independent comparison verifies this narrowly approved preparation before
 the ordinary page/content/pixel comparison runs. The original source hash
-remains the request identity. Machine findings and form interaction warnings
-remain visible. In particular, an XFA field with speech disabled keeps that
-setting: adding a native label does not prove Acrobat will announce it. Users
-must check field announcements and checkbox choices in Acrobat before sharing
-an affected form. Support for this subset does not establish PDF/UA conformance.
+remains the request identity. The reopened inventory exposes actual field
+labels and speech settings alongside exact old/new metadata changes; the audit
+must not repeat an original defect after that evidence establishes its repair.
+Machine findings and unresolved interaction warnings remain visible. Useful
+labels and enabled speech prompts do not prove that Acrobat announced them or
+operated a checkbox correctly. Those behaviors require real viewer checks.
+Support for this subset does not establish PDF/UA conformance.
 
 ## Running locally
 

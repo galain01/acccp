@@ -68,10 +68,16 @@ def prepared(source, mutate=None):
     writer = PdfWriter(clone_from=PdfReader(io.BytesIO(source), strict=True))
     writer.root_object.pop(NameObject("/Perms"),None)
     fields = writer.root_object["/AcroForm"]["/Fields"][0].get_object()["/Kids"]
+    packet = writer.root_object["/AcroForm"]["/XFA"][1].get_object()
+    xml = packet.get_data()
     for field, label in zip(fields, (" Enter your name. ","Second name")):
         field = field.get_object()
+        if "/TU" not in field or field["/TU"] == label:
+            old = ('<speak disable="1">' + label + '</speak>').encode()
+            xml = xml.replace(old, old.replace(b'disable="1"', b'disable="0"'))
         if "/TU" not in field:
             field[NameObject("/TU")] = TextStringObject(label)
+    packet.set_data(xml)
     if mutate:
         mutate(writer)
     return saved(writer)
@@ -119,11 +125,11 @@ class HybridFormVerificationTests(unittest.TestCase):
             xfa[3].get_object().set_data(b'<datasets><data><name>Changed</name></data></datasets>')
         self.assert_refused(fixture(),mutate,"hybrid_verification_unexpected_change")
 
-    def test_enabling_disabled_speech_is_not_an_allowed_delta(self):
+    def test_speech_priority_change_is_not_an_allowed_delta(self):
         def mutate(w):
             stream=w.root_object["/AcroForm"]["/XFA"][1].get_object()
-            stream.set_data(stream.get_data().replace(b'disable="1"',b'disable="0"'))
-        self.assert_refused(fixture(),mutate,"hybrid_verification_unexpected_change")
+            stream.set_data(stream.get_data().replace(b'disable="0"',b'disable="0" priority="name"'))
+        self.assert_refused(fixture(),mutate,"hybrid_verification_xfa_metadata")
 
     def test_field_values_flags_geometry_and_appearances_are_protected(self):
         for key,value in [("/V",TextStringObject("Injected")),("/Ff",NumberObject(1)),

@@ -2,9 +2,10 @@
 
 Repair discovery and its ledger are not evidence. This module reads the original
 again, derives each permitted label from the original XFA template, and compares
-the reopened files after undoing only verified /TU additions and UR3 removal.
-XFA packet bytes, scripts, values, widget ownership and all other native objects
-must remain identical. It does not validate a digital signature or certify PDF/UA.
+the reopened files after undoing verified names, speech metadata and UR3 removal.
+Only exact parser-bounded speak text/disable changes are accepted within XFA.
+Scripts, values, widget ownership and all other objects must remain identical.
+It does not validate a digital signature or certify PDF/UA.
 """
 from __future__ import annotations
 
@@ -14,6 +15,8 @@ from pathlib import Path
 import re
 import sys
 import xml.etree.ElementTree as ET
+from xml.parsers import expat
+from xml.sax.saxutils import escape
 
 from pypdf import PdfReader
 from pypdf.generic import (ArrayObject, BooleanObject, ByteStringObject, DictionaryObject,
@@ -126,6 +129,10 @@ def native_fields(reader):
             return
         require(path not in result and state.get("/FT") in ("/Tx", "/Btn"),
                 "hybrid_verification_field_type_or_duplicate")
+        flags = state.get("/Ff", 0)
+        require(isinstance(flags, int) and not isinstance(flags, (bool, BooleanObject))
+                and 0 <= flags <= 0xffffffff and (state["/FT"] != "/Btn" or not flags & ((1 << 15) | (1 << 16))),
+                "hybrid_verification_field_flags")
         keys = []
         for widget in widgets:
             require(id(widget) in pages and id(widget) not in owned, "hybrid_verification_widget_owner")
@@ -171,15 +178,23 @@ def original_labels(reader):
     root = ET.fromstring(text)
     require(root.tag.startswith("{http://www.xfa.org/schema/xfa-template/")
             and root.tag.endswith("}template"), "hybrid_verification_template_namespace")
+    namespace = root.tag.rsplit("}", 1)[0] + "}"
+    evidence_elements = {"subform", "field", "draw", "assist", "speak", "ui", "textEdit", "checkButton", "comb",
+                         "traversal", "traverse", "bind", "event", "script"}
     labels, seen = {}, 0
 
     def local(element):
         return element.tag.rsplit("}", 1)[-1]
 
-    def walk(element, path, depth):
+    def walk(element, path, depth, parent=None, foreign_ancestor=False):
         nonlocal seen
         seen += 1
         require(seen <= MAX_NODES and depth <= 64, "hybrid_verification_xml_complexity")
+        require(local(element) not in evidence_elements or (not foreign_ancestor and element.tag == namespace + local(element)),
+                "hybrid_verification_evidence_namespace")
+        if local(element) in {"field", "subform"}:
+            require(parent is not None and parent.tag in {namespace + "template", namespace + "subform"},
+                    "hybrid_verification_field_position")
         if local(element) == "field":
             require(path and path not in labels, "hybrid_verification_xfa_field_duplicate")
             assist = [c for c in element if local(c) == "assist"]
@@ -209,11 +224,189 @@ def original_labels(reader):
                 occurrence = counters.get(key, 0)
                 counters[key] = occurrence + 1
                 child_path = (*path, f"{name}[{occurrence}]")
-            walk(child, child_path, depth + 1)
+            walk(child, child_path, depth + 1, element, foreign_ancestor or element.tag != namespace + local(element))
 
     walk(root, (), 0)
     require(0 < len(labels) <= MAX_FIELDS, "hybrid_verification_xfa_field_count")
     return labels
+
+
+def accessibility_expectations(reader, fields, labels):
+    """Independently derive allowable names and exact XML metadata deltas.
+
+    This does not import the repair implementation or accept a change ledger.
+    After verifying exact expected packet bytes, the caller restores the source
+    bytes in a fresh candidate reader for the whole-object-graph comparison.
+    """
+    xfa = reader.root_object["/AcroForm"]["/XFA"]
+    source = next(v.resolved(xfa[i + 1]).get_data() for i in range(0, len(xfa), 2) if str(xfa[i]) == "template")
+    root = ET.fromstring(source.decode("utf-8-sig"))
+    elements, parents = {}, {}
+
+    def local(node):
+        return node.tag.rsplit("}", 1)[-1]
+
+    def visit(node, path):
+        if local(node) == "field":
+            elements[path] = node
+        counts = {}
+        for child in node:
+            parents[id(child)] = node
+            child_path = path
+            key = (local(child), child.get("name"))
+            if key[0] in {"field", "subform"} and key[1]:
+                number = counts.get(key, 0)
+                counts[key] = number + 1
+                child_path += (f"{key[1]}[{number}]",)
+            visit(child, child_path)
+    visit(root, ())
+    require(set(elements) == set(fields) == set(labels), "hybrid_verification_metadata_coverage")
+    supported, speech = {}, {}
+    for path, element in elements.items():
+        nodes = [s for a in element if local(a) == "assist" for s in a if local(s) == "speak"]
+        node = nodes[0] if len(nodes) == 1 else None
+        supported[path] = bool(node is not None and labels[path] is not None
+            and set(node.attrib) <= {"disable", "priority"}
+            and node.get("disable", "0") in {"0", "1"} and node.get("priority", "custom") == "custom"
+            and ("/TU" not in fields[path]["node"] or fields[path]["node"].get("/TU") == labels[path]))
+        speech[path] = node
+
+    # Independent lexical positions. Expat resolves character references for
+    # name matching; the accepted output must retain the original raw bytes.
+    spans, stack = {}, []
+    parser = expat.ParserCreate(namespace_separator="}")
+
+    def start(name, attributes):
+        kind = name.rsplit("}", 1)[-1]
+        path = stack[-1]["path"] if stack else ()
+        if kind in {"field", "subform"} and attributes.get("name"):
+            key = (kind, attributes["name"])
+            index = stack[-1]["counts"].get(key, 0) if stack else 0
+            if stack:
+                stack[-1]["counts"][key] = index + 1
+            path += (f"{key[1]}[{index}]",)
+        stack.append({"kind": kind, "path": path, "counts": {}, "start": parser.CurrentByteIndex,
+                      "direct": kind == "speak" and len(stack) >= 2 and stack[-1]["kind"] == "assist" and stack[-2]["kind"] == "field"})
+
+    def end(name):
+        item = stack.pop()
+        if not item["direct"]:
+            return
+        opening = re.match(rb'<[A-Za-z_][A-Za-z0-9_.:-]*\b[^<>]*>', source[item["start"]:])
+        closing = re.match(rb'</[A-Za-z_][A-Za-z0-9_.:-]*\s*>', source[parser.CurrentByteIndex:])
+        if opening and closing:
+            left, right = item["start"] + opening.end(), parser.CurrentByteIndex
+            if b"<" not in source[left:right]:
+                spans[item["path"]] = (item["start"], left, right)
+    parser.StartElementHandler, parser.EndElementHandler = start, end
+    parser.StartDoctypeDeclHandler = lambda *args: require(False, "hybrid_verification_xml_declaration")
+    parser.Parse(source, True)
+
+    def cell_count(path, count):
+        node = elements[path]
+        found = [c for u in node if local(u) == "ui" for e in u if local(e) == "textEdit" for c in e if local(c) == "comb"]
+        return (supported[path] and fields[path]["type"] == "/Tx"
+            and fields[path]["node"].get("/MaxLen") == count and len(found) == 1
+            and found[0].get("numberOfCells") == str(count))
+
+    def next_path(path):
+        node = elements[path]
+        parent = parents[id(node)]
+        names, counts = {}, {}
+        for child in parent:
+            name = child.get("name")
+            if name:
+                occurrence = counts.get(name, 0)
+                counts[name] = occurrence + 1
+                names[f"{name}[{occurrence}]"] = child
+        if any(count > 1 for count in counts.values()):
+            return None
+        visited = set()
+        for _ in range(5):
+            if id(node) in visited:
+                return None
+            visited.add(id(node))
+            traversal = [t for t in node if local(t) == "traversal"]
+            if len(traversal) != 1 or len(traversal[0]) != 1:
+                return None
+            edge = traversal[0][0]
+            if local(edge) != "traverse" or set(edge.attrib) - {"ref", "operation"} or edge.get("operation", "next") != "next":
+                return None
+            node = names.get(edge.get("ref"))
+            if node is None:
+                return None
+            if local(node) == "field":
+                return next((key for key, value in elements.items() if value is node), None)
+            if local(node) != "draw":
+                return None
+        return None
+
+    def same_row(a, b):
+        left, right = fields[a], fields[b]
+        try:
+            ar, br = list(map(float, left["node"]["/Rect"])), list(map(float, right["node"]["/Rect"]))
+            return (len(ar) == len(br) == 4 and all(math.isfinite(x) for x in ar + br)
+                and len(left["widgets"]) == len(right["widgets"]) == 1
+                and left["widgets"][0][0] == right["widgets"][0][0]
+                and abs(ar[1] - br[1]) <= .01 and abs(ar[3] - br[3]) <= .01
+                and ar[2] > ar[0] and br[2] > br[0] and 0 <= br[0] - ar[2] <= 36)
+        except (ValueError, TypeError, KeyError):
+            return False
+
+    names = {}
+    for path, label in labels.items():
+        match = re.search(r"(?:^|[.!?]\s+)([^.!?\r\n]{1,120})\.\s*First ([1-9][0-9]?) digits\.\s*\Z", label or "")
+        if not match or not cell_count(path, int(match.group(2))):
+            continue
+        prefix, current, proposals, visited = match.group(1).strip() + ". ", path, [], {path}
+        for step in range(2):
+            following = next_path(current)
+            if following is None or following in visited:
+                break
+            visited.add(following)
+            segment = re.fullmatch(r"(Middle|Last) ([1-9][0-9]?) digits\.\s*", labels[following] or "")
+            if (segment is None or not cell_count(following, int(segment.group(2)))
+                    or not same_row(current, following) or (step == 1 and segment.group(1) != "Last")):
+                break
+            proposals.append((following, prefix + labels[following]))
+            if segment.group(1) == "Last":
+                for key, text in proposals:
+                    require(key not in names or names[key] == text, "hybrid_verification_ambiguous_segment")
+                    names[key] = text
+                break
+            current = following
+
+    edits, enabled, actual_names = [], [], {}
+    for path, span in spans.items():
+        if not supported.get(path):
+            continue
+        start, middle, end = span
+        if speech[path].get("disable", "0") == "1":
+            opening = source[start:middle]
+            # Parse complete attribute pairs. Namespace declarations are not
+            # in ET.attrib, and their quoted values may contain fake tokens.
+            header = re.match(rb'<[A-Za-z_][A-Za-z0-9_.:-]*', opening)
+            position, token = header.end(), None
+            while position < len(opening):
+                pair = re.match(rb'\s+([A-Za-z_][A-Za-z0-9_.:-]*)\s*=\s*("[^"]*"|\'[^\']*\')', opening[position:], re.S)
+                if pair is None:
+                    break
+                if pair.group(1) == b"disable" and pair.group(2)[1:-1] == b"1":
+                    token = (position + pair.start(2) + 1, position + pair.end(2) - 1)
+                position += pair.end()
+            if token is None or opening[position:].strip() != b">":
+                continue
+            value = opening[:token[0]] + b"0" + opening[token[1]:]
+            edits.append((start, middle, value))
+            enabled.append(".".join(path))
+        if path in names:
+            prefix = names[path][:-len(labels[path])]
+            edits.append((middle, end, escape(prefix).encode() + source[middle:end]))
+            actual_names[path] = names[path]
+    expected = source
+    for left, right, value in sorted(edits, reverse=True):
+        expected = expected[:left] + value + expected[right:]
+    return source, expected, actual_names, enabled
 
 
 def removable_rights(reader):
@@ -330,17 +523,31 @@ def verify_hybrid_preparation(source_bytes, candidate_bytes):
         old, new = native_fields(before), native_fields(after)
         labels = original_labels(before)
         require(set(old) == set(new) == set(labels), "hybrid_verification_field_coverage")
-        changes = []
+        original_template, expected_template, qualified, enabled = accessibility_expectations(before, old, labels)
+        after_xfa = after.root_object["/AcroForm"]["/XFA"]
+        require(isinstance(after_xfa, list) and len(after_xfa) % 2 == 0, "hybrid_verification_xfa_packets")
+        candidates = [v.resolved(after_xfa[i + 1]) for i in range(0, len(after_xfa), 2) if str(after_xfa[i]) == "template"]
+        require(len(candidates) == 1 and isinstance(candidates[0], StreamObject)
+                and candidates[0].get_data() == expected_template, "hybrid_verification_xfa_metadata")
+        # Restore only the proven packet bytes for the exact graph comparison.
+        candidates[0].set_data(original_template)
+        changes, name_changes = [], []
         for path, record in old.items():
             candidate = new[path]
             require(record["widgets"] == candidate["widgets"] and record["type"] == candidate["type"],
                     "hybrid_verification_widget_mapping")
             left, right = record["node"], candidate["node"]
-            if "/TU" not in left and labels[path] is not None:
-                require(isinstance(right.get("/TU"), TextStringObject) and str(right["/TU"]) == labels[path],
+            if path in qualified or ("/TU" not in left and labels[path] is not None):
+                expected_label = qualified.get(path, labels[path])
+                require(isinstance(right.get("/TU"), TextStringObject) and str(right["/TU"]) == expected_label,
                         "hybrid_verification_authored_label")
-                changes.append(".".join(path))
-                right.pop(NameObject("/TU"))
+                if path in qualified:
+                    name_changes.append({"fieldName": ".".join(path), "oldText": labels[path], "newText": expected_label})
+                if "/TU" not in left:
+                    changes.append(".".join(path))
+                    right.pop(NameObject("/TU"))
+                else:
+                    right[NameObject("/TU")] = left["/TU"]
         removed = removable_rights(before)
         require("/Perms" not in after.root_object, "hybrid_verification_rights_retained")
         if removed:
@@ -351,7 +558,9 @@ def verify_hybrid_preparation(source_bytes, candidate_bytes):
         return {"passed": True, "sourceSha256": v.digest(source_bytes), "candidateSha256": v.digest(candidate_bytes),
                 "fieldCount": len(old), "widgetCount": sum(len(f["widgets"]) for f in old.values()),
                 "addedTooltipFields": changes, "removedReaderUsageRights": removed,
-                "xfaPacketsScriptsBindingsAndDataUnchanged": True,
+                "accessibleNameChanges": name_changes, "speechPromptsEnabled": enabled,
+                "xfaPacketsScriptsBindingsAndDataUnchanged": original_template == expected_template,
+                "xfaScriptsBindingsAndDataUnchanged": True, "verifiedAccessibilityMetadataOnly": True,
                 "otherReachableObjectsUnchanged": True, "originalPagesAndWidgetsRenderIdentically": True,
                 "renderedPages": candidate_pixels,
                 "renderingScope": "Static pages and native AcroForm widgets; XFA execution is not exercised.",

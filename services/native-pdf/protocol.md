@@ -54,7 +54,8 @@ attributes are present when saved in the actual PDF. `pageNumber` may be null
 on document/grouping tags. `page_content` contains every page's excluded text
 and completeness flags. No tag/text inventory is silently truncated. The
 auditor must cover every page/tag and assess excluded text. Forms remain
-interactive and are inventoried; this version does not edit form behavior.
+interactive and are inventoried; this version preserves their values,
+validation flags and action logic.
 
 Preparation also accepts a bounded subset of static hybrid XFA/AcroForm forms.
 The original must have a complete, unambiguous indexed mapping of its named XFA
@@ -67,21 +68,41 @@ bytes and never executes them.
 For this subset, preparation may remove a verified `UR3` Reader usage-rights
 signature from a permissions dictionary containing no other permissions.
 It never removes a user signature. It may also copy an existing authored XFA
-description exactly into a missing native field `TU`; an existing `TU`, even
-empty, remains unchanged. The XFA packets, speech settings, data, scripts,
-bindings, signature flags, field values, widgets and appearances remain intact.
-An independent source-bound comparison permits only those exact changes before
+description into a missing native field `TU`. Supported segmented entries may
+gain a source-proven group name in both native and XFA descriptions; other
+authored labels remain unchanged. Supported existing direct field speech
+prompts may be enabled. These exact accessibility-metadata changes are derived
+from the source, not supplied as model operations. XFA data, scripts, bindings,
+signature flags, field values, validation flags, widgets and appearances remain
+intact. An independent source-bound comparison permits only those exact changes before
 the standard preservation checks. `sourceSha256` continues to identify the
 immutable uploaded PDF, and the preparation changes appear in `changes`.
 `inventory.forms.hybrid` identifies this path as `static-xfa-with-acroform`
-and reports preserved XFA/logic, native label additions, Reader-rights removal
-and the need for interactive viewer review. This evidence reaches both model
-stages alongside the native field inventory.
+and reports preserved form logic, native label additions, verified accessible
+name/speech changes, Reader-rights removal and the need for interactive viewer
+review. This evidence reaches both model stages alongside the current field
+labels and speech settings. A metadata repair must not be represented as
+byte-for-byte preservation of the changed XFA template.
+
+`inventory.forms.fields` contains terminal controls only. Each row retains
+`name`, `type`, `label`, `required` and `value`, and provides a stable `fieldId`,
+sorted `pageNumbers` and `widgets` with `widgetId`, `pageNumber` and `rect`.
+Its `speech` object contains `supported`, `text`, `disabled`, `priority` and
+`source:"xfa-assist"`. Unsupported or non-XFA speech uses null settings, rather
+than falsely indicating enabled speech. Preparation verification includes
+`accessibleNameChanges` (`fieldName`, `oldText`, `newText`),
+`speechPromptsEnabled`; the auditor compares these records with the current
+`fields[].speech` metadata rather than treating a change count as proof of use.
 
 Preserved form structure and added native labels do not prove Acrobat's XFA
-field announcements or checkbox behavior. Disabled XFA speech remains disabled
-and produces a review warning. These warnings and all remaining validator
-findings stay visible; they cannot be dismissed by the semantic auditor.
+field announcements or checkbox behavior. Unsupported or unresolved speech
+settings and specific unverified interaction requirements remain review items.
+Do not repeat a repaired short-label or disabled-speech finding. Actual
+validator failures and remaining interaction warnings cannot be dismissed by
+the semantic auditor. Required flags stay unchanged: a clear source requirement
+in the accessible label is distinct from adding validation. Missing signature,
+date or cross-out widgets alone do not prove that no accessible viewer workflow
+exists, and no model operation creates those controls.
 
 The repair request is exactly:
 

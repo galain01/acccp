@@ -68,6 +68,14 @@ class HybridWorkerTests(unittest.TestCase):
         hybrid = prepared["inventory"]["forms"]["hybrid"]
         self.assertTrue(hybrid["verification"]["passed"])
         self.assertEqual(hybrid["nativeFieldDescriptionsAdded"], 1)
+        self.assertEqual(hybrid["speechPromptsEnabled"], ["workshop[0].name[0]"])
+        self.assertTrue(hybrid["verifiedMetadataOnly"])
+        self.assertNotIn("xfaPreserved", hybrid)
+        form = prepared["inventory"]["forms"]
+        self.assertEqual(form["field_count"], 1)
+        self.assertEqual(len(form["fields"]), 1)
+        self.assertFalse(form["fields"][0]["speech"]["disabled"])
+        self.assertEqual(form["fields"][0]["pageNumbers"], [1])
         self.assertTrue(prepared["machineChecks"]["pixelsIdentical"])
         self.assertFalse(prepared["machineChecks"]["conformanceClaim"])
         self.assertIn("legacy_form_interaction_review", [item["code"] for item in prepared["findings"]])
@@ -77,8 +85,19 @@ class HybridWorkerTests(unittest.TestCase):
         self.assertTrue(repaired["inventory"]["forms"]["hybrid"]["verification"]["passed"])
         source_packets = PdfReader(io.BytesIO(self.source)).trailer["/Root"]["/AcroForm"]["/XFA"]
         result_packets = PdfReader(io.BytesIO(base64.b64decode(repaired["pdfBase64"]))).trailer["/Root"]["/AcroForm"]["/XFA"]
-        self.assertEqual([source_packets[i].get_object().get_data() for i in range(1, len(source_packets), 2)],
-                         [result_packets[i].get_object().get_data() for i in range(1, len(result_packets), 2)])
+        for index in range(1, len(source_packets), 2):
+            expected = source_packets[index].get_object().get_data()
+            if str(source_packets[index - 1]) == "template":
+                expected = expected.replace(b'<speak disable="1">', b'<speak disable="0">')
+            self.assertEqual(expected, result_packets[index].get_object().get_data())
+
+    def test_disabled_speech_cannot_be_reintroduced_by_candidate(self):
+        prepared = self.prepared()
+        writer = PdfWriter(clone_from=PdfReader(io.BytesIO(base64.b64decode(prepared["pdfBase64"]))))
+        packet = writer.root_object["/AcroForm"]["/XFA"][3].get_object()
+        packet.set_data(packet.get_data().replace(b'disable="0"', b'disable="1"'))
+        with self.assertRaisesRegex(worker.WorkerError, "native_pdf_preservation"):
+            self.repair(prepared, result_bytes(writer))
 
     def test_changed_native_tooltip_rejected_even_with_matching_candidate_hash(self):
         prepared = self.prepared()

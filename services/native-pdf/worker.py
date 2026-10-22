@@ -30,6 +30,7 @@ import verify_pdf
 from pdf_safety import reject_signed_pdf, resolved
 from hybrid_forms import HybridFormError, inspect_hybrid, prepare_hybrid
 from hybrid_form_verification import HybridVerificationError, verify_hybrid_preparation
+from native_form_inventory import NativeFormInventoryError, native_form_inventory
 from native_structure_repairs import (NoteIdError, note_id_snapshot, repair_note_ids,
     verify_note_ids, verify_authored_ids, authored_id_bindings, verify_authored_id_bindings)
 from bounded_semantic_structure import discover_candidates, apply_operations, SemanticStructureError
@@ -373,17 +374,11 @@ def enrich_inventory(reader, original):
             "tableHeader": simple_cell(tag, by_id),
         }
         tag["snapshot"] = snapshot(tag)
-    fields = []
-    for name, field in (reader.get_fields() or {}).items():
-        if len(fields) >= 200:
-            fail("pdf_complexity_limit")
-        row = {"name": str(name), "type": str(field.get("/FT", "")).lstrip("/"),
-               "label": str(field.get("/TU", "")), "required": bool(int(field.get("/Ff", 0)) & 2),
-               "value": str(field.get("/V", ""))}
-        if any(len(value) > 8000 for value in row.values() if isinstance(value, str)):
-            fail("pdf_complexity_limit")
-        fields.append(row)
-    inventory["forms"] = {**verify_pdf.form_inventory(reader), "fields": fields}
+    try:
+        controls = native_form_inventory(reader)
+    except NativeFormInventoryError as error:
+        fail(str(error) if str(error) in ERRORS else "native_pdf_preservation")
+    inventory["forms"] = {**verify_pdf.form_inventory(reader), **controls}
     try:
         inventory["structureCandidates"] = discover_candidates(reader)
     except SemanticStructureError as error:
@@ -939,7 +934,7 @@ def response(original_path, candidate_path, changes, toolchain, *, preservation_
     if hybrid_summary is not None:
         findings.append({
             "code": "legacy_form_interaction_review", "severity": "warning", "location": "Fillable form fields",
-            "message": "This PDF uses an older Adobe form format. Its fillable fields and existing form logic have been kept, and available field descriptions were copied into the standard PDF fields. Some PDF viewers use the older form's own screen-reader settings instead.",
+            "message": "This PDF uses an older Adobe form format. Its fields and form logic have been kept. Supported field descriptions and announcement settings were repaired where the source provided enough information; actual operation still needs a check in a PDF reader.",
             "suggestion": "Open the downloaded PDF in Adobe Acrobat Reader. Check that each field announces a useful name, checkbox choices work as expected, and entered values remain after saving and reopening."
         })
     if len(findings) > 300:
@@ -1015,8 +1010,16 @@ def prepared_source(source, source_path, directory):
         changes.append({"code": "legacy_reader_rights_removed", "message": "Removed obsolete Adobe Reader usage rights from the repaired copy so it can be edited. The original PDF was kept."})
     if added:
         changes.append({"code": "authored_form_labels_added", "message": f"Copied existing descriptions into {added} standard PDF form fields without changing their values or positions."})
-    summary = {"type": "static-xfa-with-acroform", "xfaPreserved": True, "formLogicPreserved": True,
+    name_changes = verification.get("accessibleNameChanges", [])
+    speech_enabled = verification.get("speechPromptsEnabled", [])
+    if name_changes:
+        changes.append({"code": "form_label_context_added", "message": f"Added the source's group name to {len(name_changes)} number-entry field descriptions so each part identifies what number to enter."})
+    if speech_enabled:
+        changes.append({"code": "form_speech_enabled", "message": f"Enabled the existing spoken descriptions for {len(speech_enabled)} form fields."})
+    summary = {"type": "static-xfa-with-acroform", "xfaStructurePreserved": True, "formLogicPreserved": True,
                "nativeFieldDescriptionsAdded": added, "readerUsageRightsRemoved": context.has_reader_rights,
+               "accessibleNameChanges": name_changes, "speechPromptsEnabled": speech_enabled,
+               "verifiedMetadataOnly": True,
                "interactiveViewerReviewRequired": True, "verification": verification}
     return reference, reference_path, changes, summary
 

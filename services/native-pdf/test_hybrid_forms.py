@@ -70,7 +70,7 @@ class HybridFormsTests(unittest.TestCase):
             hybrid.inspect_hybrid(writer)
         self.assertIn(str(error.exception), {"native_pdf_unsupported", "pdf_complexity_limit"})
 
-    def test_prepare_copies_exact_authored_label_and_keeps_xfa_and_sigflags(self):
+    def test_prepare_copies_exact_authored_label_and_enables_only_speech_metadata(self):
         writer, field, form = fixture()
         reader_rights(writer)
         form[NameObject("/SigFlags")] = NumberObject(2)
@@ -80,11 +80,14 @@ class HybridFormsTests(unittest.TestCase):
         self.assertEqual(field["/TU"], "  Instructor name  ")
         self.assertNotIn("/Perms", writer.root_object)
         self.assertEqual(form["/SigFlags"], 2)
-        self.assertEqual(xfa_before, [form["/XFA"][i].get_object().get_data() for i in (1, 3)])
+        self.assertEqual(xfa_before[0], form["/XFA"][1].get_object().get_data())
+        self.assertEqual(xfa_before[1].replace(b'disable="1"', b'disable="0"'), form["/XFA"][3].get_object().get_data())
+        self.assertTrue(context.fields[0].needs_speech_enable)
         output = reopened(writer)
         second = hybrid.inspect_hybrid(output)
         self.assertFalse(second.has_reader_rights)
         self.assertFalse(second.fields[0].needs_tooltip)
+        self.assertFalse(second.fields[0].needs_speech_enable)
 
     def test_prepare_is_idempotent_and_never_changes_existing_blank_label(self):
         writer, field, _ = fixture()
@@ -225,7 +228,7 @@ class HybridFormsTests(unittest.TestCase):
         writer, _, form = fixture(checkbox=True, template_extra=extra)
         before = form["/XFA"][3].get_object().get_data()
         hybrid.prepare_hybrid(writer)
-        self.assertEqual(before, form["/XFA"][3].get_object().get_data())
+        self.assertEqual(before.replace(b'disable="1"', b'disable="0"'), form["/XFA"][3].get_object().get_data())
         writer, _, _ = fixture(template_extra='<event activity="enter"><script contentType="application/x-javascript">/* legacy comment */\n// another comment</script></event>')
         self.assertIsNotNone(hybrid.inspect_hybrid(writer))
 

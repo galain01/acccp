@@ -251,9 +251,19 @@ def main():
         saved_hybrid = PdfReader(io.BytesIO(base64.b64decode(hybrid_repaired["pdfBase64"], validate=True)))
         require("/Perms" not in saved_hybrid.trailer["/Root"], "Obsolete Reader rights remained in repaired copy")
         require(saved_hybrid.get_fields()["workshop[0].name[0]"]["/TU"] == "Fictional workshop name", "Authored form label was not saved")
+        require(hybrid_info["speechPromptsEnabled"] == ["workshop[0].name[0]"]
+                and hybrid_info["verifiedMetadataOnly"] is True,
+                "Supported form speech metadata was not repaired and verified")
+        require(hybrid_repaired["inventory"]["forms"]["field_count"] == 1
+                and hybrid_repaired["inventory"]["forms"]["fields"][0]["speech"]["disabled"] is False,
+                "Current terminal field inventory did not include repaired speech")
         original_packets, saved_packets = (pdf.trailer["/Root"]["/AcroForm"]["/XFA"] for pdf in (original_hybrid, saved_hybrid))
-        require(all(original_packets[i].get_object().get_data() == saved_packets[i].get_object().get_data()
-                    for i in range(1, len(original_packets), 2)), "Hybrid XFA packets changed")
+        for index in range(1, len(original_packets), 2):
+            expected = original_packets[index].get_object().get_data()
+            if str(original_packets[index - 1]) == "template":
+                expected = expected.replace(b'<speak disable="1">', b'<speak disable="0">')
+            require(expected == saved_packets[index].get_object().get_data(),
+                    "Hybrid XFA changed beyond the exact authorized speech attribute")
         # Counts, tool versions and success states are safe build diagnostics.
         print("Native PDF build smoke passed: authenticated HTTP, OpenDataLoader tagging, "
               "native repair, static hybrid form preservation, veraPDF validation, identical page pixels and preserved content.")

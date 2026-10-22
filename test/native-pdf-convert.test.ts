@@ -421,6 +421,17 @@ describe("native PDF model contracts", () => {
       },
       { operations: [{ type: "set_role", tagId: "tag-2", role: "H1" }] },
       {
+        operations: [
+          { type: "set_form_label", tagId: "tag-1", label: "Invented label" },
+        ],
+      },
+      {
+        operations: [
+          { type: "set_form_required", tagId: "tag-1", required: true },
+        ],
+      },
+      { operations: [{ type: "enable_xfa_speech", tagId: "tag-1" }] },
+      {
         operations: Array.from({ length: 2 }, () => ({
           type: "set_role",
           tagId: "tag-1",
@@ -1170,7 +1181,7 @@ describe("native PDF orchestration", () => {
       fields: [{ name: "Applicant name", alternativeName: "Full name" }],
       hybrid: {
         type: "static-xfa-with-acroform",
-        xfaPreserved: true,
+        xfaStructurePreserved: true,
         formLogicPreserved: true,
         nativeFieldDescriptionsAdded: 1,
         readerUsageRightsRemoved: true,
@@ -1222,6 +1233,139 @@ describe("native PDF orchestration", () => {
       conformanceClaim: false,
     });
     expect(result.pdf).toEqual(state.pdf);
+  });
+
+  it("reviews saved hybrid names and speech without reviving repaired labels or inferring required/signing barriers", async () => {
+    const state = await makeState();
+    const segmentName = "form[0].identifier[0].segment[1]";
+    const currentLabel = "Membership number. Last 4 digits.";
+    const requiredLabel = "Applicant name. An entry is required.";
+    const fields = [
+      {
+        fieldId: "field-" + "1".repeat(64),
+        name: "form[0].name[0]",
+        type: "Tx",
+        label: requiredLabel,
+        required: false,
+        value: "",
+        pageNumbers: [1],
+        widgets: [{ widgetId: "p1-a1", pageNumber: 1, rect: [10, 10, 80, 20] }],
+        speech: {
+          supported: true,
+          text: requiredLabel,
+          disabled: false,
+          priority: "custom",
+          source: "xfa-assist",
+        },
+      },
+      {
+        fieldId: "field-" + "2".repeat(64),
+        name: segmentName,
+        type: "Tx",
+        label: currentLabel,
+        required: false,
+        value: "",
+        pageNumbers: [1],
+        widgets: [{ widgetId: "p1-a2", pageNumber: 1, rect: [10, 30, 80, 40] }],
+        speech: {
+          supported: true,
+          text: currentLabel,
+          disabled: false,
+          priority: "custom",
+          source: "xfa-assist",
+        },
+      },
+      {
+        fieldId: "field-" + "3".repeat(64),
+        name: "form[0].special[0]",
+        type: "Btn",
+        label: "Special option",
+        required: false,
+        value: "Off",
+        pageNumbers: [1],
+        widgets: [{ widgetId: "p1-a3", pageNumber: 1, rect: [10, 50, 20, 60] }],
+        speech: {
+          supported: false,
+          text: null,
+          disabled: null,
+          priority: null,
+          source: "xfa-assist",
+        },
+      },
+    ];
+    state.inventory.forms = {
+      field_count: fields.length,
+      widget_count: fields.length,
+      fields,
+      hybrid: {
+        type: "static-xfa-with-acroform",
+        formLogicPreserved: true,
+        interactiveViewerReviewRequired: true,
+        verification: {
+          accessibleNameChanges: [
+            {
+              fieldName: segmentName,
+              oldText: "Last 4 digits.",
+              newText: currentLabel,
+            },
+          ],
+          speechPromptsEnabled: fields.slice(0, 2).map((field) => field.name),
+        },
+      },
+    };
+    const unresolved =
+      "The special option's announcement still needs an interaction check.";
+    state.findings = [
+      {
+        code: "legacy_form_interaction_review",
+        severity: "warning",
+        message: unresolved,
+      },
+    ];
+    state.changes = [
+      {
+        code: "form_name_context_added",
+        message: "Added the existing group name to a segment description.",
+      },
+      {
+        code: "form_speech_enabled",
+        message: "Enabled the existing direct field descriptions.",
+      },
+    ];
+    useState(state);
+    const result = await repairNativePdf(state.pdf, "fillable-form.pdf");
+    if ("error" in result) throw Error(result.error);
+
+    for (const [prompt, parts] of mocks.call.mock.calls) {
+      expect(scope(parts)).toMatchObject({ forms: state.inventory.forms });
+      expect(prompt).toContain(
+        "Inspect the current field labels, speech settings and preparation records"
+      );
+      expect(prompt).toContain(
+        "A required:false native flag alone is not a demonstrated accessibility defect"
+      );
+      expect(prompt).toContain(
+        "The absence of a signature field, date field or dedicated cross-out control alone does not prove"
+      );
+      expect(prompt).toContain(
+        "Actual keyboard and signing behavior requires interaction evidence"
+      );
+      expect(prompt).not.toContain("The XFA speech settings remain unchanged");
+    }
+    expect(mocks.call.mock.calls[1][0]).toContain(
+      "Do not repeat the original short-label or disabled-speech concern"
+    );
+    expect(result.errors.map((finding) => finding.message)).toEqual([
+      unresolved,
+    ]);
+    expect(result.nativePdfChecks).toMatchObject({
+      auditComplete: true,
+      screenReaderTestPerformed: false,
+      conformanceClaim: false,
+    });
+    expect(result.changes).toEqual(
+      state.changes.map((change) => change.message)
+    );
   });
 
   it.each(["metadata-missing", "display-title-missing"])(
