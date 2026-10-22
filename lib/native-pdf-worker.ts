@@ -2,6 +2,7 @@ import "server-only";
 import { createHash } from "node:crypto";
 import { isPdfBuffer, MAX_FILE_SIZE_BYTES } from "./document-input";
 import { createJobDiagnostic, type DiagnosticCode } from "./job-diagnostics";
+import type { FormInteractionReview } from "./native-pdf-interaction-evidence";
 
 export interface NativePdfTag {
   id: string;
@@ -44,6 +45,7 @@ export interface NativePdfFinding {
   pageNumber?: number;
   tagId?: string;
   location?: string;
+  interactionReview?: FormInteractionReview;
 }
 export interface NativePdfState {
   schemaVersion: 1;
@@ -247,6 +249,22 @@ export function parseNativePdfState(
   )
     return fail();
   const vera = checks.veraPdf;
+  if (
+    objectRecord(inv.forms) &&
+    inv.forms.interactionFingerprint !== undefined
+  ) {
+    const fingerprint = inv.forms.interactionFingerprint;
+    if (
+      !objectRecord(fingerprint) ||
+      Object.keys(fingerprint).some(
+        (key) => !["schemaVersion", "sha256"].includes(key)
+      ) ||
+      fingerprint.schemaVersion !== 1 ||
+      typeof fingerprint.sha256 !== "string" ||
+      !/^[a-f0-9]{64}$/.test(fingerprint.sha256)
+    )
+      return fail();
+  }
   if (
     typeof vera.completed !== "boolean" ||
     typeof vera.compliant !== "boolean" ||

@@ -100,6 +100,8 @@ function makeDocRow(
     jobId: string | null;
     status: string | null;
     errorMessage: string | null;
+    outputTarget: string;
+    interactionTestSummary: unknown;
   }> = {}
 ) {
   return {
@@ -141,6 +143,75 @@ function expectRetainedScope(condition: SQL) {
 
 describe("listDocuments", () => {
   beforeEach(() => vi.clearAllMocks());
+
+  const interactionTestSummary = {
+    evidenceId: "synthetic-form-test",
+    testedAt: "2026-10-22",
+    environment: "Acrobat and NVDA",
+    passedChecks: ["The name field announced its label."],
+    scopeNote:
+      "Earlier tests match this form; they were not rerun for this conversion.",
+  };
+
+  it("restores a successful PDF summary from the current attempt's latest completion", async () => {
+    vi.mocked(db.select)
+      .mockReturnValueOnce(
+        makeChain([
+          makeDocRow({
+            jobId: "job-1",
+            status: "completed",
+            outputTarget: "accessible_pdf",
+            interactionTestSummary,
+          }),
+        ])
+      )
+      .mockReturnValueOnce(makeChain([]));
+    const [doc] = await listDocuments("session-1");
+    expect(doc.interactionTestSummary).toEqual(interactionTestSummary);
+    const selection = vi.mocked(db.select).mock.calls[0][0] as {
+      interactionTestSummary: SQL;
+    };
+    const query = sqlCondition(selection.interactionTestSummary).sql;
+    expect(query).toContain("event_type = 'conversion_completed'");
+    expect(query).toContain(
+      'metadata ->> \'attemptNumber\' = "conversion_jobs"."attempt_count"::text'
+    );
+    expect(query).toContain('created_at >= "conversion_jobs"."started_at"');
+    expect(query).toContain("order by created_at desc, id desc limit 1");
+    expect(query).not.toContain("metadata ?");
+  });
+
+  it.each(["failed", "processing", "queued", "cancelled", "expired"])(
+    "does not restore old interaction evidence for a %s attempt",
+    async (status) => {
+      vi.mocked(db.select).mockReturnValue(
+        makeChain([
+          makeDocRow({
+            status,
+            outputTarget: "accessible_pdf",
+            interactionTestSummary,
+          }),
+        ])
+      );
+      const [doc] = await listDocuments("session-1");
+      expect(doc.interactionTestSummary).toBeUndefined();
+    }
+  );
+
+  it.each([
+    { outputTarget: "accessible_pdf" },
+    { outputTarget: "canvas_html", interactionTestSummary },
+    {
+      outputTarget: "accessible_pdf",
+      interactionTestSummary: { ...interactionTestSummary, extra: "private" },
+    },
+  ])("omits absent, non-PDF or invalid saved evidence (%#)", async (patch) => {
+    vi.mocked(db.select).mockReturnValue(
+      makeChain([makeDocRow({ status: "completed", ...patch })])
+    );
+    const [doc] = await listDocuments("session-1");
+    expect(doc.interactionTestSummary).toBeUndefined();
+  });
 
   it("returns documents for a session with status mapped to ConversionStatus", async () => {
     vi.mocked(db.select).mockReturnValue(

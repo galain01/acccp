@@ -15,6 +15,7 @@ COPY services/native-pdf/server.py services/native-pdf/worker.py services/native
 COPY services/native-pdf/hybrid_forms.py services/native-pdf/hybrid_form_verification.py /app/services/native-pdf/
 COPY services/native-pdf/hybrid_form_accessibility.py /app/services/native-pdf/
 COPY services/native-pdf/native_form_inventory.py /app/services/native-pdf/
+COPY services/native-pdf/form_interaction_fingerprint.py /app/services/native-pdf/
 COPY services/native-pdf/native_structure_repairs.py /app/services/native-pdf/
 COPY services/native-pdf/bounded_semantic_structure.py /app/services/native-pdf/
 COPY --chmod=0555 services/native-pdf/start-worker.sh /usr/local/bin/start-native-pdf.sh

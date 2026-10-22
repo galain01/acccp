@@ -112,6 +112,59 @@ afterEach(async () => {
 });
 
 describe("native PDF results", () => {
+  const interactionTestSummary = {
+    evidenceId: "synthetic-form-test",
+    testedAt: "2026-10-22",
+    environment: "Acrobat and NVDA",
+    passedChecks: [
+      "The name field announced its label.",
+      "Entered sample values survived saving and reopening.",
+    ],
+    scopeNote:
+      "Earlier tests match this form; they were not rerun for this conversion.",
+  };
+
+  it("separately shows the earlier test date, environment, completed checks and scope", async () => {
+    await mount({ outputTarget: "accessible_pdf", interactionTestSummary });
+    const section = resultDialog().querySelector(
+      'section[aria-label="Previously tested form behavior"]'
+    )!;
+    expect(section).not.toBeNull();
+    expect(section.querySelector("time")?.dateTime).toBe("2026-10-22");
+    expect(section.textContent).toContain("Acrobat and NVDA");
+    expect(
+      Array.from(section.querySelectorAll("li"), (li) => li.textContent)
+    ).toEqual(interactionTestSummary.passedChecks);
+    expect(section.textContent).toContain("not rerun for this conversion");
+    expect(section.textContent).not.toContain("certified");
+    expect(resultDialog().textContent).not.toContain("and any form fields");
+    expect(
+      resultDialog().querySelectorAll(
+        'section[aria-label="Items to review"] li'
+      )
+    ).toHaveLength(1);
+  });
+
+  it.each([
+    { outputTarget: "accessible_pdf" as const },
+    { outputTarget: "canvas_html" as const, interactionTestSummary },
+    {
+      outputTarget: "accessible_pdf" as const,
+      status: "error" as const,
+      interactionTestSummary,
+    },
+  ])(
+    "does not show prior test evidence for an older, non-PDF or failed result (%#)",
+    async (patch) => {
+      await mount(patch);
+      expect(
+        resultDialog().querySelector(
+          'section[aria-label="Previously tested form behavior"]'
+        )
+      ).toBeNull();
+    }
+  );
+
   it("shows page-specific findings and a PDF download without fetching HTML or implying certification", async () => {
     const clicked: string[] = [];
     vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (

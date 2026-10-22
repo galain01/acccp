@@ -94,6 +94,19 @@ than falsely indicating enabled speech. Preparation verification includes
 `speechPromptsEnabled`; the auditor compares these records with the current
 `fields[].speech` metadata rather than treating a change count as proof of use.
 
+For supported static hybrid forms with complete annotation ownership, both
+saved prepare and repair outputs also include
+`inventory.forms.interactionFingerprint: {schemaVersion: 1, sha256: "64 lowercase hex"}`.
+The worker computes this from the reopened saved file. It binds the complete
+native form/XFA graph (including scripts, values, speech and appearances), field
+and widget ownership, ordered annotations, tab settings, form tag order and
+effective language, and other page/catalog behavior settings. PDF object numbers,
+document title/XMP and unrelated heading/list tags are excluded. Unknown behavior
+keys are retained; ambiguous, unsupported or over-limit inspection omits the
+fingerprint and leaves ordinary interaction review in place. A fingerprint is
+an identity for separately recorded tests, not evidence of a test or conformance.
+Requests, model output and embedded PDF metadata cannot supply this field.
+
 Preserved form structure and added native labels do not prove Acrobat's XFA
 field announcements or checkbox behavior. Unsupported or unresolved speech
 settings and specific unverified interaction requirements remain review items.

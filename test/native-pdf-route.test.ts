@@ -331,6 +331,40 @@ describe("native PDF conversion route", () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
   });
 
+  it.each([true, false])(
+    "persists and returns only a valid interaction summary (valid=%s)",
+    async (valid) => {
+      const summary = {
+        evidenceId: "synthetic-form-test",
+        testedAt: "2026-10-22",
+        environment: "Acrobat and NVDA",
+        passedChecks: ["The name field announced its label."],
+        scopeNote:
+          "Earlier tests match this form; they were not rerun for this conversion.",
+      };
+      const repair = mocks.repairNativePdf.getMockImplementation()!;
+      mocks.repairNativePdf.mockImplementationOnce(async (...args) => ({
+        ...(await repair(...args)),
+        interactionTestSummary: valid
+          ? summary
+          : { ...summary, privateTranscript: "omit" },
+      }));
+      const response = await POST(request());
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      const review = JSON.parse(mocks.upload.mock.calls[2][1]);
+      const event = inserted.get(jobEvents)?.values.mock.calls[0][0];
+      expect(event).toMatchObject({
+        eventType: "conversion_completed",
+        metadata: { attemptNumber: 2 },
+      });
+      for (const published of [body, review, event.metadata]) {
+        if (valid) expect(published.interactionTestSummary).toEqual(summary);
+        else expect(published).not.toHaveProperty("interactionTestSummary");
+      }
+    }
+  );
+
   it("stores separate original and repaired PDF artifacts with checks, findings and both model stages", async () => {
     const response = await POST(request({ name: "Course.PDF" }));
     expect(response.status).toBe(200);
@@ -343,6 +377,7 @@ describe("native PDF conversion route", () => {
     });
     expect(body).not.toHaveProperty("html");
     expect(body).not.toHaveProperty("pdf");
+    expect(body).not.toHaveProperty("interactionTestSummary");
     expect(mocks.repairNativePdf).toHaveBeenCalledExactlyOnceWith(
       Buffer.from(PDF),
       "Course.PDF",
@@ -372,6 +407,7 @@ describe("native PDF conversion route", () => {
       })
     );
     const review = JSON.parse(mocks.upload.mock.calls[2][1]);
+    expect(review).not.toHaveProperty("interactionTestSummary");
     expect(review).toMatchObject({
       outputTarget: "accessible_pdf",
       profileVersion: "pdf-v1",

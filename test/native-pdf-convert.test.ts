@@ -40,6 +40,7 @@ import { NativePdfError, pdfSha256 } from "../lib/native-pdf-worker";
 import { LiteLLMError } from "../lib/litellm";
 import { NATIVE_PDF_AUDIT_PROMPT } from "../lib/prompts/native-pdf-accessibility";
 import { presentFinding } from "../lib/accessibility-findings";
+import * as interactionEvidence from "../lib/native-pdf-interaction-evidence";
 
 function tag(pageNumber: number, id = pageNumber): NativePdfTag {
   const text = `Teaching material on page ${pageNumber}`;
@@ -153,10 +154,182 @@ function validContent(prompt: string, parts: LiteLLMContentPart[]) {
   };
 }
 beforeEach(() => {
+  vi.restoreAllMocks();
   vi.resetAllMocks();
   mocks.call.mockImplementation((prompt, parts) =>
     response(validContent(prompt, parts))
   );
+});
+
+describe("prior matching PDF interaction tests", () => {
+  const fieldId = "field-" + "a".repeat(64);
+  const blanket = {
+    code: "legacy_form_interaction_review",
+    severity: "warning" as const,
+    message: "Test this form's interactions.",
+  };
+  const remaining = [
+    {
+      code: "form-certification-method",
+      severity: "warning" as const,
+      pageNumber: 1,
+      location: "Certification",
+      message: "Signing and dating have not been tested.",
+      suggestion: "Check the accepted keyboard method.",
+    },
+  ];
+  function tests(
+    state: NativePdfState
+  ): interactionEvidence.MatchedNativePdfInteractionTests {
+    return {
+      schemaVersion: 1,
+      evidenceId: "unit-tested-form-v1",
+      testedAt: "2026-10-22",
+      environment: "Acrobat and NVDA",
+      testedPdfSha256: "b".repeat(64),
+      savedTestCopySha256: "c".repeat(64),
+      sourceSha256: state.sourceSha256,
+      matchedCandidateSha256: state.candidateSha256,
+      interactionFingerprint: { schemaVersion: 1, sha256: "d".repeat(64) },
+      coverage: [
+        {
+          action: "field-announcement",
+          fieldIds: [fieldId],
+          observation: "The name was announced.",
+        },
+      ],
+      remainingReviews: remaining,
+      remainingReviewCoverage: [
+        {
+          reviewCode: "form-certification-method",
+          pageNumber: 1,
+          action: "signing",
+          fieldIds: [],
+        },
+        {
+          reviewCode: "form-certification-method",
+          pageNumber: 1,
+          action: "dating",
+          fieldIds: [],
+        },
+      ],
+      scope: "prior-tests-of-matching-form",
+      testsRunDuringThisConversion: false,
+    };
+  }
+  function request() {
+    return {
+      code: "form-interaction-review",
+      severity: "warning",
+      pageNumber: 1,
+      location: "Name",
+      message: "Check this announcement.",
+      suggestion: "Listen to the name.",
+      interactionReview: {
+        basis: "not-tested",
+        action: "field-announcement",
+        fieldIds: [fieldId],
+      },
+    };
+  }
+  it("sends matched evidence to both stages and saves the scope without claiming a new screen-reader run", async () => {
+    const state = await makeState();
+    state.inventory.forms = { fields: [{ fieldId, pageNumbers: [1] }] };
+    state.findings = [
+      blanket,
+      {
+        code: "font-mapping",
+        severity: "error",
+        message: "Current font problem.",
+      },
+    ];
+    const match = vi
+      .spyOn(interactionEvidence, "getNativePdfInteractionTests")
+      .mockImplementation((candidate, sourceHash) => {
+        expect(sourceHash).toBe(pdfSha256(state.pdf));
+        return tests(candidate);
+      });
+    useState(state);
+    mocks.call.mockImplementation((prompt, parts) =>
+      response({ ...validContent(prompt, parts), findings: [request()] })
+    );
+    const result = await repairNativePdf(state.pdf, "form.pdf");
+    if ("error" in result) throw new Error(result.error);
+    expect(match).toHaveBeenCalledTimes(2);
+    for (const [, parts] of mocks.call.mock.calls) {
+      expect(scope(parts)).toMatchObject({
+        priorMatchingInteractionTests: { evidenceId: "unit-tested-form-v1" },
+        findings: [
+          expect.objectContaining({ code: "font-mapping" }),
+          ...remaining,
+        ],
+      });
+    }
+    expect(result.errors.map((finding) => finding.message)).toEqual([
+      "Current font problem.",
+      remaining[0].message,
+    ]);
+    expect(result.interactionTestSummary?.passedChecks).toEqual([
+      "The name was announced.",
+    ]);
+    expect(result.nativePdfChecks).toMatchObject({
+      screenReaderTestPerformed: false,
+      priorMatchingInteractionTests: { testsRunDuringThisConversion: false },
+    });
+  });
+  it("does not carry a prepared match forward when the saved form no longer matches", async () => {
+    const state = await makeState();
+    state.inventory.forms = { fields: [{ fieldId, pageNumbers: [1] }] };
+    state.findings = [blanket];
+    vi.spyOn(interactionEvidence, "getNativePdfInteractionTests")
+      .mockReturnValueOnce(tests(state))
+      .mockReturnValueOnce(undefined);
+    useState(state);
+    const result = await repairNativePdf(state.pdf, "form.pdf");
+    if ("error" in result) throw new Error(result.error);
+    expect(scope(mocks.call.mock.calls[0][1])).toMatchObject({
+      priorMatchingInteractionTests: { evidenceId: "unit-tested-form-v1" },
+    });
+    expect(scope(mocks.call.mock.calls[1][1])).toMatchObject({
+      priorMatchingInteractionTests: null,
+      findings: [blanket],
+    });
+    expect(result.errors.map((finding) => finding.message)).toEqual([
+      blanket.message,
+    ]);
+    expect(result.interactionTestSummary).toBeUndefined();
+    expect(
+      result.nativePdfChecks.priorMatchingInteractionTests
+    ).toBeUndefined();
+  });
+  it("accepts only typed missing-test requests bound to existing fields on the assigned page", async () => {
+    const state = await makeState(2);
+    state.inventory.forms = { fields: [{ fieldId, pageNumbers: [1] }] };
+    const batch = nativePdfBatches(state)[0];
+    expect(
+      parseNativePdfFindings([request()], batch, state)[0].interactionReview
+    ).toMatchObject({ basis: "not-tested" });
+    for (const bad of [
+      { ...request(), severity: "error" },
+      { ...request(), pageNumber: 2 },
+      {
+        ...request(),
+        interactionReview: {
+          ...request().interactionReview,
+          fieldIds: ["field-" + "b".repeat(64)],
+        },
+      },
+      {
+        ...request(),
+        interactionReview: {
+          ...request().interactionReview,
+          basis: "observed-defect",
+        },
+      },
+      { ...request(), code: "observed-label-problem" },
+    ])
+      expect(() => parseNativePdfFindings([bad], batch, state)).toThrow();
+  });
 });
 
 describe("native PDF model contracts", () => {

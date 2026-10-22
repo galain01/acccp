@@ -36,6 +36,7 @@ import { verifyRoleOrUnauthorized } from "@/lib/auth";
 import { convertPowerPoint } from "@/lib/powerpoint-convert";
 import { convertWord } from "@/lib/word-convert";
 import { repairNativePdf } from "@/lib/native-pdf-convert";
+import { readPdfInteractionTestSummary } from "@/lib/pdf-interaction-summary";
 import { createNativePdfTransport } from "@/lib/native-pdf-transport-storage";
 import { createStoredPowerPointRenderer } from "@/lib/powerpoint-render-storage";
 import {
@@ -680,12 +681,17 @@ async function convertRequest(req: NextRequest) {
         ? PDF_MIME_TYPE
         : "text/html; charset=utf-8";
   const changes = "changes" in result ? readOutputChanges(result.changes) : [];
+  const interactionTestSummary =
+    isNativePdf && "interactionTestSummary" in result
+      ? readPdfInteractionTestSummary(result.interactionTestSummary)
+      : undefined;
   const reviewKey = outputReviewKey(sessionId, documentId, jobId);
   const reviewBody = JSON.stringify({
     outputTarget,
     profileVersion,
     changes,
     findings: result.errors,
+    ...(interactionTestSummary ? { interactionTestSummary } : {}),
     ...("nativePdfChecks" in result
       ? { nativePdfChecks: result.nativePdfChecks }
       : {}),
@@ -872,6 +878,7 @@ async function convertRequest(req: NextRequest) {
           eventType: "conversion_completed",
           message: `Converted ${filename}`,
           metadata: {
+            attemptNumber: job.attemptNumber,
             model: result.model,
             tokensUsed: result.tokensUsed,
             findingCount: result.errors.length,
@@ -879,6 +886,7 @@ async function convertRequest(req: NextRequest) {
             outputTarget,
             profileVersion,
             changes,
+            ...(interactionTestSummary ? { interactionTestSummary } : {}),
           },
         });
 
@@ -938,6 +946,7 @@ async function convertRequest(req: NextRequest) {
     outputTarget,
     profileVersion,
     changes,
+    ...(interactionTestSummary ? { interactionTestSummary } : {}),
     ...("html" in result ? { html: result.html } : {}),
     errors: result.errors,
     model: result.model,
