@@ -84,6 +84,264 @@ def inline_heading_bytes(*, nested_role="Span", bad_owner=False, role_mapping=Tr
     data = io.BytesIO(); writer.write(data); return data.getvalue()
 
 
+def link_bytes(text="Course reading guide", mutate=None):
+    writer = PdfWriter(clone_from=PdfReader(io.BytesIO(pdf_bytes(tagged=True, text=text, link="https://example.edu/course"))))
+    page = writer.pages[0]
+    root = writer.root_object["/StructTreeRoot"]
+    link = worker.native_nodes(writer)[1]
+    link[NameObject("/S")] = NameObject("/Link")
+    annotation_ref = page["/Annots"][0]
+    annotation = annotation_ref.get_object()
+    annotation[NameObject("/StructParent")] = NumberObject(1)
+    annotation[NameObject("/Rect")] = ArrayObject([NumberObject(value) for value in (15, 35, 190, 60)])
+    link[NameObject("/K")] = ArrayObject([NumberObject(0), DictionaryObject({NameObject("/Type"): NameObject("/OBJR"),
+        NameObject("/Obj"): annotation_ref, NameObject("/Pg"): page.indirect_reference})])
+    root["/ParentTree"]["/Nums"].extend([NumberObject(1), link.indirect_reference])
+    if mutate:
+        mutate(writer, link, annotation)
+    output = io.BytesIO(); writer.write(output); return output.getvalue()
+
+
+def many_link_bytes(count):
+    writer = PdfWriter(clone_from=PdfReader(io.BytesIO(link_bytes())))
+    page = writer.pages[0]; root = writer.root_object["/StructTreeRoot"]
+    document = worker.native_nodes(writer)[0]
+    links, annotations, numbers, paint = [], [], [], []
+    for index in range(count):
+        annotation = DictionaryObject({NameObject("/Type"): NameObject("/Annot"), NameObject("/Subtype"): NameObject("/Link"),
+            NameObject("/Rect"): ArrayObject([NumberObject(value) for value in (15, 35, 190, 60)]),
+            NameObject("/StructParent"): NumberObject(index+1),
+            NameObject("/A"): DictionaryObject({NameObject("/S"): NameObject("/URI"), NameObject("/URI"): TextStringObject("https://example.edu/course")})})
+        annotation_ref = writer._add_object(annotation); annotations.append(annotation_ref)
+        link = DictionaryObject({NameObject("/Type"): NameObject("/StructElem"), NameObject("/S"): NameObject("/Link"),
+            NameObject("/P"): document.indirect_reference, NameObject("/Pg"): page.indirect_reference,
+            NameObject("/K"): ArrayObject([NumberObject(index), DictionaryObject({NameObject("/Type"): NameObject("/OBJR"),
+                NameObject("/Obj"): annotation_ref, NameObject("/Pg"): page.indirect_reference})])})
+        link_ref = writer._add_object(link); links.append(link_ref); numbers.extend([NumberObject(index+1), link_ref])
+        paint.append(f"/Link <</MCID {index}>> BDC BT /F1 12 Tf 20 40 Td (Course reading guide) Tj ET EMC")
+    page[NameObject("/Annots")] = ArrayObject(annotations)
+    document[NameObject("/K")] = ArrayObject(links)
+    root["/ParentTree"][NameObject("/Nums")] = ArrayObject([NumberObject(0), ArrayObject(links), *numbers])
+    stream = DecodedStreamObject(); stream.set_data("\n".join(paint).encode())
+    page[NameObject("/Contents")] = writer._add_object(stream)
+    output = io.BytesIO(); writer.write(output); return output.getvalue()
+
+
+class NativeLinkDescriptionTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.folder = Path(temporary.name)
+        self.source = self.folder / "source.pdf"
+        self.output = self.folder / "output.pdf"
+
+    def repair(self, data):
+        self.source.write_bytes(data)
+        original = worker.open_pdf(data)
+        plan = {"schemaVersion": 1, "candidateSha256": worker.digest(data), "operations": []}
+        changes = worker.apply_plan(original, original, plan, self.output)
+        return original, worker.open_pdf(self.output.read_bytes()), changes
+
+    def test_missing_description_is_added_with_identical_pixels_content_and_destination(self):
+        data = link_bytes()
+        original, saved, changes = self.repair(data)
+        self.assertEqual("Course reading guide", saved.pages[0]["/Annots"][0].get_object()["/Contents"])
+        self.assertEqual(["link_description_added"], [item["code"] for item in changes])
+        checks = worker.verify_pdf.compare_pdfs(self.source, self.output)
+        self.assertTrue(checks["preservation"]["passed"])
+        self.assertTrue(checks["preservation"]["pages"][0]["pixels_identical"])
+        self.assertEqual(original.pages[0]["/Annots"][0].get_object()["/A"], saved.pages[0]["/Annots"][0].get_object()["/A"])
+        self.assertEqual(original.get_fields(), saved.get_fields())
+        self.assertEqual(original.pages[0].extract_text(), saved.pages[0].extract_text())
+        self.assertEqual(data, self.source.read_bytes())
+
+    def test_prepare_repairs_before_model_and_repair_is_idempotent(self):
+        request = self.folder / "request.pdf"; request.write_bytes(link_bytes())
+        with patch.object(worker, "response", side_effect=lambda source, result, changes, tools: changes):
+            changes = worker.process("prepare", request, self.folder, {})
+        self.assertEqual("link_description_added", changes[0]["code"])
+        original, candidate = worker.open_pdf(request.read_bytes()), worker.open_pdf(self.output.read_bytes())
+        plan = {"schemaVersion": 1, "candidateSha256": worker.digest(self.output.read_bytes()), "operations": []}
+        next_output = self.folder / "again.pdf"
+        self.assertEqual([], worker.apply_plan(original, candidate, plan, next_output))
+        self.assertEqual(worker.annotation_states(candidate), worker.annotation_states(worker.open_pdf(next_output.read_bytes())))
+
+    def test_resolved_internal_destination_is_retained(self):
+        def destination(writer, link, annotation):
+            annotation.pop("/A")
+            annotation[NameObject("/Dest")] = ArrayObject([writer.pages[0].indirect_reference, NameObject("/Fit")])
+        original, saved, changes = self.repair(link_bytes(mutate=destination))
+        self.assertEqual("link_description_added", changes[0]["code"])
+        old = worker.annotation_states(original)[(1, 1)]
+        new = worker.annotation_states(saved)[(1, 1)]
+        self.assertEqual(old["/Dest"], new["/Dest"])
+        self.assertTrue(worker.verify_pdf.compare_pdfs(self.source, self.output)["preservation"]["passed"])
+
+    def test_form_field_labels_values_and_widget_dictionary_stay_unchanged(self):
+        def add_form(writer, link, annotation):
+            page = writer.pages[0]; root = writer.root_object["/StructTreeRoot"]
+            document = worker.native_nodes(writer)[0]
+            widget = DictionaryObject({NameObject("/Type"): NameObject("/Annot"), NameObject("/Subtype"): NameObject("/Widget"),
+                NameObject("/FT"): NameObject("/Tx"), NameObject("/T"): TextStringObject("comments"),
+                NameObject("/TU"): TextStringObject("Optional comments"), NameObject("/V"): TextStringObject("Existing answer"),
+                NameObject("/Rect"): ArrayObject([NumberObject(n) for n in (20, 10, 180, 30)]), NameObject("/StructParent"): NumberObject(2)})
+            widget_ref = writer._add_object(widget); page["/Annots"].append(widget_ref)
+            form = DictionaryObject({NameObject("/Type"): NameObject("/StructElem"), NameObject("/S"): NameObject("/Form"),
+                NameObject("/P"): document.indirect_reference, NameObject("/Pg"): page.indirect_reference,
+                NameObject("/K"): DictionaryObject({NameObject("/Type"): NameObject("/OBJR"), NameObject("/Obj"): widget_ref, NameObject("/Pg"): page.indirect_reference})})
+            form_ref = writer._add_object(form); document["/K"].append(form_ref)
+            root["/ParentTree"]["/Nums"].extend([NumberObject(2), form_ref])
+            writer.root_object[NameObject("/AcroForm")] = DictionaryObject({NameObject("/Fields"): ArrayObject([widget_ref])})
+        original, saved, changes = self.repair(link_bytes(mutate=add_form))
+        self.assertEqual("link_description_added", changes[0]["code"])
+        self.assertEqual(worker.annotation_states(original)[(1, 2)], worker.annotation_states(saved)[(1, 2)])
+        self.assertEqual(original.get_fields(), saved.get_fields())
+        self.assertEqual("Existing answer", saved.get_fields()["comments"]["/V"])
+        self.assertTrue(worker.verify_pdf.compare_pdfs(self.source, self.output)["preservation"]["passed"])
+
+    def test_existing_descriptions_including_blank_numeric_and_placeholder_are_preserved(self):
+        for description in ("Existing authored explanation", "", "1", "Annotation"):
+            with self.subTest(description=description):
+                data = link_bytes(mutate=lambda w, link, annotation: annotation.__setitem__(NameObject("/Contents"), TextStringObject(description)))
+                original = worker.open_pdf(data); writer = PdfWriter(clone_from=original)
+                self.assertEqual([], worker.add_link_descriptions(original, original, writer))
+                self.assertEqual(description, writer.pages[0]["/Annots"][0].get_object()["/Contents"])
+
+    def test_authored_overrides_on_link_annotation_or_ancestor_are_not_bypassed(self):
+        for position in ("link", "annotation", "ancestor"):
+            for name in ("/Alt", "/ActualText"):
+                def mutate(writer, link, annotation):
+                    target = {"link": link, "annotation": annotation, "ancestor": worker.native_nodes(writer)[0]}[position]
+                    target[NameObject(name)] = TextStringObject("Authored meaning")
+                with self.subTest(position=position, name=name):
+                    original = worker.open_pdf(link_bytes(mutate=mutate))
+                    self.assertEqual({}, worker.native_link_descriptions(original))
+
+    def test_generic_numeric_empty_and_private_use_labels_are_skipped(self):
+        for text in ("1", "", "Click here", "Link", "Read more"):
+            self.assertEqual({}, worker.native_link_descriptions(worker.open_pdf(link_bytes(text))))
+        for text in ("bad\ue123label", "bad\ufffdlabel", "bad\u202elabel"):
+            self.assertIsNone(worker.link_label(text))
+
+    def test_ambiguous_structure_hidden_geometry_and_missing_actions_are_skipped(self):
+        mutations = {
+            "bad parent": lambda w, link, a: a.__setitem__(NameObject("/StructParent"), NumberObject(99)),
+            "duplicate annotation alias": lambda w, link, a: w.pages[0]["/Annots"].append(w.pages[0]["/Annots"][0]),
+            "duplicate owner": lambda w, link, a: link["/K"].append(link["/K"][1]),
+            "duplicate MCID": lambda w, link, a: link["/K"].insert(0, NumberObject(0)),
+            "hidden": lambda w, link, a: a.__setitem__(NameObject("/F"), NumberObject(2)),
+            "off page": lambda w, link, a: a.__setitem__(NameObject("/Rect"), ArrayObject([NumberObject(n) for n in (500, 500, 600, 600)])),
+            "missing action": lambda w, link, a: a.pop("/A"),
+            "unresolved destination": lambda w, link, a: a.__setitem__(NameObject("/A"), DictionaryObject({NameObject("/S"): NameObject("/GoTo"), NameObject("/D"): TextStringObject("missing")})),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                self.assertEqual({}, worker.native_link_descriptions(worker.open_pdf(link_bytes(mutate=mutate))))
+
+    def test_mixed_graphics_invisible_text_and_inline_replacement_are_skipped(self):
+        for addition in (b" 30 30 10 10 re f ", b" /Span <</ActualText (Other)>> BDC (Visible) Tj EMC "):
+            def mutate(writer, link, annotation):
+                stream = writer.pages[0].get_contents()
+                stream.set_data(stream.get_data().replace(b" EMC", addition + b" EMC"))
+                writer.pages[0][NameObject("/Contents")] = writer._add_object(stream)
+            self.assertEqual({}, worker.native_link_descriptions(worker.open_pdf(link_bytes(mutate=mutate))))
+        def invisible(writer, link, annotation):
+            stream = writer.pages[0].get_contents(); stream.set_data(stream.get_data().replace(b"BT ", b"BT 3 Tr "))
+            writer.pages[0][NameObject("/Contents")] = writer._add_object(stream)
+        self.assertEqual({}, worker.native_link_descriptions(worker.open_pdf(link_bytes(mutate=invisible))))
+        def restored_invisible(writer, link, annotation):
+            stream = writer.pages[0].get_contents(); stream.set_data(stream.get_data().replace(b"BT ", b"3 Tr q 0 Tr Q BT "))
+            writer.pages[0][NameObject("/Contents")] = writer._add_object(stream)
+        self.assertEqual({}, worker.native_link_descriptions(worker.open_pdf(link_bytes(mutate=restored_invisible))))
+        for prefix in (b"0 0 0 0 re W n ", b"0 0 0 0 re W* n ", b"4 Tr "):
+            def clipped(writer, link, annotation):
+                stream = writer.pages[0].get_contents(); stream.set_data(prefix + stream.get_data())
+                writer.pages[0][NameObject("/Contents")] = writer._add_object(stream)
+            self.assertEqual({}, worker.native_link_descriptions(worker.open_pdf(link_bytes(mutate=clipped))))
+
+    def test_simple_underlined_text_is_allowed_but_complex_graphic_strokes_are_not(self):
+        def with_stroke(program):
+            def mutate(writer, link, annotation):
+                stream = writer.pages[0].get_contents()
+                stream.set_data(stream.get_data().replace(b" EMC", program + b" EMC"))
+                writer.pages[0][NameObject("/Contents")] = writer._add_object(stream)
+            return worker.open_pdf(link_bytes(mutate=mutate))
+        normal = with_stroke(b" q 1 0 0 1 20 38 cm 0.9 w 0 0 m 160 0 l S Q ")
+        self.assertEqual("Course reading guide", worker.native_link_descriptions(normal)[(1, 1)]["label"])
+        for path in (b" 20 38 m 180 44 l S ", b" 20 38 m 100 38 l 180 38 l S ",
+                     b" 20 38 m 180 38 l 5 w S ", b" 20 58 m 180 58 l S ",
+                     b" 20 38 m 180 38 l 20 38 m 180 38 l S "):
+            self.assertEqual({}, worker.native_link_descriptions(with_stroke(path)))
+        for prefix in (b"0 0 200 100 re W n ", b"q 0 0 0 0 re W n Q "):
+            def safe_crop(writer, link, annotation):
+                stream = writer.pages[0].get_contents(); stream.set_data(prefix + stream.get_data())
+                writer.pages[0][NameObject("/Contents")] = writer._add_object(stream)
+            self.assertEqual(1, len(worker.native_link_descriptions(worker.open_pdf(link_bytes(mutate=safe_crop)))))
+
+    def test_changed_native_text_or_destination_does_not_authorize_label_copy(self):
+        original = worker.open_pdf(link_bytes())
+        different_text = worker.open_pdf(link_bytes("Other reading guide"))
+        different_uri = worker.open_pdf(link_bytes(mutate=lambda w, link, a: a["/A"].__setitem__(NameObject("/URI"), TextStringObject("https://example.edu/other"))))
+        for candidate in (different_text, different_uri):
+            self.assertEqual([], worker.add_link_descriptions(original, candidate, PdfWriter(clone_from=candidate)))
+
+    def test_saved_wrong_label_unrelated_annotation_mutation_and_authored_overwrite_fail(self):
+        original, saved, _ = self.repair(link_bytes())
+        def change(name, value):
+            return worker.open_pdf(modified(self.output.read_bytes(), lambda w: w.pages[0]["/Annots"][0].get_object().__setitem__(NameObject(name), value)))
+        bad = [change("/Contents", TextStringObject("Invented explanation")), change("/F", NumberObject(4)),
+               change("/Contents", NameObject("/Course-reading-guide"))]
+        for candidate in bad:
+            with self.assertRaisesRegex(worker.WorkerError, "preservation"):
+                worker.verify_saved_annotations(original, original, candidate)
+        authored = worker.open_pdf(link_bytes(mutate=lambda w, link, a: a.__setitem__(NameObject("/Contents"), TextStringObject("Authored"))))
+        with self.assertRaisesRegex(worker.WorkerError, "preservation"):
+            worker.verify_saved_annotations(authored, authored, saved)
+
+    def test_unknown_added_description_is_rejected_on_repair_input(self):
+        original = worker.open_pdf(link_bytes())
+        candidate_data = modified(original.stream.getvalue(), lambda w: w.pages[0]["/Annots"][0].get_object().__setitem__(NameObject("/Contents"), TextStringObject("Wrong label")))
+        candidate = worker.open_pdf(candidate_data)
+        with self.assertRaisesRegex(worker.WorkerError, "preservation"):
+            worker.apply_plan(original, candidate, {"schemaVersion": 1, "candidateSha256": worker.digest(candidate_data), "operations": []}, self.output)
+
+    def test_untagged_sources_and_incomplete_text_are_not_guessed(self):
+        original = worker.open_pdf(pdf_bytes(link="https://example.edu/course"))
+        self.assertEqual({}, worker.native_link_descriptions(original))
+        original = worker.open_pdf(link_bytes())
+        inventory = worker.verify_pdf.structure_inventory(original)
+        inventory["tags"][1]["textIncomplete"] = True
+        with patch.object(worker.verify_pdf, "structure_inventory", return_value=inventory):
+            self.assertEqual({}, worker.native_link_descriptions(original))
+
+    def test_automatic_link_fix_has_its_own_bound(self):
+        original = worker.open_pdf(link_bytes())
+        with patch.object(worker, "MAX_LINK_DESCRIPTIONS", 0), patch.object(worker, "simple_link_paint") as paint:
+            self.assertEqual([], worker.add_link_descriptions(original, original, PdfWriter(clone_from=original)))
+            paint.assert_not_called()
+
+    def test_201_links_repairs_200_and_leaves_remaining_link_unchanged(self):
+        original = worker.open_pdf(many_link_bytes(201)); writer = PdfWriter(clone_from=original)
+        with patch.object(worker, "simple_link_paint", wraps=worker.simple_link_paint) as paint:
+            changes = worker.add_link_descriptions(original, original, writer)
+        self.assertEqual(200, len(changes))
+        self.assertEqual(400, paint.call_count)  # 200 source and 200 exact candidate matches.
+        self.assertTrue(all("/Contents" in value.get_object() for value in writer.pages[0]["/Annots"][:200]))
+        self.assertNotIn("/Contents", writer.pages[0]["/Annots"][200].get_object())
+        saved = worker.write_pdf(writer, self.output)
+        worker.verify_saved_annotations(original, original, saved)
+        changed = modified(self.output.read_bytes(), lambda w: w.pages[0]["/Annots"][200].get_object().__setitem__(NameObject("/Contents"), TextStringObject("Course reading guide")))
+        with self.assertRaisesRegex(worker.WorkerError, "complexity_limit"):
+            worker.verify_added_link_descriptions(original, worker.open_pdf(changed))
+
+    def test_complex_page_scan_budget_leaves_links_for_review(self):
+        original = worker.open_pdf(many_link_bytes(3))
+        count = len(worker.verify_pdf.operations(original.pages[0]))
+        with patch.object(worker, "MAX_LINK_SCAN_OPERATIONS", count), patch.object(worker, "simple_link_paint", wraps=worker.simple_link_paint) as paint:
+            result = worker.native_link_descriptions(original)
+        self.assertEqual(1, len(result)); self.assertEqual(1, paint.call_count)
+
+
 class NativePdfWorkerTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()

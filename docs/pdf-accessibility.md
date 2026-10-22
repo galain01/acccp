@@ -41,6 +41,16 @@ ActualText are preserved. The model cannot replace arbitrary PDF content, change
 form behavior or create external references. Complex tables and uncertain
 relationships remain findings.
 
+During preparation, the worker can also fill an absent link-annotation
+description from the original link's verified text. This is a bounded automatic
+repair for up to 200 simple text links in an already-tagged original PDF, each
+with a unique, verified annotation owner. Additional links remain unchanged for
+normal validation and review. It preserves existing descriptions, link
+destinations, page appearance and
+reading order. Ambiguous links, generic labels and unsupported structures remain
+for review. The saved output is checked again to prove that only the intended
+description was added and that it matches the original text.
+
 Text-block repairs preserve inline spans and valid links. Custom source roles
 correctly mapped to paragraphs or headings are eligible too. The repair changes
 only the block's native role, with bounded inline descendants and independently
@@ -166,3 +176,20 @@ The repair prompt explains automatic document-property repairs, and the audit
 uses the reopened output's checks rather than inferring missing metadata from a
 rebuilt page excerpt. Remaining real defects stay visible. These release checks
 do not establish universal PDF coverage or PDF/UA conformance.
+
+## Link-description repair verification, 2026-10-21
+
+The follow-up link repair passed 62 Python worker/service tests, 52 focused app
+tests, TypeScript and lint checks. The real local HTTP worker smoke test also
+passed. Tests cover authored-description preservation, ambiguous ownership,
+hidden/clipped text, ordinary underlines, changed destinations, saved-output
+tampering, repeat processing and the 200-link/operation-scan bounds.
+
+Against the exact classroom-guide production download, preparation added one
+missing annotation description on page two using the existing W3C link text.
+Both link-related veraPDF failures disappeared; the missing PDF/UA declaration
+remained. Independent comparison confirmed identical pixels on both pages,
+unchanged destinations and annotation properties, and preserved footnote
+descriptions. Repeated preparation and a normal repair round-trip preserved
+the addition without duplicating the change. This follow-up used no model calls
+or new desktop screen-reader tests and made no font changes or conformance claim.

@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -17,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from xml.sax.saxutils import escape
 
 REPO = Path(__file__).resolve().parents[2]
@@ -36,6 +38,8 @@ MAX_REPORT = 16 * 1024 * 1024
 MAX_TAGS = 5000
 MAX_TEXT = 500_000
 MAX_OPS = 500
+MAX_LINK_DESCRIPTIONS = 200
+MAX_LINK_SCAN_OPERATIONS = 1_000_000
 ROLES = {"P", "H", "Caption", "Note", *(f"H{i}" for i in range(1, 7))}
 PLACEHOLDER = re.compile(r"\s*(?:image\s*\d*|figure\s*\d*|formula|annotation)\s*", re.I)
 ERRORS = {"native_pdf_unsupported", "native_pdf_preservation", "native_pdf_invalid_plan",
@@ -363,6 +367,270 @@ def write_pdf(writer, path):
     return open_pdf(path.read_bytes())
 
 
+def link_label(value):
+    if not isinstance(value, str) or len(value) > 20_000:
+        return None
+    # A native string is evidence, not permission to invent a link purpose.
+    if any(unicodedata.category(char) in {"Cf", "Co", "Cs"} or char == "\ufffd"
+           or (unicodedata.category(char) == "Cc" and not char.isspace()) for char in value):
+        return None
+    label = re.sub(r"\s+", " ", value).strip()
+    if (not 3 <= len(label) <= 2000 or not any(char.isalpha() for char in label)
+            or label.casefold().strip(" .:") in {"annotation", "link", "here", "click here", "read more", "more", "image"}):
+        return None
+    return label
+
+
+def annotation_states(reader):
+    """Include every dictionary entry, including descriptions and parent keys.
+
+    The general verifier intentionally allows new descriptions. This stricter
+    view proves that our writer changes only the specifically approved entry.
+    """
+    rows = {}
+    for page_number, page in enumerate(reader.pages, 1):
+        for index, reference in enumerate(resolved(page.get("/Annots", ArrayObject())), 1):
+            annotation = resolved(reference)
+            if not isinstance(annotation, DictionaryObject):
+                fail("native_pdf_preservation")
+            rows[(page_number, index)] = {str(key): verify_pdf.Canonicalizer(list(reader.pages)).hash(value)
+                                          for key, value in annotation.items()}
+    return rows
+
+
+def simple_link_paint(page, mcids, rectangle, page_operations=None):
+    """Allow text and a plain underline; reject mixed or replacement content."""
+    stack, counts, rendered = [], {}, set()
+    invisible, graphics_override = False, False
+    matrix, line_width, graphics_stack, path, strokes = (1, 0, 0, 1, 0, 0), 1, [], [], 0
+    for operands, operator in page_operations if page_operations is not None else verify_pdf.operations(page):
+        if operator == b"q":
+            graphics_stack.append((matrix, line_width, invisible, graphics_override))
+        elif operator == b"Q":
+            if not graphics_stack:
+                return False
+            matrix, line_width, invisible, graphics_override = graphics_stack.pop()
+        elif operator == b"cm":
+            a, b, c, d, e, f = (float(value) for value in operands)
+            aa, bb, cc, dd, ee, ff = matrix
+            matrix = (a*aa+b*cc, a*bb+b*dd, c*aa+d*cc, c*bb+d*dd, e*aa+f*cc+ee, e*bb+f*dd+ff)
+        elif operator == b"w":
+            line_width = float(operands[0])
+        if operator in (b"m", b"l"):
+            x, y = (float(value) for value in operands)
+            a, b, c, d, e, f = matrix
+            path.append((operator, x*a+y*c+e, x*b+y*d+f))
+        elif operator == b"re":
+            x, y, width, height = (float(value) for value in operands)
+            a, b, c, d, e, f = matrix
+            corners = [(xx*a+yy*c+e, xx*b+yy*d+f) for xx, yy in ((x, y), (x+width, y), (x+width, y+height), (x, y+height))]
+            axis_aligned = (b == c == 0 or a == d == 0)
+            path.append((operator, corners, axis_aligned))
+        elif operator in (b"c", b"v", b"y", b"h"):
+            path.append((operator,))
+        if operator == b"Tr":
+            invisible = int(operands[0]) in (3, 7)
+            if int(operands[0]) in (4, 5, 6, 7):
+                graphics_override = True
+        if operator == b"gs":
+            # Opacity and optional-content effects need a richer visibility check.
+            graphics_override = True
+        if operator in (b"W", b"W*"):
+            # A simple page/cell crop containing the entire link is harmless.
+            # Unknown, empty or intersecting clips remain ambiguous until Q.
+            safe_clip = len(path) == 1 and path[0][0] == b"re" and path[0][2]
+            if safe_clip:
+                xs, ys = zip(*path[0][1])
+                safe_clip = (all(math.isfinite(value) for value in (*xs, *ys))
+                             and min(xs) <= rectangle[0] < rectangle[2] <= max(xs)
+                             and min(ys) <= rectangle[1] < rectangle[3] <= max(ys))
+            graphics_override |= not safe_clip
+        if operator in (b"BMC", b"BDC"):
+            properties = resolved(operands[1]) if operator == b"BDC" and len(operands) > 1 else {}
+            if isinstance(properties, NameObject):
+                properties = resolved(resolved(page.get("/Resources", DictionaryObject())).get("/Properties", DictionaryObject())).get(properties)
+                properties = resolved(properties)
+            identifier = verify_pdf.integer(properties.get("/MCID")) if isinstance(properties, dict) else None
+            unsafe = (str(operands[0]) in ("/Artifact", "/OC") or not isinstance(properties, dict)
+                      or any(key in properties for key in ("/Alt", "/ActualText", "/OC")))
+            stack.append((identifier, unsafe))
+            if identifier in mcids:
+                counts[identifier] = counts.get(identifier, 0) + 1
+        selected = {identifier for identifier, _ in stack if identifier in mcids}
+        if selected and (any(unsafe for _, unsafe in stack) or len(selected) != 1):
+            return False
+        if selected and operator == b"S":
+            # Word/LibreOffice often puts the ordinary hyperlink underline in
+            # the text's MCID. It is not an additional graphic description.
+            a, b, c, d, _, _ = matrix
+            width = abs(line_width) * max(math.hypot(a, b), math.hypot(c, d))
+            left, bottom, right, top = rectangle
+            if (graphics_override or strokes >= len(mcids) or not selected <= rendered or len(path) != 2
+                    or path[0][0] != b"m" or path[1][0] != b"l"
+                    or not all(math.isfinite(value) for point in path for value in point[1:])
+                    or abs(path[0][2] - path[1][2]) > 0.01
+                    or not 0 < width <= min(2, (top-bottom)*0.2)
+                    or not (right-left)*0.5 <= abs(path[1][1]-path[0][1]) <= right-left
+                    # Exported link rectangles may round differently from the
+                    # underline endpoints. Half a point covers that rounding,
+                    # without accepting a stroke outside the link's region.
+                    or not all(left-0.5 <= point[1] <= right+0.5 and bottom <= point[2] <= bottom+(top-bottom)*0.35 for point in path)):
+                return False
+            strokes += 1
+        if selected and operator in (b"Do", b"INLINE IMAGE", b"s", b"f", b"F", b"f*", b"B", b"B*", b"b", b"b*", b"sh"):
+            return False
+        if selected and operator in (b"Tj", b"TJ", b"'", b'"'):
+            if invisible or graphics_override or not all(math.isfinite(value) for value in matrix) or abs(matrix[0]*matrix[3]-matrix[1]*matrix[2]) < 1e-10:
+                return False
+            rendered.update(selected)
+        if operator == b"EMC":
+            if not stack:
+                return False
+            stack.pop()
+        if operator in (b"S", b"s", b"f", b"F", b"f*", b"B", b"B*", b"b", b"b*", b"n"):
+            path = []
+    return not stack and not graphics_stack and rendered == mcids and counts == {identifier: 1 for identifier in mcids}
+
+
+def native_link_descriptions(reader, *, targets=None, include_existing=False):
+    """Verified source-tagged, single-page links with literal native labels."""
+    if reader.trailer["/Root"].get("/StructTreeRoot") is None:
+        return {}
+    inventory = verify_pdf.structure_inventory(reader)
+    if inventory.get("checks_complete") is not True or len(inventory["tags"]) > MAX_TAGS:
+        return {}
+    tags = {tag["id"]: tag for tag in inventory["tags"]}
+    owners = {}
+    for tag in tags.values():
+        for item in tag.get("contentSequence", []):
+            if item.get("kind") == "objectReference":
+                owners.setdefault(item.get("annotationId"), []).append(tag["id"])
+    states, result, page_operations, paint_attempts, scanned_operations = annotation_states(reader), {}, {}, 0, 0
+    for tag in tags.values():
+        if tag["role"] != "Link" or tag["sourceRole"] != "Link" or tag.get("textIncomplete") or tag.get("attributeGaps"):
+            continue
+        sequence = tag.get("contentSequence", [])
+        refs = [item for item in sequence if item.get("kind") == "objectReference"]
+        marks = [item for item in sequence if item.get("kind") == "markedContent"]
+        if (len(refs) != 1 or not marks or len(sequence) > 64 or len(sequence) != len(marks) + 1
+                or any(item.get("resolved") is not True or item.get("parentTreeVerified") is not True for item in sequence)
+                or any("streamId" in item for item in marks)
+                or len({item.get("mcid") for item in marks}) != len(marks)):
+            continue
+        reference = refs[0]
+        page_number, index = reference.get("pageNumber"), reference.get("annotationIndex")
+        if (type(page_number) is not int or type(index) is not int or reference.get("subtype") != "Link"
+                or any(item.get("pageNumber") != page_number for item in marks)
+                or owners.get(reference.get("annotationId")) != [tag["id"]]):
+            continue
+        key = (page_number, index)
+        if targets is not None and key not in targets:
+            continue
+        # An ancestor replacement can override the visible/native link label.
+        current, seen, overrides = tag, set(), False
+        while current and current["id"] not in seen:
+            seen.add(current["id"])
+            overrides |= "alt" in current or "actualText" in current
+            current = tags.get(current.get("parentId"))
+        page = reader.pages[page_number - 1]
+        annotation = resolved(page["/Annots"][index - 1])
+        if not include_existing and "/Contents" in annotation:
+            continue
+        if overrides or any(key in annotation for key in ("/Alt", "/ActualText", "/OC")):
+            continue
+        action = resolved(annotation.get("/A"))
+        if "/A" in annotation and "/Dest" in annotation:
+            continue
+        if reference.get("actionType") == "URI":
+            if not isinstance(action, dict) or not isinstance(action.get("/URI"), TextStringObject) or not re.match(r"^(?:https?://|mailto:|tel:)\S+$", str(action["/URI"]), re.I):
+                continue
+        elif reference.get("destinationResolved") is not True or (action is not None and reference.get("actionType") != "GoTo"):
+            continue
+        try:
+            rectangle = [float(value) for value in resolved(annotation.get("/Rect", ArrayObject()))]
+            crop = [float(value) for value in page.cropbox]
+            flags = int(annotation.get("/F", 0))
+            if (len(rectangle) != 4 or not all(math.isfinite(value) for value in rectangle + crop)
+                    or flags & (1 | 2 | 32) or not crop[0] <= rectangle[0] < rectangle[2] <= crop[2]
+                    or not crop[1] <= rectangle[1] < rectangle[3] <= crop[3]):
+                continue
+        except (ValueError, TypeError):
+            continue
+        label = link_label(tag.get("text"))
+        if label is None or label != link_label("".join(item.get("text") or "" for item in marks)):
+            continue
+        # Optional cleanup must not consume unbounded scans or reject the PDF
+        # simply because further links need review. Candidate matching examines
+        # only these source-proven targets, avoiding differences in scan order.
+        if paint_attempts >= MAX_LINK_DESCRIPTIONS:
+            break
+        paint_attempts += 1
+        if page_number not in page_operations:
+            page_operations[page_number] = verify_pdf.operations(page)
+        scanned_operations += len(page_operations[page_number])
+        if scanned_operations > MAX_LINK_SCAN_OPERATIONS:
+            break
+        if not simple_link_paint(page, {item["mcid"] for item in marks}, rectangle, page_operations[page_number]):
+            continue
+        result[key] = {"label": label, "tagId": tag["id"],
+                       "sequence": [{name: value for name, value in item.items() if name != "description"} for item in sequence],
+                       "state": {name: value for name, value in states[key].items() if name != "/Contents"}}
+    return result
+
+
+def verify_added_link_descriptions(original, candidate):
+    # This increment does not infer link labels for OpenDataLoader's new tags.
+    if original.trailer["/Root"].get("/StructTreeRoot") is None:
+        return
+    before, after = annotation_states(original), annotation_states(candidate)
+    additions = [key for key in before if "/Contents" not in before[key] and "/Contents" in after.get(key, {})]
+    if not additions:
+        return
+    source_links = native_link_descriptions(original)
+    candidate_links = native_link_descriptions(candidate, targets=source_links, include_existing=True)
+    if len(additions) > MAX_LINK_DESCRIPTIONS:
+        fail("pdf_complexity_limit")
+    for key in additions:
+        expected = source_links.get(key)
+        annotation = resolved(candidate.pages[key[0] - 1]["/Annots"][key[1] - 1])
+        if (expected is None or candidate_links.get(key) != expected
+                or not isinstance(annotation.get("/Contents"), TextStringObject)
+                or str(annotation["/Contents"]) != expected["label"]):
+            fail("native_pdf_preservation")
+
+
+def add_link_descriptions(original, candidate, writer):
+    source_links = native_link_descriptions(original)
+    candidate_links = native_link_descriptions(candidate, targets=source_links, include_existing=True)
+    changes = []
+    for key, expected in source_links.items():
+        old = resolved(original.pages[key[0] - 1]["/Annots"][key[1] - 1])
+        if "/Contents" in old or candidate_links.get(key) != expected:
+            continue
+        annotation = resolved(writer.pages[key[0] - 1]["/Annots"][key[1] - 1])
+        if "/Contents" in annotation:
+            continue
+        if len(changes) >= MAX_LINK_DESCRIPTIONS:
+            break
+        annotation[NameObject("/Contents")] = TextStringObject(expected["label"])
+        changes.append({"code": "link_description_added", "message": "Added the link's existing visible text as its description.",
+                        "tagId": expected["tagId"], "pageNumber": key[0]})
+    return changes
+
+
+def verify_saved_annotations(original, before, after):
+    old, new = annotation_states(before), annotation_states(after)
+    if old.keys() != new.keys():
+        fail("native_pdf_preservation")
+    for key, value in old.items():
+        changed = new[key]
+        if "/Contents" not in value and "/Contents" in changed:
+            changed = {name: digest for name, digest in changed.items() if name != "/Contents"}
+        if changed != value:
+            fail("native_pdf_preservation")
+    verify_added_link_descriptions(original, after)
+
+
 def set_metadata(writer, title=None, language=None):
     root, changes = writer.root_object, []
     existing_title = str((writer.metadata or {}).get("/Title", "")).strip()
@@ -415,13 +683,15 @@ def apply_plan(original, candidate, plan, output):
     operations = plan.get("operations")
     if not isinstance(operations, list) or len(operations) > MAX_OPS:
         fail("native_pdf_invalid_plan")
+    verify_added_link_descriptions(original, candidate)
     inventory = enrich_inventory(candidate, original)
     nodes = native_nodes(candidate)
     if len(nodes) != len(inventory["tags"]) or any(str(node.get("/S", "")).lstrip("/") != tag["sourceRole"] for node, tag in zip(nodes, inventory["tags"])):
         fail("native_pdf_preservation")
     writer = PdfWriter(clone_from=candidate)
     targets = native_nodes(writer)
-    changes = set_metadata(writer, plan.get("title"), plan.get("language"))
+    changes = add_link_descriptions(original, candidate, writer)
+    changes.extend(set_metadata(writer, plan.get("title"), plan.get("language")))
     used = set()
     for operation in operations:
         if not isinstance(operation, dict) or operation.get("type") not in ("set_role", "set_alt", "set_table_header"):
@@ -463,6 +733,7 @@ def apply_plan(original, candidate, plan, output):
             message = "Identified this table cell as a header for its row or column."
         changes.append({"code": operation["type"], "message": message, "tagId": identifier, "pageNumber": tag["pageNumber"]})
     reopened = write_pdf(writer, output)
+    verify_saved_annotations(original, candidate, reopened)
     actual = enrich_inventory(reopened, original)
     if len(actual["tags"]) != len(inventory["tags"]):
         fail("native_pdf_preservation")
@@ -566,6 +837,7 @@ def normalized_finding(item, inventory):
 def response(original_path, candidate_path, changes, toolchain):
     before = open_pdf(original_path.read_bytes())
     after = open_pdf(candidate_path.read_bytes())
+    verify_added_link_descriptions(before, after)
     checks = verify_pdf.compare_pdfs(original_path, candidate_path)
     # Preservation failures cannot be waived by a model or converted to a
     # normal warning. Incomplete semantic inspection remains a visible issue.
@@ -644,8 +916,10 @@ def process(mode, request_path, directory, toolchain):
         else:
             candidate = original
         writer = PdfWriter(clone_from=candidate)
+        changes.extend(add_link_descriptions(original, candidate, writer))
         changes.extend(set_metadata(writer))
-        write_pdf(writer, output_path)
+        reopened = write_pdf(writer, output_path)
+        verify_saved_annotations(original, candidate, reopened)
     elif mode == "repair":
         try:
             data = json.loads(request_path.read_bytes())
