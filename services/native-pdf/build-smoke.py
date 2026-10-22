@@ -18,7 +18,8 @@ import secrets
 import threading
 
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+from pypdf.generic import (ArrayObject, BooleanObject, ByteStringObject, DecodedStreamObject,
+                          DictionaryObject, NameObject, NumberObject, TextStringObject)
 
 import server
 
@@ -39,6 +40,67 @@ def synthetic_pdf():
     content.set_data(b"BT /F1 18 Tf 72 720 Td (Native PDF build check) Tj ET\n"
                      b"BT /F1 12 Tf 72 680 Td (This synthetic page tests preserved text and layout.) Tj ET\n")
     page[NameObject("/Contents")] = writer._add_object(content)
+    result = io.BytesIO()
+    writer.write(result)
+    return result.getvalue()
+
+
+def synthetic_hybrid_pdf():
+    """A wholly synthetic tagged form, including synthetic Reader-rights data."""
+    writer = PdfWriter(clone_from=PdfReader(io.BytesIO(synthetic_pdf())))
+    page = writer.pages[0]
+    content = page["/Contents"]
+    content.set_data(b"/P <</MCID 0>> BDC\n" + content.get_data() + b"EMC\n")
+    font = page["/Resources"]["/Font"]["/F1"]
+    widget = DictionaryObject({NameObject("/Type"): NameObject("/Annot"), NameObject("/Subtype"): NameObject("/Widget"),
+        NameObject("/FT"): NameObject("/Tx"), NameObject("/T"): TextStringObject("name[0]"),
+        NameObject("/V"): TextStringObject(""), NameObject("/DA"): TextStringObject("/F1 12 Tf 0 g"),
+        NameObject("/Rect"): ArrayObject([NumberObject(n) for n in (72, 610, 280, 632)]),
+        NameObject("/P"): page.indirect_reference, NameObject("/StructParent"): NumberObject(1)})
+    widget_ref = writer._add_object(widget)
+    parent = DictionaryObject({NameObject("/T"): TextStringObject("workshop[0]"), NameObject("/Kids"): ArrayObject([widget_ref])})
+    parent_ref = writer._add_object(parent)
+    widget[NameObject("/Parent")] = parent_ref
+    page[NameObject("/Annots")] = ArrayObject([widget_ref])
+    packets = ArrayObject()
+    for name, value in (
+        ("config", '<config xmlns="http://www.xfa.org/schema/xci/3.0/"><acrobat><acrobat7><dynamicRender>forbidden</dynamicRender></acrobat7></acrobat></config>'),
+        ("template", '<template xmlns="http://www.xfa.org/schema/xfa-template/3.6/"><subform name="workshop"><field name="name"><ui><textEdit/></ui><assist><speak disable="1">Fictional workshop name</speak></assist></field></subform></template>'),
+        ("datasets", '<datasets xmlns="http://www.xfa.org/schema/xfa-data/1.0/"><data><workshop><name/></workshop></data></datasets>'),
+    ):
+        packet = DecodedStreamObject()
+        packet.set_data(value.encode())
+        packet[NameObject("/Type")] = NameObject("/EmbeddedFile")
+        packets.extend([TextStringObject(name), writer._add_object(packet)])
+    writer.root_object[NameObject("/AcroForm")] = DictionaryObject({NameObject("/Fields"): ArrayObject([parent_ref]),
+        NameObject("/DA"): TextStringObject("/F1 12 Tf 0 g"), NameObject("/DR"): DictionaryObject({NameObject("/Font"): DictionaryObject({NameObject("/F1"): font})}),
+        NameObject("/XFA"): packets, NameObject("/SigFlags"): NumberObject(2)})
+    structure = DictionaryObject({NameObject("/Type"): NameObject("/StructTreeRoot")})
+    structure_ref = writer._add_object(structure)
+    document = DictionaryObject({NameObject("/Type"): NameObject("/StructElem"), NameObject("/S"): NameObject("/Document"), NameObject("/P"): structure_ref})
+    document_ref = writer._add_object(document)
+    paragraph = DictionaryObject({NameObject("/Type"): NameObject("/StructElem"), NameObject("/S"): NameObject("/P"),
+        NameObject("/P"): document_ref, NameObject("/Pg"): page.indirect_reference, NameObject("/K"): NumberObject(0)})
+    paragraph_ref = writer._add_object(paragraph)
+    form_tag = DictionaryObject({NameObject("/Type"): NameObject("/StructElem"), NameObject("/S"): NameObject("/Form"),
+        NameObject("/P"): document_ref, NameObject("/Pg"): page.indirect_reference,
+        NameObject("/K"): DictionaryObject({NameObject("/Type"): NameObject("/OBJR"), NameObject("/Obj"): widget_ref, NameObject("/Pg"): page.indirect_reference})})
+    form_ref = writer._add_object(form_tag)
+    document[NameObject("/K")] = ArrayObject([paragraph_ref, form_ref])
+    structure[NameObject("/K")] = document_ref
+    structure[NameObject("/ParentTree")] = DictionaryObject({NameObject("/Nums"): ArrayObject([NumberObject(0), ArrayObject([paragraph_ref]), NumberObject(1), form_ref])})
+    page[NameObject("/StructParents")] = NumberObject(0)
+    writer.root_object[NameObject("/StructTreeRoot")] = structure_ref
+    writer.root_object[NameObject("/MarkInfo")] = DictionaryObject({NameObject("/Marked"): BooleanObject(True)})
+    writer.root_object[NameObject("/Lang")] = TextStringObject("en-US")
+    reference = DictionaryObject({NameObject("/Type"): NameObject("/SigRef"), NameObject("/TransformMethod"): NameObject("/UR3"),
+        NameObject("/Data"): writer.root_object.indirect_reference, NameObject("/TransformParams"): DictionaryObject({
+            NameObject("/Type"): NameObject("/TransformParams"), NameObject("/V"): NameObject("/2.2"),
+            NameObject("/Document"): ArrayObject([NameObject("/FullSave")])})})
+    signature = DictionaryObject({NameObject("/Type"): NameObject("/Sig"), NameObject("/Filter"): NameObject("/Adobe.PPKLite"),
+        NameObject("/SubFilter"): NameObject("/adbe.pkcs7.detached"), NameObject("/Contents"): ByteStringObject(b"\x9fsynthetic-build-usage-rights"),
+        NameObject("/ByteRange"): ArrayObject([NumberObject(n) for n in (0, 10, 40, 10)]), NameObject("/Reference"): ArrayObject([writer._add_object(reference)])})
+    writer.root_object[NameObject("/Perms")] = DictionaryObject({NameObject("/UR3"): writer._add_object(signature)})
     result = io.BytesIO()
     writer.write(result)
     return result.getvalue()
@@ -127,9 +189,29 @@ def main():
         require(any(item["id"] == tag["id"] and item["role"] == target_role
                     for item in repaired["inventory"]["tags"]), "Requested native tag edit was not saved")
         require(any(change["code"] == "set_role" for change in repaired["changes"]), "Native edit was not recorded")
+        hybrid_source = synthetic_hybrid_pdf()
+        status, hybrid_prepared = request(service, "/prepare", hybrid_source)
+        require(status == 200, "Installed hybrid preparation failed: " + str(hybrid_prepared.get("error", {}).get("code", status)))
+        assert_result(hybrid_prepared, hybrid_source)
+        hybrid_info = hybrid_prepared["inventory"]["forms"]["hybrid"]
+        require(hybrid_info["nativeFieldDescriptionsAdded"] == 1 and hybrid_info["readerUsageRightsRemoved"] is True,
+                "Hybrid preparation did not apply its bounded changes")
+        hybrid_payload = {"sourcePdfBase64": base64.b64encode(hybrid_source).decode("ascii"),
+                          "candidatePdfBase64": hybrid_prepared["pdfBase64"],
+                          "plan": {"schemaVersion": 1, "candidateSha256": hybrid_prepared["candidateSha256"], "operations": []}}
+        status, hybrid_repaired = request(service, "/repair", json.dumps(hybrid_payload).encode())
+        require(status == 200, "Installed hybrid repair failed: " + str(hybrid_repaired.get("error", {}).get("code", status)))
+        assert_result(hybrid_repaired, hybrid_source)
+        original_hybrid = PdfReader(io.BytesIO(hybrid_source))
+        saved_hybrid = PdfReader(io.BytesIO(base64.b64decode(hybrid_repaired["pdfBase64"], validate=True)))
+        require("/Perms" not in saved_hybrid.trailer["/Root"], "Obsolete Reader rights remained in repaired copy")
+        require(saved_hybrid.get_fields()["workshop[0].name[0]"]["/TU"] == "Fictional workshop name", "Authored form label was not saved")
+        original_packets, saved_packets = (pdf.trailer["/Root"]["/AcroForm"]["/XFA"] for pdf in (original_hybrid, saved_hybrid))
+        require(all(original_packets[i].get_object().get_data() == saved_packets[i].get_object().get_data()
+                    for i in range(1, len(original_packets), 2)), "Hybrid XFA packets changed")
         # Counts, tool versions and success states are safe build diagnostics.
         print("Native PDF build smoke passed: authenticated HTTP, OpenDataLoader tagging, "
-              "native repair, veraPDF validation, identical page pixels and preserved content.")
+              "native repair, static hybrid form preservation, veraPDF validation, identical page pixels and preserved content.")
     finally:
         service.shutdown()
         service.server_close()

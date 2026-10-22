@@ -157,7 +157,7 @@ class NativeLinkDescriptionTests(unittest.TestCase):
 
     def test_prepare_repairs_before_model_and_repair_is_idempotent(self):
         request = self.folder / "request.pdf"; request.write_bytes(link_bytes())
-        with patch.object(worker, "response", side_effect=lambda source, result, changes, tools: changes):
+        with patch.object(worker, "response", side_effect=lambda source, result, changes, tools, **verification: changes):
             changes = worker.process("prepare", request, self.folder, {})
         self.assertEqual("link_description_added", changes[0]["code"])
         original, candidate = worker.open_pdf(request.read_bytes()), worker.open_pdf(self.output.read_bytes())

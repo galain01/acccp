@@ -658,6 +658,66 @@ describe("native PDF orchestration", () => {
     ]);
   });
 
+  it("keeps hybrid form evidence and interaction warnings when the auditor reports no additional issues", async () => {
+    const state = await makeState();
+    state.inventory.forms = {
+      fields: [{ name: "Applicant name", alternativeName: "Full name" }],
+      hybrid: {
+        type: "static-xfa-with-acroform",
+        xfaPreserved: true,
+        formLogicPreserved: true,
+        nativeFieldDescriptionsAdded: 1,
+        readerUsageRightsRemoved: true,
+        interactiveViewerReviewRequired: true,
+      },
+    };
+    state.findings = [
+      {
+        code: "legacy_form_interaction_review",
+        severity: "warning",
+        message:
+          "Check that Acrobat announces the field labels and operates the checkbox choices correctly.",
+      },
+    ];
+    state.changes = [
+      {
+        code: "hybrid-field-label-added",
+        pageNumber: 1,
+        message:
+          "Copied the existing form description into the PDF field label.",
+      },
+    ];
+    useState(state);
+    const result = await repairNativePdf(state.pdf, "fillable-form.pdf");
+    if ("error" in result) throw Error(result.error);
+
+    for (const [prompt, parts] of mocks.call.mock.calls) {
+      expect(scope(parts)).toMatchObject({
+        forms: state.inventory.forms,
+        findings: state.findings,
+      });
+      expect(prompt).toContain(
+        "A native field label is not proof of what Acrobat announces"
+      );
+      expect(prompt).toContain("PDF excerpts may omit the form layer");
+    }
+    expect(result.errors).toEqual([
+      expect.objectContaining({
+        severity: "warning",
+        message: state.findings[0].message,
+      }),
+    ]);
+    expect(result.changes).toEqual([
+      "Page 1: Copied the existing form description into the PDF field label.",
+    ]);
+    expect(result.nativePdfChecks).toMatchObject({
+      auditComplete: true,
+      screenReaderTestPerformed: false,
+      conformanceClaim: false,
+    });
+    expect(result.pdf).toEqual(state.pdf);
+  });
+
   it.each(["metadata-missing", "display-title-missing"])(
     "retains an actual saved %s failure even when the semantic audit finds no additional problem",
     async (code) => {

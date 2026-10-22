@@ -56,8 +56,34 @@ correctly mapped to paragraphs or headings are eligible too. The repair changes
 only the block's native role, with bounded inline descendants and independently
 verified content ownership; it never absorbs a nested block, table or figure.
 
+### Fillable forms
+
+Some older forms, such as the W-9 test document, store the same controls in two
+ways: standard PDF fields and an Adobe XFA form layer. The worker supports a
+limited fixed-layout subset when it can map every field between those layers
+and recognize the form's existing scripts. It preserves the original pages,
+fillable text fields, checkbox controls, values, appearances, XFA data and
+bindings. Accepted scripts are kept exactly; the repair service does not run
+them. Forms that change layout, reference external resources, contain unknown
+scripts or use unsupported controls remain unsupported.
+
+Preparation can copy an existing authored XFA field description into a missing
+standard PDF field label. It preserves existing labels, including empty ones.
+It also removes verified legacy Adobe Reader usage rights from the repaired
+copy because rewriting the PDF invalidates those rights. These rights are
+distinct from a person's digital signature; digitally signed documents remain
+unsupported. The original upload stays unchanged. A separate comparison checks
+each permitted change against the source before ordinary preservation checks.
+
+The XFA layer and its speech settings remain unchanged. If that layer disables
+field announcements, adding a standard PDF label may not change what Acrobat
+announces. The app retains a warning to check field announcements and checkbox
+choices in Acrobat before sharing the form. Machine checks, an AI audit and
+unchanged appearance cannot establish those interactive behaviors or PDF/UA
+conformance.
+
 The local research tools have broader, fixture-specific experiments for OCR,
-font substitution, form labels and appended descriptions. Those experiments are
+font substitution, broader form repairs and appended descriptions. Those experiments are
 not automatically applied to arbitrary uploaded files by this first app engine.
 Scanned text, complex forms, font defects and excluded content must remain
 visible issues when they cannot be safely repaired.
