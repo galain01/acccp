@@ -66,6 +66,22 @@ export interface NativePdfHeadingReviewTarget {
   currentRole: string;
   eligibleForResolution: boolean;
 }
+interface NativePdfArtifactReview {
+  pageNumber: number;
+  decision:
+    | "decorative-or-redundant"
+    | "meaningful-content-excluded"
+    | "uncertain";
+  explanation: string;
+}
+interface NativePdfArtifactReviewEvidence {
+  candidateSha256: string;
+  pages: (NativePdfArtifactReview & {
+    inventoryComplete: boolean;
+    pageAuditComplete: boolean;
+    reminderRetired: boolean;
+  })[];
+}
 export interface NativePdfConversionResult {
   pdf: Buffer;
   errors: AccessibilityError[];
@@ -80,6 +96,7 @@ export interface NativePdfConversionResult {
     auditComplete: boolean;
     screenReaderTestPerformed: false;
     priorMatchingInteractionTests?: MatchedNativePdfInteractionTests;
+    artifactTextReview?: NativePdfArtifactReviewEvidence;
   };
 }
 const invalid = (): never => {
@@ -143,13 +160,32 @@ export function nativePdfBatches(
     assigned.push(tag);
     tagsByPage.set(page, assigned);
   }
+  const candidateContextPages = new Map<string, Set<number>>();
+  for (const candidate of state.inventory.structureCandidates ?? []) {
+    const context =
+      candidateContextPages.get(candidate.tagId) ?? new Set<number>();
+    for (const relatedId of candidate.relatedTagIds) {
+      const related = byId.get(relatedId);
+      if (!related) throw new NativePdfError("pdf_protocol_error");
+      for (const page of pagesOf(related)) context.add(page);
+    }
+    candidateContextPages.set(candidate.tagId, context);
+  }
   const makeBatch = (
     pages: number[],
     assigned: NativePdfTag[],
     pageReviewPages = pages
   ): Batch => {
     const visualPages = [
-      ...new Set([...pages, ...assigned.flatMap(pagesOf)]),
+      ...new Set([
+        ...pages,
+        ...assigned.flatMap(pagesOf),
+        // Cross-page source relationships need the related page's appearance
+        // even when its tags belong to a different batch. Ownership stays put.
+        ...assigned.flatMap((tag) => [
+          ...(candidateContextPages.get(tag.id) ?? []),
+        ]),
+      ]),
     ].sort((a, b) => a - b);
     return {
       pages,
@@ -411,13 +447,23 @@ export function parseNativePdfPlan(
     if (
       op.type === "repair_structure" &&
       Object.keys(op).every((key) =>
-        ["type", "tagId", "candidateId", "role"].includes(key)
+        ["type", "tagId", "candidateId", "role", "alt"].includes(key)
       )
     ) {
       const candidate = state.inventory.structureCandidates?.find(
         (c) => c.tagId === tag.id && c.candidateId === op.candidateId
       );
       if (!candidate) return invalid();
+      if (candidate.kind === "describe_chart") {
+        if (op.role !== undefined || !text(op.alt, 8000)) return invalid();
+        return {
+          ...common,
+          type: "repair_structure",
+          candidateId: candidate.candidateId,
+          alt: op.alt,
+        };
+      }
+      if (op.alt !== undefined) return invalid();
       if (candidate.kind === "split_heading") {
         if (!["H2", "H3", "H4", "H5", "H6"].includes(String(op.role)))
           return invalid();
@@ -482,6 +528,30 @@ export function coalesceNativePdfOperations(
   operations: NativePdfOperation[],
   state: NativePdfState
 ): NativePdfOperation[] {
+  // Whole-table, chart and callout repairs establish the roles of their
+  // source-derived participants together. A different page/tag batch can
+  // propose an ordinary role change without seeing that selected operation.
+  const structureTargets = new Set(
+    operations.flatMap((operation) => {
+      if (operation.type !== "repair_structure") return [];
+      const candidate = state.inventory.structureCandidates?.find(
+        (candidate) =>
+          candidate.candidateId === operation.candidateId &&
+          candidate.tagId === operation.tagId &&
+          [
+            "rebuild_table",
+            "move_callout",
+            "move_page_continuation",
+            "describe_chart",
+          ].includes(candidate.kind)
+      );
+      return candidate
+        ? [candidate.tagId, ...candidate.relatedTagIds].filter(
+            (id) => !candidate.readonlyTagIds?.includes(id)
+          )
+        : [];
+    })
+  );
   const noteTargets = new Set(
     operations.flatMap((operation) => {
       if (operation.type !== "repair_structure") return [];
@@ -498,16 +568,19 @@ export function coalesceNativePdfOperations(
     (operation) =>
       !(
         operation.type === "set_role" &&
-        operation.role === "Note" &&
-        noteTargets.has(operation.tagId)
+        (structureTargets.has(operation.tagId) ||
+          (operation.role === "Note" && noteTargets.has(operation.tagId)))
       )
   );
 }
-export function parseNativePdfAudit(
+function parseNativePdfAuditEvidence(
   raw: Record<string, unknown>,
   batch: Batch,
   state?: NativePdfState
-): NativePdfFinding[] {
+): {
+  findings: NativePdfFinding[];
+  artifactReviews: NativePdfArtifactReview[];
+} {
   if (
     Object.keys(raw).some(
       (k) =>
@@ -528,6 +601,7 @@ export function parseNativePdfAudit(
   )
     return invalid();
   const findings = parseNativePdfFindings(raw.findings, batch, state);
+  const artifactReviews: NativePdfArtifactReview[] = [];
   for (const key of ["artifactReviews", "textReviews"] as const) {
     const reviews = raw[key];
     const pass =
@@ -566,9 +640,118 @@ export function parseNativePdfAudit(
         )
       )
         return invalid();
+      if (key === "artifactReviews")
+        artifactReviews.push({
+          pageNumber: Number(review.pageNumber),
+          decision: review.decision as NativePdfArtifactReview["decision"],
+          explanation: String(review.explanation),
+        });
     }
   }
-  return findings;
+  return { findings, artifactReviews };
+}
+export function parseNativePdfAudit(
+  raw: Record<string, unknown>,
+  batch: Batch,
+  state?: NativePdfState
+): NativePdfFinding[] {
+  return parseNativePdfAuditEvidence(raw, batch, state).findings;
+}
+
+/** Resolve only the worker's request for semantic review of excluded text. */
+function reconcileNativePdfArtifactReminders(
+  workerFindings: NativePdfFinding[],
+  modelFindings: NativePdfFinding[],
+  state: NativePdfState,
+  batches: Batch[],
+  audits: PromiseSettledResult<{ artifactReviews: NativePdfArtifactReview[] }>[]
+): { findings: NativePdfFinding[]; evidence: NativePdfArtifactReviewEvidence } {
+  const byId = new Map(state.inventory.tags.map((tag) => [tag.id, tag]));
+  const pagesForTag = (tagId: string): Set<number> => {
+    const pages = new Set<number>();
+    const pending = [tagId];
+    const seen = new Set<string>();
+    while (pending.length) {
+      const id = pending.pop()!;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const tag = byId.get(id);
+      if (!tag) continue;
+      pagesOf(tag).forEach((page) => pages.add(page));
+      pending.push(...tag.children);
+    }
+    return pages;
+  };
+  const missingContent = [...workerFindings, ...modelFindings].filter(
+    (finding) => finding.code === "missing-content"
+  );
+  const conflicts = (page: number, reminder: NativePdfFinding): boolean =>
+    missingContent.some((finding) => {
+      if (finding.pageNumber === page) return true;
+      if (finding.tagId && finding.tagId === reminder.tagId) return true;
+      const tagPages = finding.tagId ? pagesForTag(finding.tagId) : undefined;
+      if (tagPages?.has(page)) return true;
+      // An unlocated or unmapped content-loss concern cannot be cleared by a
+      // positive review of one page. Located concerns on other pages remain.
+      return finding.pageNumber === undefined && !tagPages?.size;
+    });
+  const evidence: NativePdfArtifactReviewEvidence = {
+    candidateSha256: state.candidateSha256,
+    pages: audits.flatMap((audit, index) => {
+      if (audit.status !== "fulfilled") return [];
+      return audit.value.artifactReviews.map((review) => {
+        const matching = state.inventory.page_content.filter(
+          (page) => page.pageNumber === review.pageNumber
+        );
+        return {
+          ...review,
+          inventoryComplete:
+            state.inventory.page_content.length === state.pageCount &&
+            matching.length === 1 &&
+            state.inventory.page_content[review.pageNumber - 1] ===
+              matching[0] &&
+            matching[0].artifactTextComplete === true &&
+            typeof matching[0].artifactText === "string",
+          pageAuditComplete:
+            batches[index].pageReviewPages.includes(review.pageNumber) &&
+            batches.filter((batch) =>
+              batch.pageReviewPages.includes(review.pageNumber)
+            ).length === 1 &&
+            batches.every(
+              (batch, batchIndex) =>
+                !batch.visualPages.includes(review.pageNumber) ||
+                audits[batchIndex]?.status === "fulfilled"
+            ),
+          reminderRetired: false,
+        };
+      });
+    }),
+  };
+  const findings = workerFindings.filter((finding) => {
+    if (
+      finding.code !== "artifact_text_needs_semantic_review" ||
+      finding.severity !== "warning" ||
+      !Number.isInteger(finding.pageNumber) ||
+      finding.pageNumber! < 1 ||
+      finding.pageNumber! > state.pageCount
+    )
+      return true;
+    const matches = evidence.pages.filter(
+      (page) => page.pageNumber === finding.pageNumber
+    );
+    const review = matches.length === 1 ? matches[0] : undefined;
+    if (
+      !review ||
+      review.decision !== "decorative-or-redundant" ||
+      !review.inventoryComplete ||
+      !review.pageAuditComplete ||
+      conflicts(review.pageNumber, finding)
+    )
+      return true;
+    review.reminderRetired = true;
+    return false;
+  });
+  return { findings, evidence };
 }
 /** Only an explicit current-state review can retire a targeted heading concern. */
 export function parseNativePdfHeadingReviews(
@@ -1034,7 +1217,11 @@ export async function repairNativePdf(
         );
         const data = parsed(call.content);
         if (call.finishReason && call.finishReason !== "stop") return invalid();
-        const findings = parseNativePdfAudit(data, batch, repaired);
+        const { findings, artifactReviews } = parseNativePdfAuditEvidence(
+          data,
+          batch,
+          repaired
+        );
         const resolvedFindingIds = parseNativePdfHeadingReviews(
           data.repairFindingReviews,
           reviewTargets
@@ -1052,7 +1239,7 @@ export async function repairNativePdf(
           })
         )
           return invalid();
-        return { findings, resolvedFindingIds };
+        return { findings, resolvedFindingIds, artifactReviews };
       },
       false
     );
@@ -1100,8 +1287,15 @@ export async function repairNativePdf(
         });
       }
     });
-    const findings = reconcileNativePdfInteractionFindings(
+    const artifactReview = reconcileNativePdfArtifactReminders(
       workerFindings,
+      modelFindings,
+      repaired,
+      batches,
+      audits
+    );
+    const findings = reconcileNativePdfInteractionFindings(
+      artifactReview.findings,
       modelFindings,
       repaired,
       repairedInteractionTests
@@ -1173,6 +1367,7 @@ export async function repairNativePdf(
         ...repaired.machineChecks,
         auditComplete,
         screenReaderTestPerformed: false,
+        artifactTextReview: artifactReview.evidence,
         ...(repairedInteractionTests
           ? { priorMatchingInteractionTests: repairedInteractionTests }
           : {}),

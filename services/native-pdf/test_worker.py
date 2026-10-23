@@ -146,7 +146,7 @@ class NativeLinkDescriptionTests(unittest.TestCase):
         data = link_bytes()
         original, saved, changes = self.repair(data)
         self.assertEqual("Course reading guide", saved.pages[0]["/Annots"][0].get_object()["/Contents"])
-        self.assertEqual(["link_description_added"], [item["code"] for item in changes])
+        self.assertEqual(["link_description_added", "link_tab_order"], [item["code"] for item in changes])
         checks = worker.verify_pdf.compare_pdfs(self.source, self.output)
         self.assertTrue(checks["preservation"]["passed"])
         self.assertTrue(checks["preservation"]["pages"][0]["pixels_identical"])
@@ -163,8 +163,11 @@ class NativeLinkDescriptionTests(unittest.TestCase):
         original, candidate = worker.open_pdf(request.read_bytes()), worker.open_pdf(self.output.read_bytes())
         plan = {"schemaVersion": 1, "candidateSha256": worker.digest(self.output.read_bytes()), "operations": []}
         next_output = self.folder / "again.pdf"
-        self.assertEqual([], worker.apply_plan(original, candidate, plan, next_output))
+        self.assertEqual(["link_tab_order"], [item["code"] for item in worker.apply_plan(original, candidate, plan, next_output)])
         self.assertEqual(worker.annotation_states(candidate), worker.annotation_states(worker.open_pdf(next_output.read_bytes())))
+        candidate = worker.open_pdf(next_output.read_bytes())
+        plan["candidateSha256"] = worker.digest(next_output.read_bytes())
+        self.assertEqual([], worker.apply_plan(original, candidate, plan, self.folder / "third.pdf"))
 
     def test_resolved_internal_destination_is_retained(self):
         def destination(writer, link, annotation):

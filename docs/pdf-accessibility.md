@@ -54,7 +54,7 @@ The current general repair operations add a missing title or language, identify
 supported text blocks as paragraphs/headings/captions/notes, add missing figure
 descriptions, and identify simple table headers. Authored descriptions and
 ActualText are preserved. The model cannot replace arbitrary PDF content, change
-form behavior or create external references. Complex tables and uncertain
+form behavior or create external references. Unsupported tables and uncertain
 relationships remain findings.
 
 The worker also offers narrowly verified structure candidates. The model may
@@ -71,13 +71,56 @@ they do not rewrite wording or redraw pages. Unsupported boundaries and unclear
 relationships remain for review. Saved tag lineage keeps historical and current
 inventories aligned when a repair adds structure nodes. If optional candidate
 discovery reaches its work limit, other repairs and checks continue with a
-visible warning that the heading/list/note suggestions need review.
+visible warning that the structural suggestions need review.
+
+Additional source-bound candidates support aligned two-column tables whose text
+was tagged as paragraphs, vector charts with missing figure descriptions, and
+short linked callouts that interrupt a body sentence. Table repair separates
+existing text instructions into cells and supplies column, row and group header
+associations; notes remain outside the table. Chart repair groups verified plot
+graphics and labels into a native Figure and attaches a detailed source-grounded
+description proposed by the model. Reading-order repair joins the body fragments
+and moves the callout after them in the tag tree. All three preserve visible
+positions, wording, graphics and links. They require verified geometry and
+content boundaries, followed by independent inspection of the saved structure.
+Ambiguous cells, plots or reading relationships remain findings rather than
+being guessed. The model audit then checks the repaired relationships and
+chart descriptions against the original pages.
+
+Table repair can also mark an untagged, uniform light background as decorative
+when native instructions prove it is a constant fill tightly surrounding only
+the table. Gradients, transparent fills, authored markings and uncertain
+graphics remain untouched. Reopening verifies the exact background instructions
+and resources as well as the table's text and header relationships.
+
+When verified charts precede the continuation of an unfinished sentence from
+the previous page, a separate candidate can move that unchanged paragraph
+directly after its preceding paragraph in reading order. It requires an exact
+source-bound anchor and compatible prior-repair proof if the anchor's heading
+was split. Chart titles become native captions inside their figures. Pages
+containing only fully tagged links can also gain a missing keyboard navigation
+setting so Tab follows the structure order. Existing authored settings, form
+pages and ambiguous annotation ownership are preserved.
 
 Missing Note identifiers are added automatically when the existing identifier
 tree is unambiguous. Decorative marked content and literally empty markers do
 not require content tags, but meaningful unowned text or graphics still fail
 the structure check. The independent auditor remains responsible for checking
 whether content marked decorative actually carries meaning.
+
+An excluded-text review reminder is retired only when its page has a complete
+exclusion inventory, every audit batch touching that page finishes, the assigned
+page reviewer confirms the excluded text is decorative or redundant, and no
+conflicting content-loss finding remains. Saved review evidence records the
+decision, explanation and exact output hash. Actual machine failures and
+uncertain or incomplete reviews remain visible.
+
+The audit treats extracted text as evidence rather than a recording of screen
+reader speech. Some PDFs express spaces through character positions; extraction
+engines can join words that are visibly separated. A joined inventory string
+alone does not establish a delivered accessibility defect. The review still
+checks missing words, numbers, negation and authored text alternatives, and
+does not invent replacement text to compensate for extraction uncertainty.
 
 Model batches keep a page's tags together where possible and split by serialized
 evidence size as well as page and tag counts. Dense pages have one
@@ -306,3 +349,32 @@ continued after dismissing it; no font or Acrobat configuration changes were
 made. Keyboard signing, dating and certification strikeout were not established
 by these checks, so their specific interaction-review concerns remain. These
 local results do not claim PDF/UA conformance or activate a hosted release.
+
+## Automatic structure repair verification, 2026-10-23
+
+Local verification passed 311 Python worker tests, 170 native-PDF app tests,
+TypeScript and scoped ESLint checks. The rebuilt nonroot Linux worker passed
+its installed-toolchain HTTP smoke test. Replaying the real model plan through
+the production supervisor completed in 48.91 seconds, within the unchanged
+90-second request limit and existing CPU, memory and file bounds.
+
+A full repair and independent model audit of the four-page Einstadter journal
+PDF completed in 113 seconds. It rebuilt the 19-row table with column, group,
+subgroup and row-header associations; attached detailed descriptions to both
+native chart Figures; separated three run-in section headings; repaired three
+interrupting callouts and the cross-page Methods continuation; and supplied
+structure-order keyboard navigation for the four link-only pages. The audit
+reported no remaining table, chart-description or reading-order defect. Four
+excluded-text reminders were retired with complete, hash-bound review evidence.
+
+Independent comparison preserved original drawing instructions, text, resources,
+fonts, images, annotations and fields. Pages 2–4 were pixel-identical. Page 1's
+57-pixel rasterization difference at the primary scale passed the existing
+strict multiscale proof, with exact pixels at scales 1 and 2. No page was redrawn.
+
+The final report retains six findings about existing long URL descriptions on
+links, plus the source font-embedding failure and missing PDF/UA declaration.
+Extractor-dependent word-spacing concerns were investigated against the original
+and repaired files and are no longer asserted as proven screen-reader failures.
+No new desktop screen-reader test or PDF/UA conformance claim was made. This
+verification is local; it does not activate a hosted release.

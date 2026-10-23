@@ -89,6 +89,23 @@ def selection(candidates, kind=None):
         for item in candidates if kind is None or item['kind'] == kind]
 
 
+def run_in_fixture():
+    writer, named = fixture()
+    page = writer.pages[0]
+    medium = writer._add_object(DictionaryObject({N('/Type'): N('/Font'),
+        N('/Subtype'): N('/Type1'), N('/BaseFont'): N('/Courier')}))
+    page['/Resources']['/Font'][N('/Medium')] = medium
+    data = page['/Contents'].get_data().replace(
+        b'/Bold 10 Tf 1 0 0 1 20 170 Tm (Section title. ) Tj /Regular 10 Tf',
+        b'/Medium 10 Tf 1 0 0 1 20 170 Tm (Study approach) Tj (|) Tj /Regular 10 Tf')
+    data = data.replace(b'/Content << /MCID 1 >>',
+        b'/Content << /MCID 6 >> BDC 1 0 0 1 20 160 Tm (More original body text remains in its later text scope.) Tj EMC\n/Content << /MCID 1 >>')
+    page['/Contents'].set_data(data)
+    named['heading'][N('/K')] = ArrayObject([I(0), I(6)])
+    writer.root_object['/StructTreeRoot']['/ParentTree']['/Nums'][1].append(named['heading'].indirect_reference)
+    return writer, named
+
+
 class BoundedSemanticTests(unittest.TestCase):
     def source(self):
         writer, _ = fixture()
@@ -98,7 +115,97 @@ class BoundedSemanticTests(unittest.TestCase):
         writer = PdfWriter(clone_from=reader)
         result = b.apply_operations(reader, writer, operations)
         output = saved(writer)
-        return PdfReader(io.BytesIO(output)), result, output
+        reopened = PdfReader(io.BytesIO(output))
+        self.assertTrue(b.verify_saved(reopened, result['verification']))
+        return reopened, result, output
+
+    def test_run_in_separator_heading_keeps_all_later_mcids_with_body(self):
+        source = PdfReader(io.BytesIO(saved(run_in_fixture()[0])))
+        candidates = [item for item in b.discover_candidates(source) if item['kind'] == 'split_heading']
+        self.assertEqual(len(candidates), 1)
+        output, result, _ = self.repair(source, selection(candidates))
+        tags = b.v.structure_inventory(output)['tags']
+        heading = next(tag for tag in tags if tag['role'] == 'H2')
+        body = next(tag for tag in tags if 6 in tag['mcids'])
+        self.assertEqual(b._split_text(heading['text']), 'Study approach|')
+        self.assertEqual(heading['mcids'], [0])
+        self.assertEqual(body['role'], 'P')
+        self.assertEqual(body['mcids'], [7, 6])
+        self.assertTrue(all(item.get('parentTreeVerified') for item in body['contentSequence']))
+        self.assertEqual(source.pages[0].extract_text(), output.pages[0].extract_text())
+        self.assertEqual(b.paint_fingerprint(b.v.operations(source.pages[0])), b.paint_fingerprint(b.v.operations(output.pages[0])))
+        self.assertEqual(len(result['changes']), 1)
+
+    def test_run_in_separator_declines_ambiguous_font_delimiter_or_authored_meaning(self):
+        for mutation in ('font', 'font_alias', 'delimiter', 'baseline', 'override'):
+            with self.subTest(mutation=mutation):
+                writer, named = run_in_fixture()
+                stream = writer.pages[0]['/Contents']
+                data = stream.get_data()
+                if mutation == 'font':
+                    data = data.replace(b'/Medium 10 Tf', b'/Regular 10 Tf')
+                elif mutation == 'font_alias':
+                    fonts = writer.pages[0]['/Resources']['/Font']
+                    fonts[N('/Medium')] = fonts.raw_get('/Regular')
+                elif mutation == 'delimiter':
+                    data = data.replace(b'(|) Tj', b'(/) Tj')
+                elif mutation == 'baseline':
+                    data = data.replace(b'(|) Tj', b'0 20 Td (|) Tj 0 -20 Td')
+                else:
+                    named['heading'][N('/ActualText')] = TextStringObject('Authored meaning')
+                stream.set_data(data)
+                self.assertFalse(any(item['kind'] == 'split_heading' for item in
+                    b.discover_candidates(PdfReader(io.BytesIO(saved(writer))))))
+
+    def test_split_saved_proof_rejects_wrong_role_order_owner_and_body_text(self):
+        for mutation in ('role', 'order', 'owner', 'text'):
+            with self.subTest(mutation=mutation):
+                source = PdfReader(io.BytesIO(saved(run_in_fixture()[0])))
+                writer = PdfWriter(clone_from=source)
+                result = b.apply_operations(source, writer, selection(b.discover_candidates(source), 'split_heading'))
+                tags = b.nodes(writer)
+                heading = next(node for node in tags if node['/S'] == '/H2')
+                if mutation == 'role':
+                    heading[N('/S')] = N('/P')
+                elif mutation == 'order':
+                    parent = heading['/P']
+                    parent[N('/K')] = ArrayObject(list(reversed(parent['/K'])))
+                elif mutation == 'owner':
+                    writer.root_object['/StructTreeRoot']['/ParentTree']['/Nums'][1][6] = heading.indirect_reference
+                else:
+                    content = b.ContentStream(writer.pages[0]['/Contents'], writer)
+                    replaced = False
+                    for args, op in content.operations:
+                        if op == b'Tj' and isinstance(args[0], (b.ByteStringObject, TextStringObject)):
+                            value = args[0].original_bytes if isinstance(args[0], TextStringObject) else bytes(args[0])
+                            if b'More original body' in value:
+                                args[0] = b.ByteStringObject(value.replace(b'More original body', b'Changed other body'))
+                                replaced = True
+                    self.assertTrue(replaced)
+                    writer.pages[0][N('/Contents')] = writer._add_object(content)
+                with self.assertRaises(b.SemanticStructureError):
+                    b.verify_saved(PdfReader(io.BytesIO(saved(writer))), result['verification'])
+
+    def test_split_saved_proof_rejects_json_and_reuses_fresh_inspection(self):
+        source = PdfReader(io.BytesIO(saved(run_in_fixture()[0])))
+        output, result, _ = self.repair(source, selection(b.discover_candidates(source), 'split_heading'))
+        from unittest.mock import patch
+        inspection = b._DiscoveryInspection(output)
+        with patch.object(b.v, 'structure_inventory', side_effect=AssertionError('extra inventory')):
+            self.assertTrue(b.verify_saved(output, result['verification'], _inspection=inspection))
+        with self.assertRaises(b.SemanticStructureError):
+            b.verify_saved(output, {'entries': []})
+
+    def test_split_saved_proof_accepts_direct_structure_root_parent(self):
+        writer, named = run_in_fixture()
+        root = writer.root_object['/StructTreeRoot']
+        document_ref = root.raw_get('/K')
+        named['wrapper'].pop('/K')
+        named['heading'][N('/P')] = root.indirect_reference
+        root[N('/K')] = ArrayObject([named['heading'].indirect_reference, document_ref])
+        source = PdfReader(io.BytesIO(saved(writer)))
+        output, result, _ = self.repair(source, selection(b.discover_candidates(source), 'split_heading'))
+        self.assertTrue(b.verify_saved(output, result['verification']))
 
     def test_all_three_kinds_preserve_paint_text_graph_and_pixels(self):
         source = self.source()

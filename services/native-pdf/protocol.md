@@ -175,9 +175,16 @@ complex cells are left for review. No arbitrary PDF/XML/paths are accepted.
 `relatedTagIds`. The candidate identifier binds the exact prepared PDF and its
 verified structure/painting boundaries. A planner may select
 `{type:"repair_structure", tagId, expected, candidateId}`; only a
-`split_heading` candidate also accepts `role:"H2"` through `"H6"`.
-The other candidate kinds are `convert_list`, `join_list_continuation` and
-`mark_note_reference`. List candidates retain each original paragraph and its
+`split_heading` candidate also accepts `role:"H2"` through `"H6"`. A
+`describe_chart` candidate requires `alt` (1–8000 characters) and forbids `role`.
+Other candidate kinds are `convert_list`, `join_list_continuation`,
+`mark_note_reference`, `rebuild_table`, `move_callout` and
+`move_page_continuation`; these accept neither `role` nor `alt`. Up to 200
+related tag IDs identify participants. Only `move_page_continuation` supplies
+`readonlyTagIds`: exactly one related anchor, distinct from the primary tag,
+that provides context and is not modified by that operation. This permits a
+verified heading split on the anchor to compose with moving its continuation.
+List candidates retain each original paragraph and its
 visible label inside native list items. They do not invent labels or move
 intervening content. The worker independently discovers the candidates again
 and rejects forged, stale, overlapping or unsupported operations. It never
@@ -186,6 +193,40 @@ optional: reaching its bounded work limit returns no candidates and a visible
 `structure_candidates_limited` warning, while the ordinary checks and supported
 metadata/role repairs continue. A selected structural repair still fails closed
 if its proof cannot be completed.
+
+`rebuild_table` uses verified aligned two-column geometry and existing text-show
+boundaries to separate cells. It preserves exact encoded text and spacing,
+creates Table/TR/TH/TD and explicit header IDs/associations, and keeps text
+outside the table (including notes) outside its cells. `move_callout` requires
+linked sidebar geometry beside an unfinished body sentence and its continuation;
+it joins the original body owners under a paragraph and places the original
+callout after it in tag reading order. `describe_chart` requires a caption,
+verified native labels and simple vector plot scopes. It groups those graphics
+and labels as a Figure with the proposed detailed description and the original
+title as a Caption child. `move_page_continuation` moves an unchanged paragraph
+past verified chart groups to follow its unfinished preceding-page paragraph.
+The source-bound anchor must remain intact or match a prior private heading
+split proof; arbitrary changes to that anchor are rejected. Authored
+alternatives, identifiers and unsupported structures cannot be overwritten.
+The private pipeline rederives selections from immutable source bytes, captures
+original node maps before edits, rejects overlapping operations, and verifies
+saved cell/header membership, graphic ownership and reading order after reopening.
+The independent audit checks semantic accuracy against the original pages.
+
+The table kernel may additionally wrap one source-proven constant pale axial
+shading in `/Artifact` marking. It requires a self-contained rectangular clip
+tightly surrounding the table, painting before its text, safe inherited graphics
+state and no foreign text, images or forms in the region. Gradients, transparency,
+authored marking and uncertain bounds are ineligible. The private saved proof
+binds the original paint program, shading resource, transform and bounds; the
+model cannot supply an artifact operation or select arbitrary graphics.
+
+The final write may add a missing native `/Tabs /S` setting on pages containing
+only uniquely tagged Link annotations, so keyboard link navigation follows
+the repaired structure order. Original authored `/Tabs` settings must survive
+preparation and final output. Forms, other annotation types and ambiguous
+ownership are ineligible. Source eligibility and saved settings/owners are
+independently verified; no model-supplied navigation setting is accepted.
 
 Structure edits preserve original nodes and painting. A reference candidate may
 partition a trailing `*` or `**` from a `Tj` string only with verified simple
