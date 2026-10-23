@@ -6,6 +6,7 @@ import hashlib
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -30,6 +31,28 @@ ERROR_STATUS = {"pdf_invalid": 400, "pdf_password": 400, "pdf_page_limit": 400,
                 "native_pdf_unsupported": 400, "native_pdf_invalid_plan": 400,
                 "native_pdf_preservation": 422, "native_pdf_worker_failed": 503,
                 "native_pdf_timeout": 504, "native_pdf_busy": 503}
+FAILURE_REASONS = frozenset(("timeout", "output_limit", "nonzero_exit", "missing_result", "invalid_result"))
+
+
+def log_execution_failure(mode, error_code, elapsed_ms, process_exit_code, reason):
+    """Log only bounded supervisor facts, never document/processor output."""
+    safe_mode = mode if type(mode) is str and mode in ("prepare", "repair") else "unknown"
+    safe_code = error_code if type(error_code) is str and error_code in ERROR_STATUS else "native_pdf_worker_failed"
+    safe_reason = reason if type(reason) is str and reason in FAILURE_REASONS else "invalid_result"
+    safe_elapsed = 0
+    if type(elapsed_ms) is int or type(elapsed_ms) is float and math.isfinite(elapsed_ms):
+        safe_elapsed = int(max(0, min(elapsed_ms, 86_400_000)))
+    safe_exit = (process_exit_code if type(process_exit_code) is int
+                 and -2_147_483_648 <= process_exit_code <= 4_294_967_295 else None)
+    entry = {"event": "native_pdf_process_failure", "mode": safe_mode, "errorCode": safe_code,
+             "elapsedMs": safe_elapsed, "processExitCode": safe_exit, "reason": safe_reason}
+    if safe_exit is not None and safe_exit < 0:
+        entry["signal"] = -safe_exit
+    try:
+        print(json.dumps(entry, ensure_ascii=True, separators=(",", ":"), allow_nan=False), file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        # Diagnostic availability must not change the controlled HTTP response.
+        pass
 
 
 def child_environment():
@@ -60,6 +83,13 @@ def kill_tree(process):
 
 
 def execute(mode, body, toolchain, *, timeout=None):
+    started = time.monotonic()
+
+    def failure(reason, process, code="native_pdf_worker_failed"):
+        log_execution_failure(mode, code, (time.monotonic() - started) * 1000,
+                              process.returncode, reason)
+        return ERROR_STATUS[code], {"error": {"code": code}}
+
     # Every disk file, including failed outputs and native temporary files,
     # belongs to this request and is removed before the HTTP response finishes.
     with tempfile.TemporaryDirectory(prefix="native-pdf-") as temporary:
@@ -90,25 +120,30 @@ def execute(mode, body, toolchain, *, timeout=None):
             process.wait(timeout=DEADLINE if timeout is None else max(0.01, timeout))
         except subprocess.TimeoutExpired:
             kill_tree(process)
-            return 504, {"error": {"code": "native_pdf_timeout"}}
+            return failure("timeout", process, "native_pdf_timeout")
         finally:
             for thread in threads:
                 thread.join(timeout=5)
         if excessive.is_set():
-            return 503, {"error": {"code": "native_pdf_worker_failed"}}
+            return failure("output_limit", process)
         if process.returncode != 0:
             try:
                 error = json.loads(output[0])["error"]["code"]
             except Exception:
                 error = "native_pdf_worker_failed"
-            error = error if error in ERROR_STATUS else "native_pdf_worker_failed"
-            return ERROR_STATUS[error], {"error": {"code": error}}
-        if not result.is_file() or not 0 < result.stat().st_size <= MAX_RESULT:
-            return 503, {"error": {"code": "native_pdf_worker_failed"}}
+            error = error if type(error) is str and error in ERROR_STATUS else "native_pdf_worker_failed"
+            return failure("nonzero_exit", process, error)
+        if not result.is_file():
+            return failure("missing_result", process)
+        result_size = result.stat().st_size
+        if result_size > MAX_RESULT:
+            return failure("output_limit", process)
+        if result_size == 0:
+            return failure("invalid_result", process)
         try:
             return 200, json.loads(result.read_bytes())
         except Exception:
-            return 503, {"error": {"code": "native_pdf_worker_failed"}}
+            return failure("invalid_result", process)
 
 
 def fetch_stored(body, origin, *, timeout=stored_transport.FETCH_DEADLINE):

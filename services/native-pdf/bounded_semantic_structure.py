@@ -12,7 +12,7 @@ import hashlib
 import json
 import re
 
-from pypdf import PdfWriter
+from pypdf import PdfReader, PdfWriter
 from pypdf.generic import (ArrayObject, BooleanObject, ByteStringObject, ContentStream,
     DictionaryObject, IndirectObject, NameObject, NullObject, NumberObject,
     TextStringObject)
@@ -229,8 +229,34 @@ def _single_child_index(parent, child):
     return matches[0]
 
 
-def _discover(reader):
-    inventory = v.structure_inventory(reader)
+class _DiscoveryInspection:
+    """One fresh reader inspection, shared only during worker enrichment.
+
+    No caller-provided inventory or writer state is accepted. The worker keeps
+    this local to one enrich_inventory call, with no intervening reader edits;
+    applying a plan always rediscovers candidates from a fresh inspection.
+    """
+    __slots__ = ('_reader', '_inventory')
+
+    def __init__(self, reader):
+        if not isinstance(reader, PdfReader):
+            fail()
+        self._reader = reader
+        self._inventory = v.structure_inventory(reader)
+
+    def copy_for(self, reader):
+        if reader is not self._reader:
+            fail()
+        # Worker enrichment adds editing flags and child indexes. Those must
+        # never become part of the raw evidence used for candidate discovery.
+        return copy.deepcopy(self._inventory)
+
+
+def _discover(reader, *, _inspection=None):
+    if _inspection is not None and type(_inspection) is not _DiscoveryInspection:
+        fail()
+    inventory = (_inspection.copy_for(reader) if _inspection is not None
+                 else v.structure_inventory(reader))
     tags, objects = inventory['tags'], nodes(reader)
     if len(tags) != len(objects):
         fail()
@@ -468,8 +494,8 @@ def _discover(reader):
     return result, inventory, objects
 
 
-def discover_candidates(reader):
-    return [public for public, _ in _discover(reader)[0]]
+def discover_candidates(reader, *, _inspection=None):
+    return [public for public, _ in _discover(reader, _inspection=_inspection)[0]]
 
 
 def _reference(writer, node):

@@ -34,7 +34,8 @@ from native_form_inventory import NativeFormInventoryError, native_form_inventor
 from form_interaction_fingerprint import form_interaction_fingerprint
 from native_structure_repairs import (NoteIdError, note_id_snapshot, repair_note_ids,
     verify_note_ids, verify_authored_ids, authored_id_bindings, verify_authored_id_bindings)
-from bounded_semantic_structure import discover_candidates, apply_operations, SemanticStructureError
+from bounded_semantic_structure import (discover_candidates, apply_operations,
+    SemanticStructureError, _DiscoveryInspection)
 
 # No research-only source hash exceptions authorize changes in the app.
 verify_pdf.REVIEWED_WHITESPACE_ARTIFACTS = {}
@@ -350,7 +351,10 @@ def text_block_eligible(tag, tags):
 
 
 def enrich_inventory(reader, original):
-    inventory = verify_pdf.structure_inventory(reader)
+    # Both consumers inspect this exact, unchanged PdfReader. Keep pristine
+    # evidence local to this call; every reopened output starts a new scan.
+    discovery_inspection = _DiscoveryInspection(reader)
+    inventory = discovery_inspection.copy_for(reader)
     tags = inventory["tags"]
     if not tags or len(tags) > MAX_TAGS:
         fail("pdf_complexity_limit" if tags else "native_pdf_unsupported")
@@ -408,7 +412,7 @@ def enrich_inventory(reader, original):
     if interaction is not None:
         inventory["forms"]["interactionFingerprint"] = interaction
     try:
-        inventory["structureCandidates"] = discover_candidates(reader)
+        inventory["structureCandidates"] = discover_candidates(reader, _inspection=discovery_inspection)
     except SemanticStructureError as error:
         if str(error) != "pdf_complexity_limit":
             fail(str(error) if str(error) in {"native_pdf_invalid_plan", "native_pdf_preservation"} else "native_pdf_worker_failed")
