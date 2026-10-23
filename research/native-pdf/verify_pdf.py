@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import io
 import json
 import logging
 import math
@@ -1896,7 +1897,42 @@ def compare_actual_text_associations(source: PdfReader, output: PdfReader) -> di
             'comparisons': comparisons, 'scope': 'Authored native StructElem ActualText and text-only inline replacement scopes; ' + before['scope']}
 
 
-def compare_pdfs(source: Path, output: Path, strict_text_subset: bool = False) -> dict[str, Any]:
+class _PdfInspection:
+    """Request-local evidence derived only from a fresh parse of exact PDF bytes.
+
+    Native readers and writers are never retained or supplied by callers. The
+    private raw snapshot is copied before report enrichment, and can be reused
+    only for the identical saved bytes that produced it.
+    """
+    __slots__ = ('_bytes', '_inventory')
+
+    def __init__(self, data: bytes):
+        if type(data) is not bytes or not 0 < len(data) <= MAX_FILE_BYTES:
+            raise InspectionError('invalid_inspection_evidence')
+        reader = PdfReader(io.BytesIO(data), strict=True)
+        if reader.is_encrypted:
+            raise InspectionError('encrypted_pdf_unsupported')
+        self._bytes = data
+        self._inventory = structure_inventory(reader)
+
+    def fresh_reader(self) -> PdfReader:
+        return PdfReader(io.BytesIO(self._bytes), strict=True)
+
+    def copy_for(self, data: bytes) -> dict[str, Any]:
+        if type(data) is not bytes or data != self._bytes:
+            raise InspectionError('inspection_bytes_changed')
+        return copy.deepcopy(self._inventory)
+
+
+class _PdfInspectionCapture:
+    __slots__ = ('source', 'output')
+
+    def __init__(self):
+        self.source = self.output = None
+
+
+def compare_pdfs(source: Path, output: Path, strict_text_subset: bool = False, *,
+                 _capture=None, _source_inspection=None, _output_inspection=None) -> dict[str, Any]:
     report: dict[str, Any] = {"schema_version": 1, "passed": False, "certification": False, "accessibility_ready": False, "semantic_review_required": True, "renderer": {"name": "PDFium", "scale": RENDER_SCALE}, "preservation": {"passed": False, "pages": []}, "structure": {"passed": False}, "findings": []}
 
     def finding(code: str, message: str, page: int | None = None) -> None:
@@ -1909,10 +1945,17 @@ def compare_pdfs(source: Path, output: Path, strict_text_subset: bool = False) -
             report["findings_truncated"] = True
 
     try:
+        if (_capture is not None and (type(_capture) is not _PdfInspectionCapture
+                or _capture.source is not None or _capture.output is not None)):
+            raise InspectionError('invalid_inspection_evidence')
+        if any(item is not None and type(item) is not _PdfInspection
+               for item in (_source_inspection, _output_inspection)):
+            raise InspectionError('invalid_inspection_evidence')
         for path in (source, output):
             if not path.is_file() or path.stat().st_size > MAX_FILE_BYTES:
                 raise InspectionError("file_missing_or_too_large")
-        readers = [PdfReader(path, strict=True) for path in (source, output)]
+        saved_bytes = [path.read_bytes() for path in (source, output)]
+        readers = [PdfReader(io.BytesIO(data), strict=True) for data in saved_bytes]
         if any(reader.is_encrypted for reader in readers):
             raise InspectionError("encrypted_pdf_unsupported")
         before, after = readers
@@ -1988,8 +2031,10 @@ def compare_pdfs(source: Path, output: Path, strict_text_subset: bool = False) -
         if equivalent:
             report["preservation"]["rendering_equivalence"] = {"method": "identical-paint-multiscale-v1", "pages": list(equivalent.values())}
         report["preservation"]["passed"] = not report["findings"]
-        report["source_structure"] = structure_inventory(before)
-        report["structure"] = structure_inventory(after)
+        inspections = [item if item is not None else _PdfInspection(data)
+                       for item, data in zip((_source_inspection, _output_inspection), saved_bytes)]
+        report["source_structure"], report["structure"] = [
+            item.copy_for(data) for item, data in zip(inspections, saved_bytes)]
         source_figures = sum(tag["role"] == "Figure" for tag in report["source_structure"]["tags"])
         output_figures = sum(tag["role"] == "Figure" for tag in report["structure"]["tags"])
         report["structure"]["figure_counts"] = {"source": source_figures, "output": output_figures}
@@ -2033,12 +2078,18 @@ def compare_pdfs(source: Path, output: Path, strict_text_subset: bool = False) -
                 finding(str(error), "The PDF's saved tag structure did not pass the supported-subset machine checks.")
         report["mechanical_checks_passed"] = report["preservation"]["passed"] and report["structure"]["passed"] and not report["findings"]
         report["passed"] = report["mechanical_checks_passed"] and report["structure"].get("checks_complete", False) and not report["structure"].get("findings") and report["structure"]["authored_alternative_associations_verified"]
+        if any(path.read_bytes() != data for path, data in zip((source, output), saved_bytes)):
+            raise InspectionError('inspection_bytes_changed')
+        if _capture is not None:
+            _capture.source, _capture.output = inspections
     except InspectionError as error:
+        report['passed'] = False
         report["inspection_incomplete"] = True
         report['preservation']['passed'] = False
         report['mechanical_checks_passed'] = False
         finding(str(error), "The checker could not complete a supported, bounded inspection of these PDFs.")
     except Exception:
+        report['passed'] = False
         report["inspection_incomplete"] = True
         report['preservation']['passed'] = False
         report['mechanical_checks_passed'] = False

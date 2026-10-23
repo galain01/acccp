@@ -288,18 +288,23 @@ failure. The worker does not run generic OCR, font substitution or arbitrary
 form editing. Hybrid-form preparation is restricted to the verified changes
 described above.
 
-During a single inventory-enrichment call, candidate discovery reuses a fresh
-inspection bound to that exact, unchanged PDF reader. Each consumer gets a
-deep copy of the raw evidence. Reopened outputs and plan application still
-receive fresh inspections; no inspection cache survives the call or request.
+Within one repair request, the baseline comparison, plan application and final
+comparison may reuse a private structure inspection of identical saved bytes.
+The evidence constructor parses those bytes itself; it accepts neither a
+caller-provided inventory nor a mutable reader. Every consumer receives a deep
+copy, and changed bytes require a fresh inspection. Source and repaired output
+have separate evidence. Candidate discovery still derives its operations from
+the current source, and each comparison still checks painting, resources,
+behavior, descriptions and pixels. No evidence survives the request.
 
 Failures return `{"error":{"code":"controlled_code"}}`, never native tool
 stderr, source text or filesystem paths. HTTP 400 means unsupported input or
 plan; 422 means unsafe preservation or incomplete evidence; 503 means capacity
-or toolchain unavailable; 504 means the worker deadline expired.
+or toolchain unavailable; 504 means the worker wall-clock or CPU limit expired.
 The supervisor logs a bounded failure category, operation, elapsed time and
 child exit code/signal. It never logs child output, document text, paths,
-model plans or credentials. These diagnostics do not change the public error.
+model plans or credentials. A CPU-limit signal is reported as a timeout and
+remaining child processes are stopped before cleanup.
 
 veraPDF checks the **actual delivered file**, without adding a PDF/UA claim to
 satisfy the checker. Its failures remain visible independently of the model

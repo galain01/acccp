@@ -755,13 +755,14 @@ def set_metadata(writer, title=None, language=None):
 
 class _SavedOutputInspection:
     """Private handoff of verified reopened output; never request-supplied data."""
-    __slots__ = ('_source_bytes', '_output_bytes', '_inventory')
+    __slots__ = ('_source_bytes', '_output_bytes', '_inventory', '_saved_pdf')
 
     def __init__(self, original, reopened, inspection):
         if type(inspection) is not _DiscoveryInspection:
             fail("native_pdf_preservation")
         self._source_bytes = original.stream.getvalue()
         self._output_bytes = reopened.stream.getvalue()
+        self._saved_pdf = inspection._saved_pdf
         # Derive the inventory here, rather than accepting a caller's raw dict.
         self._inventory = enrich_inventory(reopened, original, _inspection=inspection)
 
@@ -773,6 +774,15 @@ class _SavedOutputInspection:
         if source_bytes != self._source_bytes:
             return None
         return copy.deepcopy(self._inventory)
+
+    def saved_pdf_for(self, output_bytes):
+        if output_bytes != self._output_bytes:
+            fail("native_pdf_preservation")
+        if self._saved_pdf is not None:
+            if type(self._saved_pdf) is not verify_pdf._PdfInspection:
+                fail("native_pdf_preservation")
+            self._saved_pdf.copy_for(output_bytes)
+        return self._saved_pdf
 
 
 class _SavedOutputCapture:
@@ -851,7 +861,7 @@ def verify_link_tab_order(before, after, pages, inspection, *, _before_inspectio
             fail('native_pdf_preservation')
 
 
-def apply_plan(original, candidate, plan, output, *, lineage=None, _saved_output=None):
+def apply_plan(original, candidate, plan, output, *, lineage=None, _saved_output=None, _candidate_inspection=None):
     if _saved_output is not None and (type(_saved_output) is not _SavedOutputCapture or _saved_output.inspection is not None):
         fail("native_pdf_invalid_plan")
     if not isinstance(plan, dict) or set(plan) - {"schemaVersion", "candidateSha256", "language", "title", "operations"} or type(plan.get("schemaVersion")) is not int or plan["schemaVersion"] != 1 or plan.get("candidateSha256") != digest(candidate.stream.getvalue()):
@@ -859,10 +869,23 @@ def apply_plan(original, candidate, plan, output, *, lineage=None, _saved_output
     operations = plan.get("operations")
     if not isinstance(operations, list) or len(operations) > MAX_OPS:
         fail("native_pdf_invalid_plan")
+    if _candidate_inspection is not None:
+        if type(_candidate_inspection) is not verify_pdf._PdfInspection:
+            fail("native_pdf_invalid_plan")
+        try:
+            _candidate_inspection.copy_for(candidate.stream.getvalue())
+            # The caller already applied open_pdf's unsupported-feature guard.
+            # Mint an unchanged reader from the comparison's exact saved bytes.
+            candidate, candidate_inspection = _DiscoveryInspection._from_saved_pdf(_candidate_inspection)
+        except (SemanticStructureError, verify_pdf.InspectionError):
+            fail("native_pdf_preservation")
+    else:
+        candidate_inspection = None
     verify_added_link_descriptions(original, candidate)
     verify_authored_tab_order(original, candidate)
     try:
-        candidate_inspection = _DiscoveryInspection(candidate)
+        if candidate_inspection is None:
+            candidate_inspection = _DiscoveryInspection(candidate)
         verify_authored_ids(original, candidate, _candidate_inspection=candidate_inspection)
     except (NoteIdError, verify_pdf.InspectionError, KeyError, IndexError, AttributeError, TypeError):
         fail("native_pdf_preservation")
@@ -924,7 +947,7 @@ def apply_plan(original, candidate, plan, output, *, lineage=None, _saved_output
         changes.append({"code": operation["type"], "message": message, "tagId": identifier, "pageNumber": tag["pageNumber"]})
     try:
         authored_bindings = authored_id_bindings(writer)
-        structural = apply_operations(candidate, writer, structure_operations) if structure_operations else {
+        structural = apply_operations(candidate, writer, structure_operations, _inspection=candidate_inspection) if structure_operations else {
             "changes": [], "lineage": [{"node": node, "sourceTagId": f"tag-{index + 1}"} for index, node in enumerate(targets)]}
         verify_authored_id_bindings(authored_bindings, writer)
     except SemanticStructureError as error:
@@ -952,8 +975,9 @@ def apply_plan(original, candidate, plan, output, *, lineage=None, _saved_output
     changes.extend(repair_note_ids(writer))
     reopened = write_pdf(writer, output)
     try:
+        reopened, output_inspection = _DiscoveryInspection._from_saved_pdf(
+            verify_pdf._PdfInspection(output.read_bytes()))
         verify_note_ids(note_before, reopened)
-        output_inspection = _DiscoveryInspection(reopened)
         verify_authored_ids(original, reopened, _candidate_inspection=output_inspection)
         verify_authored_tab_order(original, reopened)
         verify_link_tab_order(candidate, reopened, tab_order_pages, output_inspection, _before_inspection=candidate_inspection)
@@ -1078,7 +1102,9 @@ def response(original_path, candidate_path, changes, toolchain, *, preservation_
     before = open_pdf(original_bytes)
     after = open_pdf(candidate_bytes)
     verify_added_link_descriptions(before, after)
-    checks = verify_pdf.compare_pdfs(preservation_source_path or original_path, candidate_path)
+    saved_pdf = _saved_output.saved_pdf_for(candidate_bytes) if _saved_output is not None else None
+    checks = verify_pdf.compare_pdfs(preservation_source_path or original_path, candidate_path,
+        **({'_output_inspection': saved_pdf} if saved_pdf is not None else {}))
     # Preservation failures cannot be waived by a model or converted to a
     # normal warning. Incomplete semantic inspection remains a visible issue.
     if checks.get("inspection_incomplete") or not checks.get("preservation", {}).get("passed") or checks.get("findings"):
@@ -1237,11 +1263,13 @@ def process(mode, request_path, directory, toolchain):
         baseline = directory / "baseline.pdf"
         baseline.write_bytes(candidate_bytes)
         # Validate the caller-provided prepared file before using its IDs.
-        comparison = verify_pdf.compare_pdfs(reference_path, baseline)
+        comparison_capture = verify_pdf._PdfInspectionCapture()
+        comparison = verify_pdf.compare_pdfs(reference_path, baseline, _capture=comparison_capture)
         if comparison.get("inspection_incomplete") or not comparison.get("preservation", {}).get("passed") or comparison.get("findings"):
             fail("native_pdf_preservation")
         lineage = {}
-        changes = apply_plan(original, candidate, data["plan"], output_path, lineage=lineage, _saved_output=saved_output)
+        changes = apply_plan(original, candidate, data["plan"], output_path, lineage=lineage, _saved_output=saved_output,
+                             _candidate_inspection=comparison_capture.output)
     else:
         fail("native_pdf_invalid_plan")
     return response(source_path, output_path, changes, toolchain,

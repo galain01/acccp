@@ -31,7 +31,7 @@ ERROR_STATUS = {"pdf_invalid": 400, "pdf_password": 400, "pdf_page_limit": 400,
                 "native_pdf_unsupported": 400, "native_pdf_invalid_plan": 400,
                 "native_pdf_preservation": 422, "native_pdf_worker_failed": 503,
                 "native_pdf_timeout": 504, "native_pdf_busy": 503}
-FAILURE_REASONS = frozenset(("timeout", "output_limit", "nonzero_exit", "missing_result", "invalid_result"))
+FAILURE_REASONS = frozenset(("timeout", "cpu_limit", "output_limit", "nonzero_exit", "missing_result", "invalid_result"))
 
 
 def log_execution_failure(mode, error_code, elapsed_ms, process_exit_code, reason):
@@ -118,6 +118,13 @@ def execute(mode, body, toolchain, *, timeout=None):
             thread.start()
         try:
             process.wait(timeout=DEADLINE if timeout is None else max(0.01, timeout))
+            cpu_signal = getattr(signal, "SIGXCPU", None)
+            if cpu_signal is not None and process.returncode == -cpu_signal:
+                # The OS ended this worker at its CPU budget. Stop any native
+                # descendants before draining pipes/cleaning request files;
+                # retain the original signal in the content-free diagnostic.
+                kill_tree(process)
+                return failure("cpu_limit", process, "native_pdf_timeout")
         except subprocess.TimeoutExpired:
             kill_tree(process)
             return failure("timeout", process, "native_pdf_timeout")

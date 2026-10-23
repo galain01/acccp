@@ -252,16 +252,29 @@ class _DiscoveryInspection:
 
     No caller-provided inventory or writer state is accepted. The worker shares
     this with authored-ID checks, enrichment and discovery, with no intervening
-    reader edits. Structural plan application always rediscovers candidates
-    from a fresh inspection; every reopened output receives new evidence.
+    reader edits. Structural plan application always rediscovers candidates;
+    every saved output receives new evidence. A comparison may transfer its
+    fresh saved-byte evidence by minting a new reader, never by importing a
+    caller's inventory or retaining a mutable reader from an earlier phase.
     """
-    __slots__ = ('_reader', '_inventory')
+    __slots__ = ('_reader', '_inventory', '_saved_pdf')
 
     def __init__(self, reader):
         if not isinstance(reader, PdfReader):
             fail()
         self._reader = reader
         self._inventory = v.structure_inventory(reader)
+        self._saved_pdf = None
+
+    @classmethod
+    def _from_saved_pdf(cls, evidence):
+        if cls is not _DiscoveryInspection or type(evidence) is not v._PdfInspection:
+            fail()
+        result = object.__new__(cls)
+        result._reader = evidence.fresh_reader()
+        result._inventory = evidence.copy_for(result._reader.stream.getvalue())
+        result._saved_pdf = evidence
+        return result._reader, result
 
     def copy_for(self, reader):
         if reader is not self._reader:
