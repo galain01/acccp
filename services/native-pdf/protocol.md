@@ -247,10 +247,18 @@ failure. The worker does not run generic OCR, font substitution or arbitrary
 form editing. Hybrid-form preparation is restricted to the verified changes
 described above.
 
+During a single inventory-enrichment call, candidate discovery reuses a fresh
+inspection bound to that exact, unchanged PDF reader. Each consumer gets a
+deep copy of the raw evidence. Reopened outputs and plan application still
+receive fresh inspections; no inspection cache survives the call or request.
+
 Failures return `{"error":{"code":"controlled_code"}}`, never native tool
 stderr, source text or filesystem paths. HTTP 400 means unsupported input or
 plan; 422 means unsafe preservation or incomplete evidence; 503 means capacity
 or toolchain unavailable; 504 means the worker deadline expired.
+The supervisor logs a bounded failure category, operation, elapsed time and
+child exit code/signal. It never logs child output, document text, paths,
+model plans or credentials. These diagnostics do not change the public error.
 
 veraPDF checks the **actual delivered file**, without adding a PDF/UA claim to
 satisfy the checker. Its failures remain visible independently of the model
