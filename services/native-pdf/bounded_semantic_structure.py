@@ -171,12 +171,13 @@ def _states(page, ops):
             font_name = str(resource.get('/BaseFont', ''))
             horizontal = matrix is not None and abs(matrix[1]) < 1e-8 and abs(matrix[2]) < 1e-8
             result[index] = {'font': font, 'bold': bool(re.search(r'Bold|Black|Demi|Heavy|[-,]Bd(?:It)?$', font_name, re.I)),
+                'fontName': re.sub(r'^/[A-Z]{6}\+', '/', font_name),
                 'size': abs(size * matrix[3]) if horizontal else 0,
                 'y': matrix[5] if horizontal else None}
     return result
 
 
-def _scopes(ops):
+def _scopes(ops, *, allow_text_boundaries=False):
     result, stack, bad, seen_mcids = {}, [], set(), set()
     for index, (args, operator) in enumerate(ops):
         if operator in (b'BDC', b'BMC'):
@@ -199,7 +200,8 @@ def _scopes(ops):
                 if mcid in result:
                     bad.add(mcid)
                 inside = list(range(entry['start'] + 1, index))
-                if entry['valid'] and all(ops[i][1] in TEXT_ONLY - {b"'", b'"'} for i in inside):
+                allowed = (TEXT_ONLY - {b"'", b'"'}) | ({b'BT', b'ET'} if allow_text_boundaries else set())
+                if entry['valid'] and all(ops[i][1] in allowed for i in inside):
                     result[mcid] = {'start': entry['start'], 'end': index,
                         'shows': [i for i in inside if ops[i][1] in (b'Tj', b'TJ')]}
     if stack:
@@ -214,6 +216,22 @@ def _simple(tag, node):
         and len(content) == 1 and content[0].get('kind') == 'markedContent'
         and content[0].get('resolved') is True and content[0].get('parentTreeVerified') is True
         and 'streamId' not in content[0] and isinstance(tag.get('pageNumber'), int))
+
+
+def _heading_leaf(tag, node):
+    """A paragraph with direct, verified text owners and no authored override."""
+    if _simple(tag, node):
+        return True
+    content = tag.get('contentSequence', [])
+    native_content = _children(node)
+    return (not tag.get('textIncomplete') and not tag.get('attributeGaps')
+        and set(node) <= SIMPLE_KEYS and isinstance(tag.get('pageNumber'), int)
+        and bool(content) and len(content) <= 200 and len(native_content) == len(content)
+        and all(item.get('kind') == 'markedContent' and item.get('resolved') is True
+            and item.get('parentTreeVerified') is True and 'streamId' not in item
+            and item.get('pageNumber') == tag['pageNumber']
+            and v.integer(native_item) == item.get('mcid')
+            for item, native_item in zip(content, native_content)))
 
 
 def _children(parent):
@@ -302,6 +320,48 @@ def _discover(reader, *, _inspection=None):
         scope = scopes[page_index].get(mcid)
         if scope and len(scope['shows']) >= 1:
             eligible[tag['id']] = (page_index, mcid, scope)
+    # A run-in heading may share only its first MCID with prose, while many
+    # later MCIDs still belong to the same paragraph. Keep all later owners.
+    for tag in tags:
+        if (tag['role'] != 'P' or not _heading_leaf(tag, native[tag['id']])
+            or authored_override(tag) or tag.get('pageNumber') in unsafe_pages):
+            continue
+        pi = tag['pageNumber'] - 1
+        mcid = tag['contentSequence'][0]['mcid']
+        scope = scopes[pi].get(mcid)
+        if not scope or len(scope['shows']) < 2:
+            continue
+        show, state = scope['shows'], states[pi]
+        first_plain = next((i for i in range(1, len(show)) if not state.get(show[i], {}).get('bold')), None)
+        split_at, prefix, body = None, None, None
+        if state.get(show[0], {}).get('bold') and first_plain is not None:
+            prefix = show_text(pi, set(show[:first_plain]))
+            body = show_text(pi, set(show[first_plain:]))
+            if 4 <= len(prefix) <= 240 and len(body) >= 10 and prefix[-1] in '.:?!':
+                split_at = first_plain
+        if split_at is None and len(show) >= 3:
+            first, separator, prose = [state.get(index, {}) for index in show[:3]]
+            em = prose.get('size', 0)
+            font_transition = (first.get('font') and first.get('font') == separator.get('font')
+                and first.get('font') != prose.get('font') and em > 0
+                and first.get('fontName') and prose.get('fontName')
+                and first.get('fontName') != prose.get('fontName')
+                and all(item.get('y') is not None and .8*em <= item.get('size', 0) <= 1.3*em
+                    and abs(item['y']-prose['y']) <= .4*em for item in (first, separator)))
+            if font_transition and show_text(pi, {show[1]}) == '|':
+                label = show_text(pi, {show[0]})
+                if (4 <= len(label) <= 80 and len(label.split()) <= 10
+                    and re.fullmatch(r'[\w][\w /\-\u2013\u2014]*', label)
+                    and any(character.isalpha() for character in label)):
+                    prefix = show_text(pi, set(show[:2]))
+                    body = show_text(pi, set(show[2:]))
+                    if len(body) >= 10:
+                        split_at = 2
+        if split_at is not None:
+            add('split_heading', tag, f'Heading: {prefix}\nParagraph: {body}', [],
+                {'pageIndex': pi, 'mcid': mcid, 'split': show[split_at], 'scope': scope,
+                 'prefix': prefix, 'body': body,
+                 'additionalMcids': [item['mcid'] for item in tag['contentSequence'][1:]]})
     note_markers = {}
     for tag in tags:
         if tag['role'] not in ('P', 'Note') or tag['id'] not in eligible:
@@ -325,16 +385,7 @@ def _discover(reader, *, _inspection=None):
             continue
         pi, mcid, scope = eligible[tag['id']]
         ops, show = page_ops[pi], scope['shows']
-        # A visual font transition is a proposal, not automatic heading evidence.
         state = states[pi]
-        first_plain = next((i for i in range(1, len(show)) if not state.get(show[i], {}).get('bold')), None)
-        if state.get(show[0], {}).get('bold') and first_plain is not None:
-            prefix = show_text(pi, set(show[:first_plain]))
-            body = show_text(pi, set(show[first_plain:]))
-            if 4 <= len(prefix) <= 240 and len(body) >= 10 and prefix[-1] in '.:?!':
-                add('split_heading', tag, f'Heading: {prefix}\nParagraph: {body}', [],
-                    {'pageIndex': pi, 'mcid': mcid, 'split': show[first_plain], 'scope': scope,
-                     'prefix': prefix, 'body': body})
         marker = show_text(pi, {show[-1]})
         matches = note_markers.get((pi, marker), [])
         previous, last = state.get(show[-2], {}) if len(show) >= 2 else {}, state.get(show[-1], {})
@@ -511,7 +562,104 @@ def _new_tag(writer, role, parent, page, content):
     return node
 
 
-def apply_operations(source_reader, writer, operations):
+_SPLIT_PROOF_TOKEN = object()
+
+
+class _SplitHeadingVerification:
+    """Only an applied source-bound plan can create this saved-file proof."""
+    __slots__ = ('_payload',)
+
+    def __init__(self, token, entries):
+        if token is not _SPLIT_PROOF_TOKEN:
+            fail()
+        object.__setattr__(self, '_payload', json.dumps(entries, sort_keys=True, separators=(',', ':')))
+
+    def __setattr__(self, name, value):
+        fail()
+
+    @property
+    def entries(self):
+        return json.loads(self._payload)
+
+
+def _split_node_key(node):
+    key = v.reference_key(node)
+    if key is None:
+        fail()
+    return key
+
+
+def _split_shape(node, pages):
+    return {'parent': _split_node_key(v.resolved(node.get('/P'))),
+        'attributes': v.Canonicalizer(pages).value(DictionaryObject({key: value
+            for key, value in node.items() if key not in ('/P', '/K')})),
+        'content': v.Canonicalizer(pages).value(node.get('/K'))}
+
+
+def _split_text(text):
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def _verified_split_body(source_reader, writer, node, source_tag_id, proof):
+    """Composition guard for a later repair that reads this split body anchor."""
+    if type(proof) is not _SplitHeadingVerification:
+        return False
+    for entry in proof.entries:
+        if (entry.get('sourceTagId') == source_tag_id
+            and entry.get('sourceSha256') == source_digest(source_reader)
+            and tuple(entry['body']) == _split_node_key(node)
+            and json.dumps(_split_shape(node, list(writer.pages)), sort_keys=True)
+                == json.dumps(entry['bodyShape'], sort_keys=True)):
+            return True
+    return False
+
+
+def verify_saved(reader, verification, *, _inspection=None):
+    """Check split headings against reopened hierarchy and MCID text owners."""
+    if type(verification) is not _SplitHeadingVerification:
+        fail()
+    if not verification.entries:
+        return True
+    if _inspection is not None and type(_inspection) is not _DiscoveryInspection:
+        fail()
+    inventory = (_inspection.copy_for(reader) if _inspection is not None
+        else v.structure_inventory(reader))
+    native = nodes(reader)
+    if len(native) != len(inventory['tags']):
+        fail()
+    indexed = {_split_node_key(node): node for node in native}
+    tag_map = {_split_node_key(node): tag for node, tag in zip(native, inventory['tags'])}
+    pages = list(reader.pages)
+    for proof in verification.entries:
+        for name in ('heading', 'body'):
+            key = tuple(proof[name])
+            if (key not in indexed or json.dumps(_split_shape(indexed[key], pages), sort_keys=True)
+                != json.dumps(proof[name+'Shape'], sort_keys=True)):
+                fail()
+            content = tag_map[key]['contentSequence']
+            expected = proof[name+'Text']
+            if (len(content) != len(expected) or any(
+                item.get('kind') != 'markedContent' or item.get('resolved') is not True
+                or item.get('parentTreeVerified') is not True or 'streamId' in item
+                or item.get('pageNumber') != proof['page'] or item.get('mcid') != mcid
+                or _split_text(item.get('text', '')) != text
+                for item, (mcid, text) in zip(content, expected))):
+                fail()
+        parent = indexed.get(tuple(proof['parent']))
+        if parent is None:
+            structure_root = v.resolved(reader.trailer['/Root'].get('/StructTreeRoot'))
+            if v.reference_key(structure_root) == tuple(proof['parent']):
+                parent = structure_root
+        if parent is None:
+            fail()
+        siblings = [_split_node_key(v.resolved(item)) for item in _children(parent)]
+        if sum(siblings[i:i+2] == [tuple(proof['heading']), tuple(proof['body'])]
+               for i in range(len(siblings))) != 1:
+            fail()
+    return True
+
+
+def apply_operations(source_reader, writer, operations, *, _inspection=None):
     """Apply only rediscovered, hash-bound candidates; return native-node lineage.
 
     The writer must be cloned from source_reader. Ordinary repairs can precede
@@ -520,7 +668,7 @@ def apply_operations(source_reader, writer, operations):
     """
     if not isinstance(operations, list) or len(operations) > 500:
         fail()
-    candidates, inventory, original_nodes = _discover(source_reader)
+    candidates, inventory, original_nodes = _discover(source_reader, _inspection=_inspection)
     targets = nodes(writer)
     if len(targets) != len(original_nodes):
         fail()
@@ -554,7 +702,7 @@ def apply_operations(source_reader, writer, operations):
         selected.append((operation, public, detail))
     root = v.resolved(writer.root_object.get('/StructTreeRoot'))
     parents = v.number_tree(root.get('/ParentTree')) if selected else {}
-    page_edits, changes, completed_notes = {}, [], set()
+    page_edits, changes, completed_notes, split_proofs = {}, [], set(), []
     def edit_page(pi):
         if pi not in page_edits:
             page = writer.pages[pi]
@@ -634,7 +782,7 @@ def apply_operations(source_reader, writer, operations):
         elif public['kind'] == 'split_heading':
             parent = v.resolved(target['/P'])
             edit = edit_page(pi)
-            heading = _new_tag(writer, operation['role'], parent, page, target['/K'])
+            heading = _new_tag(writer, operation['role'], parent, page, NumberObject(detail['mcid']))
             if '/Lang' in target:
                 heading[NameObject('/Lang')] = target['/Lang']
             siblings = _children(parent)
@@ -642,9 +790,21 @@ def apply_operations(source_reader, writer, operations):
             parent[NameObject('/K')] = ArrayObject(siblings)
             edit['parentArray'][detail['mcid']] = _reference(writer, heading)
             new_mcid = allocate(edit, target)
-            target[NameObject('/K')] = NumberObject(new_mcid)
+            remaining = _children(target)[1:]
+            target[NameObject('/K')] = (ArrayObject([NumberObject(new_mcid), *remaining])
+                if remaining else NumberObject(new_mcid))
             split_scope(edit, detail, new_mcid)
             lineage.append({'node': heading, 'sourceTagId': public['tagId']})
+            original_tag = next(tag for tag in inventory['tags'] if tag['id'] == public['tagId'])
+            split_proofs.append({'heading': _split_node_key(heading), 'body': _split_node_key(target),
+                'sourceTagId': public['tagId'], 'sourceSha256': source_digest(source_reader),
+                'parent': _split_node_key(parent), 'page': pi+1,
+                'headingShape': _split_shape(heading, list(writer.pages)),
+                'bodyShape': _split_shape(target, list(writer.pages)),
+                'headingText': [(detail['mcid'], _split_text(detail['prefix']))],
+                'bodyText': [(new_mcid, _split_text(detail['body'])),
+                    *[(item['mcid'], _split_text(item.get('text', '')))
+                      for item in original_tag['contentSequence'][1:]]]})
         else:
             edit = edit_page(pi)
             reference = _new_tag(writer, 'Reference', target, page, ArrayObject())
@@ -696,4 +856,5 @@ def apply_operations(source_reader, writer, operations):
         content = ContentStream(None, writer)
         content.operations = changed
         writer.pages[pi][NameObject('/Contents')] = writer._add_object(content)
-    return {'changes': changes, 'lineage': lineage}
+    return {'changes': changes, 'lineage': lineage,
+        'verification': _SplitHeadingVerification(_SPLIT_PROOF_TOKEN, split_proofs)}

@@ -35,8 +35,8 @@ from native_form_inventory import NativeFormInventoryError, native_form_inventor
 from form_interaction_fingerprint import form_interaction_fingerprint
 from native_structure_repairs import (NoteIdError, note_id_snapshot, repair_note_ids,
     verify_note_ids, verify_authored_ids, authored_id_bindings, verify_authored_id_bindings)
-from bounded_semantic_structure import (discover_candidates, apply_operations,
-    SemanticStructureError, _DiscoveryInspection)
+from bounded_semantic_structure import SemanticStructureError, _DiscoveryInspection
+from native_structure_pipeline import discover_candidates, apply_operations, verify_saved as verify_saved_structure
 
 # No research-only source hash exceptions authorize changes in the app.
 verify_pdf.REVIEWED_WHITESPACE_ARTIFACTS = {}
@@ -782,6 +782,75 @@ class _SavedOutputCapture:
         self.inspection = None
 
 
+def link_tab_order_pages(reader, inventory):
+    """Only absent tab settings on pages of fully owned native links.
+
+    Forms, other annotations and authored tab orders stay unchanged. This
+    enables keyboard navigation to follow the repaired structure's link order.
+    """
+    owners = {}
+    for tag in inventory['tags']:
+        for part in tag.get('contentSequence', []):
+            if part.get('annotationId'):
+                owners.setdefault(part['annotationId'], []).append((tag, part))
+    eligible = []
+    for number, page in enumerate(reader.pages, 1):
+        annotations = resolved(page.get('/Annots'))
+        if '/Tabs' in page or not isinstance(annotations, ArrayObject) or not 1 <= len(annotations) <= 200:
+            continue
+        for index, reference in enumerate(annotations, 1):
+            annotation = resolved(reference)
+            matches = owners.get(f'p{number}-a{index}', [])
+            if (not isinstance(annotation, dict) or annotation.get('/Subtype') != '/Link'
+                    or len(matches) != 1 or matches[0][0]['role'] != 'Link'
+                    or matches[0][1].get('subtype') != 'Link'
+                    or matches[0][1].get('pageNumber') != number
+                    or not matches[0][1].get('resolved') or not matches[0][1].get('parentTreeVerified')):
+                break
+        else:
+            eligible.append(number)
+    return eligible
+
+
+def verify_authored_tab_order(original, candidate):
+    if len(original.pages) != len(candidate.pages):
+        fail('native_pdf_preservation')
+    for source, output in zip(original.pages, candidate.pages):
+        old, new = resolved(source.get('/Tabs')), resolved(output.get('/Tabs'))
+        if '/Tabs' in source and ('/Tabs' not in output or type(old) is not type(new) or old != new):
+            fail('native_pdf_preservation')
+
+
+def verify_link_tab_order(before, after, pages, inspection, *, _before_inspection=None):
+    actual = inspection.copy_for(after)
+    # Rediscover the source authorization; the saved state alone cannot grant it.
+    if _before_inspection is not None and type(_before_inspection) is not _DiscoveryInspection:
+        fail('native_pdf_preservation')
+    source_inspection = _before_inspection if _before_inspection is not None else _DiscoveryInspection(before)
+    expected_pages = link_tab_order_pages(before, source_inspection.copy_for(before))
+    if pages != expected_pages or len(before.pages) != len(after.pages):
+        fail('native_pdf_preservation')
+    for number, (source, output) in enumerate(zip(before.pages, after.pages), 1):
+        if number in pages:
+            setting = resolved(output.get('/Tabs'))
+            if not isinstance(setting, NameObject) or setting != '/S':
+                fail('native_pdf_preservation')
+            # All unchanged link objects must still have exactly one current
+            # structure owner after heading/table/reading-order operations.
+            refs = [part for tag in actual['tags'] if tag['role'] == 'Link'
+                    for part in tag.get('contentSequence', [])
+                    if part.get('kind') == 'objectReference' and part.get('pageNumber') == number]
+            ids = [part.get('annotationId') for part in refs]
+            expected = [f'p{number}-a{i}' for i in range(1, len(resolved(output.get('/Annots'))) + 1)]
+            if (any(not isinstance(item, str) for item in ids) or sorted(ids) != sorted(expected) or any(not part.get('resolved')
+                    or not part.get('parentTreeVerified') or part.get('subtype') != 'Link' for part in refs)):
+                fail('native_pdf_preservation')
+        elif (('/Tabs' in source) != ('/Tabs' in output)
+                or type(resolved(source.get('/Tabs'))) is not type(resolved(output.get('/Tabs')))
+                or resolved(source.get('/Tabs')) != resolved(output.get('/Tabs'))):
+            fail('native_pdf_preservation')
+
+
 def apply_plan(original, candidate, plan, output, *, lineage=None, _saved_output=None):
     if _saved_output is not None and (type(_saved_output) is not _SavedOutputCapture or _saved_output.inspection is not None):
         fail("native_pdf_invalid_plan")
@@ -791,12 +860,14 @@ def apply_plan(original, candidate, plan, output, *, lineage=None, _saved_output
     if not isinstance(operations, list) or len(operations) > MAX_OPS:
         fail("native_pdf_invalid_plan")
     verify_added_link_descriptions(original, candidate)
+    verify_authored_tab_order(original, candidate)
     try:
         candidate_inspection = _DiscoveryInspection(candidate)
         verify_authored_ids(original, candidate, _candidate_inspection=candidate_inspection)
     except (NoteIdError, verify_pdf.InspectionError, KeyError, IndexError, AttributeError, TypeError):
         fail("native_pdf_preservation")
     inventory = enrich_inventory(candidate, original, _inspection=candidate_inspection)
+    tab_order_pages = link_tab_order_pages(candidate, inventory)
     nodes = native_nodes(candidate)
     if len(nodes) != len(inventory["tags"]) or any(str(node.get("/S", "")).lstrip("/") != tag["sourceRole"] for node, tag in zip(nodes, inventory["tags"])):
         fail("native_pdf_preservation")
@@ -820,7 +891,7 @@ def apply_plan(original, candidate, plan, output, *, lineage=None, _saved_output
         if operation.get("expected") != tag["snapshot"]:
             fail("native_pdf_invalid_plan")
         if operation["type"] == "repair_structure":
-            if (set(operation) - {"type", "tagId", "expected", "candidateId", "role"}
+            if (set(operation) - {"type", "tagId", "expected", "candidateId", "role", "alt"}
                     or not isinstance(operation.get("candidateId"), str)):
                 fail("native_pdf_invalid_plan")
             structure_operations.append({key: value for key, value in operation.items() if key != "expected"})
@@ -861,6 +932,10 @@ def apply_plan(original, candidate, plan, output, *, lineage=None, _saved_output
     except NoteIdError:
         fail("native_pdf_preservation")
     changes.extend(structural["changes"])
+    for number in tab_order_pages:
+        writer.pages[number - 1][NameObject('/Tabs')] = NameObject('/S')
+        changes.append({'code': 'link_tab_order', 'pageNumber': number,
+                        'message': 'Set keyboard link navigation to follow the document reading order.'})
     final_positions = {id(node): f"tag-{index + 1}" for index, node in enumerate(native_nodes(writer))}
     source_lineage = {f"tag-{index + 1}": final_positions[id(node)]
                       for index, node in enumerate(targets) if id(node) in final_positions}
@@ -880,6 +955,12 @@ def apply_plan(original, candidate, plan, output, *, lineage=None, _saved_output
         verify_note_ids(note_before, reopened)
         output_inspection = _DiscoveryInspection(reopened)
         verify_authored_ids(original, reopened, _candidate_inspection=output_inspection)
+        verify_authored_tab_order(original, reopened)
+        verify_link_tab_order(candidate, reopened, tab_order_pages, output_inspection, _before_inspection=candidate_inspection)
+        if structure_operations:
+            verify_saved_structure(reopened, structural["verification"], _inspection=output_inspection)
+    except SemanticStructureError:
+        fail("native_pdf_preservation")
     except (NoteIdError, verify_pdf.InspectionError, KeyError, IndexError, AttributeError, TypeError):
         fail("native_pdf_preservation")
     verify_saved_annotations(original, candidate, reopened)
@@ -957,7 +1038,7 @@ def normalized_finding(item, inventory):
         "placeholder_alternative": f"This {subject} has a generic label rather than a useful description.",
         "artifact_text_needs_semantic_review": "Some text is excluded from screen-reader reading order. Check that it is only repeated headers, footers or decoration.",
         "missing_structure_tree": "The PDF does not contain the tags needed to identify its reading order and headings.",
-        "structure_candidates_limited": "Automatic heading, list and footnote repair suggestions could not be completed within the processing limit. Review those parts of the PDF; the other document checks still ran.",
+        "structure_candidates_limited": "Automatic structure repair suggestions could not be completed within the processing limit. Review the headings, lists, tables, charts and reading order; the other document checks still ran.",
     }.get(code, "A saved-PDF structure check still needs attention: " + code.replace("_", " ") + ".")
     row = {"code": code, "severity": "error" if item.get("severity") == "error" else "warning", "message": text,
            "suggestion": "Review the indicated content in a PDF accessibility editor and run its accessibility checker.", "location": "Document"}

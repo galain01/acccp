@@ -450,6 +450,66 @@ describe("native PDF model contracts", () => {
     );
   });
 
+  it("includes a continuation's previous-page visual context without assigning its read-only anchor twice", async () => {
+    const state = await makeState(2);
+    state.inventory.tags = [
+      ...Array.from({ length: 201 }, (_, index) => tag(1, index + 1)),
+      tag(2, 202),
+    ];
+    state.inventory.structureCandidates = [
+      {
+        candidateId: "f".repeat(64),
+        kind: "move_page_continuation",
+        tagId: "tag-202",
+        pageNumber: 2,
+        text: "continues the previous sentence.",
+        preview: "The previous page ends mid-sentence.",
+        relatedTagIds: ["tag-201"],
+        readonlyTagIds: ["tag-201"],
+      },
+    ];
+    const batches = nativePdfBatches(state);
+    const continuation = batches.find((batch) => batch.pages.includes(2))!;
+    expect(continuation.pages).toEqual([2]);
+    expect(continuation.visualPages).toEqual([1, 2]);
+    expect(continuation.tags.map((item) => item.id)).toEqual(["tag-202"]);
+    expect(batches.flatMap((batch) => batch.pageReviewPages)).toEqual([1, 2]);
+    expect(
+      batches.flatMap((batch) => batch.tags.map((item) => item.id))
+    ).toEqual(state.inventory.tags.map((item) => item.id));
+    expect(() =>
+      parseNativePdfPlan(
+        {
+          reviewedPages: continuation.pages,
+          reviewedTagIds: ["tag-202"],
+          operations: [{ type: "set_role", tagId: "tag-201", role: "P" }],
+          findings: [],
+        },
+        continuation,
+        state
+      )
+    ).toThrow("native_pdf_invalid_plan");
+  });
+
+  it("keeps the visual-page budget when candidate context cannot fit a single assigned tag", async () => {
+    const state = await makeState(13);
+    state.inventory.structureCandidates = [
+      {
+        candidateId: "e".repeat(64),
+        kind: "move_callout",
+        tagId: "tag-13",
+        pageNumber: 13,
+        text: "Source",
+        preview: "Source-derived related content",
+        relatedTagIds: Array.from(
+          { length: 12 },
+          (_, index) => `tag-${index + 1}`
+        ),
+      },
+    ];
+    expect(() => nativePdfBatches(state)).toThrow("pdf_complexity_limit");
+  });
+
   it("includes contextual evidence in the existing 900,000-character scope budget", async () => {
     const state = await makeState(3);
     state.inventory.forms = { authoredDescription: "x".repeat(620_000) };
@@ -700,6 +760,9 @@ describe("native PDF model contracts", () => {
     "join_list_continuation",
     "mark_note_reference",
     "convert_list",
+    "rebuild_table",
+    "move_callout",
+    "describe_chart",
   ] as const)(
     "binds %s to a supplied candidate and rejects arbitrary changes",
     async (kind) => {
@@ -722,6 +785,11 @@ describe("native PDF model contracts", () => {
         tagId: "tag-1",
         candidateId,
         ...(kind === "split_heading" ? { role: "H3" } : {}),
+        ...(kind === "describe_chart"
+          ? {
+              alt: "The chart compares the observed results for the two groups.",
+            }
+          : {}),
       };
       const base = {
         reviewedPages: [1],
@@ -738,6 +806,8 @@ describe("native PDF model contracts", () => {
         { text: "Invented replacement" },
         { offset: 7 },
         { role: kind === "split_heading" ? "H1" : "H3" },
+        { alt: kind === "describe_chart" ? "" : "An unsupported description" },
+        { alt: "x".repeat(8001) },
       ])
         expect(() =>
           parseNativePdfPlan(
@@ -1073,6 +1143,326 @@ describe("native PDF model contracts", () => {
   });
 });
 
+describe("current excluded-text review reconciliation", () => {
+  const reminder = (pageNumber = 1) => ({
+    code: "artifact_text_needs_semantic_review",
+    severity: "warning" as const,
+    pageNumber,
+    message: `Check excluded text on page ${pageNumber}.`,
+  });
+  const missing = (pageNumber = 1) => ({
+    code: "missing-content",
+    severity: "warning" as const,
+    pageNumber,
+    location: "Instruction below the figure",
+    message: "A unique instruction is absent from reading order.",
+    suggestion: "Restore the instruction to the PDF reading order.",
+  });
+  async function run(state: NativePdfState) {
+    const result = await repairNativePdf(state.pdf, "excluded-text.pdf");
+    if ("error" in result) throw Error(result.error);
+    return result;
+  }
+
+  it("retires only a worker reminder with complete current evidence and keeps validator errors and model findings", async () => {
+    const prepared = await makeState();
+    const doc = await PDFDocument.load(prepared.pdf);
+    doc.setTitle("Current repaired PDF");
+    const pdf = Buffer.from(await doc.save());
+    const repaired = {
+      ...prepared,
+      pdf,
+      candidateSha256: pdfSha256(pdf),
+      findings: [
+        reminder(),
+        {
+          code: "pdfua-font-rule",
+          severity: "error" as const,
+          pageNumber: 1,
+          message: "An original font is not embedded.",
+        },
+        {
+          ...reminder(),
+          severity: "error" as const,
+          message: "An actual excluded-text error must remain.",
+        },
+      ],
+    };
+    repaired.machineChecks.veraPdf.failedChecks = 2;
+    useState(prepared);
+    mocks.worker
+      .mockResolvedValueOnce(prepared)
+      .mockResolvedValueOnce(repaired);
+    mocks.call.mockImplementation((prompt, parts) =>
+      response({
+        ...validContent(prompt, parts),
+        ...(prompt === NATIVE_PDF_AUDIT_PROMPT
+          ? {
+              findings: [
+                {
+                  ...reminder(),
+                  location: "Footer",
+                  message: "Separate model concern.",
+                  suggestion: "Review the footer with your accessibility team.",
+                },
+              ],
+            }
+          : {}),
+      })
+    );
+    const result = await run(prepared);
+    expect(result.errors.map((error) => error.message)).toEqual([
+      "An original font is not embedded.",
+      "An actual excluded-text error must remain.",
+      "Separate model concern.",
+    ]);
+    expect(result.nativePdfChecks.veraPdf.failedChecks).toBe(2);
+    expect(result.nativePdfChecks.artifactTextReview).toEqual({
+      candidateSha256: repaired.candidateSha256,
+      pages: [
+        {
+          pageNumber: 1,
+          decision: "decorative-or-redundant",
+          explanation: "The page has no excluded meaningful text.",
+          inventoryComplete: true,
+          pageAuditComplete: true,
+          reminderRetired: true,
+        },
+      ],
+    });
+    expect(result.nativePdfChecks.artifactTextReview?.candidateSha256).not.toBe(
+      prepared.candidateSha256
+    );
+  });
+
+  it.each([
+    "false",
+    "missing-flag",
+    "string-flag",
+    "missing-page",
+    "wrong-page",
+    "duplicate-page",
+  ])(
+    "retains the reminder when current page evidence is incomplete or ambiguous: %s",
+    async (mode) => {
+      const state = await makeState();
+      state.findings = [reminder()];
+      if (mode === "false")
+        state.inventory.page_content[0].artifactTextComplete = false;
+      if (mode === "missing-flag")
+        delete state.inventory.page_content[0].artifactTextComplete;
+      if (mode === "string-flag")
+        state.inventory.page_content[0].artifactTextComplete = "true";
+      if (mode === "missing-page") state.inventory.page_content = [];
+      if (mode === "wrong-page") state.inventory.page_content[0].pageNumber = 2;
+      if (mode === "duplicate-page")
+        state.inventory.page_content.push({
+          ...state.inventory.page_content[0],
+        });
+      useState(state);
+      const result = await run(state);
+      expect(result.errors.map((error) => error.message)).toContain(
+        reminder().message
+      );
+      expect(result.nativePdfChecks.artifactTextReview?.pages[0]).toMatchObject(
+        {
+          inventoryComplete: false,
+          reminderRetired: false,
+        }
+      );
+    }
+  );
+
+  it.each([
+    "missing",
+    "duplicate",
+    "unassigned",
+    "empty-explanation",
+    "extra-field",
+    "uncertain",
+    "excluded",
+    "provider-failed",
+    "truncated",
+  ])(
+    "does not turn an invalid, uncertain, or failed audit into approval: %s",
+    async (mode) => {
+      const state = await makeState();
+      state.findings = [reminder()];
+      useState(state);
+      mocks.call.mockImplementation((prompt, parts) => {
+        const content = validContent(prompt, parts);
+        if (prompt !== NATIVE_PDF_AUDIT_PROMPT) return response(content);
+        if (mode === "provider-failed")
+          throw new LiteLLMError("private failure details");
+        if (!("artifactReviews" in content))
+          throw Error("Expected an audit response");
+        const review = content.artifactReviews[0];
+        if (mode === "missing")
+          return response({ ...content, artifactReviews: [] });
+        if (mode === "duplicate")
+          return response({ ...content, artifactReviews: [review, review] });
+        if (mode === "unassigned")
+          return response({
+            ...content,
+            artifactReviews: [{ ...review, pageNumber: 2 }],
+          });
+        if (mode === "empty-explanation")
+          return response({
+            ...content,
+            artifactReviews: [{ ...review, explanation: " " }],
+          });
+        if (mode === "extra-field")
+          return response({
+            ...content,
+            artifactReviews: [{ ...review, approved: true }],
+          });
+        if (mode === "truncated")
+          return { ...response(content), finishReason: "length" };
+        return response({
+          ...content,
+          artifactReviews: [
+            {
+              ...review,
+              decision:
+                mode === "uncertain"
+                  ? "uncertain"
+                  : "meaningful-content-excluded",
+            },
+          ],
+          findings: [missing()],
+        });
+      });
+      const result = await run(state);
+      expect(result.errors.map((error) => error.message)).toContain(
+        reminder().message
+      );
+      expect(
+        result.nativePdfChecks.artifactTextReview?.pages.some(
+          (page) => page.reminderRetired
+        )
+      ).toBe(false);
+      expect(result.nativePdfChecks.auditComplete).toBe(
+        mode === "uncertain" || mode === "excluded"
+      );
+    }
+  );
+
+  it.each(["repair", "audit", "worker", "unlocated", "descendant-tag"])(
+    "retains the reminder when content-loss evidence conflicts: %s",
+    async (source) => {
+      const state = await makeState();
+      state.findings = [reminder()];
+      if (source === "worker") state.findings.push(missing());
+      if (source === "unlocated") {
+        const finding: Partial<ReturnType<typeof missing>> = missing();
+        delete finding.pageNumber;
+        state.findings.push(finding as ReturnType<typeof missing>);
+      }
+      if (source === "descendant-tag") {
+        const parent = {
+          ...tag(1, 2),
+          pageNumber: null,
+          content: [],
+          children: ["tag-1"],
+        };
+        state.inventory.tags.unshift(parent);
+        state.inventory.tags[1].parentId = parent.id;
+        state.findings.push({
+          ...missing(),
+          pageNumber: undefined,
+          tagId: parent.id,
+        });
+      }
+      useState(state);
+      mocks.call.mockImplementation((prompt, parts) =>
+        response({
+          ...validContent(prompt, parts),
+          findings:
+            (source === "repair" && prompt !== NATIVE_PDF_AUDIT_PROMPT) ||
+            (source === "audit" && prompt === NATIVE_PDF_AUDIT_PROMPT)
+              ? [missing()]
+              : [],
+        })
+      );
+      const result = await run(state);
+      expect(result.errors.map((error) => error.message)).toContain(
+        reminder().message
+      );
+      expect(
+        result.nativePdfChecks.artifactTextReview?.pages[0].reminderRetired
+      ).toBe(false);
+    }
+  );
+
+  it("keeps missing-content findings on their page while resolving another page's reminder", async () => {
+    const state = await makeState(2);
+    state.findings = [reminder(1), reminder(2)];
+    useState(state);
+    mocks.call.mockImplementation((prompt, parts) =>
+      response({
+        ...validContent(prompt, parts),
+        findings: prompt === NATIVE_PDF_AUDIT_PROMPT ? [missing(2)] : [],
+      })
+    );
+    const result = await run(state);
+    expect(result.errors.map((error) => error.message)).not.toContain(
+      reminder(1).message
+    );
+    expect(result.errors.map((error) => error.message)).toContain(
+      reminder(2).message
+    );
+    expect(
+      result.nativePdfChecks.artifactTextReview?.pages.map(
+        (page) => page.reminderRetired
+      )
+    ).toEqual([true, false]);
+  });
+
+  it.each(["conflict", "failed", "unassigned-review"])(
+    "requires every dense-page batch to finish without a content-loss conflict: %s",
+    async (mode) => {
+      const state = await makeState();
+      state.inventory.tags = Array.from({ length: 201 }, (_, index) =>
+        tag(1, index + 1)
+      );
+      state.findings = [reminder()];
+      useState(state);
+      mocks.call.mockImplementation((prompt, parts) => {
+        const content = validContent(prompt, parts);
+        if (
+          prompt !== NATIVE_PDF_AUDIT_PROMPT ||
+          scope(parts).pageReviewPages.length
+        )
+          return response(content);
+        if (mode === "failed") throw new LiteLLMError("private batch failure");
+        if (mode === "unassigned-review")
+          return response({
+            ...content,
+            artifactReviews: [
+              {
+                pageNumber: 1,
+                decision: "decorative-or-redundant",
+                explanation: "Not this batch's page review.",
+              },
+            ],
+          });
+        return response({
+          ...content,
+          findings: [{ ...missing(), tagId: content.reviewedTagIds[0] }],
+        });
+      });
+      const result = await run(state);
+      expect(result.errors.map((error) => error.message)).toContain(
+        reminder().message
+      );
+      expect(
+        result.nativePdfChecks.artifactTextReview?.pages[0].reminderRetired
+      ).toBe(false);
+      expect(result.nativePdfChecks.auditComplete).toBe(mode === "conflict");
+    }
+  );
+});
+
 describe("native PDF orchestration", () => {
   it.each([false, true])(
     "retains an initial candidate-discovery limit once without reviving resolved defects (still limited: %s)",
@@ -1189,7 +1579,7 @@ describe("native PDF orchestration", () => {
       "do not blindly inherit the nearest preceding heading's rank plus one"
     );
     expect(prompt).toContain(
-      "including set_role on any paragraph participating in convert_list"
+      "Do not add separate edits on any primary or related tag of a selected structural candidate"
     );
   });
 
@@ -1387,6 +1777,89 @@ describe("native PDF orchestration", () => {
     expect(coalesceNativePdfOperations([redundant], state)).toEqual([
       redundant,
     ]);
+  });
+
+  it.each(["rebuild_table", "move_callout", "describe_chart"] as const)(
+    "%s owns participant roles across model batches without dropping unrelated repairs",
+    async (kind) => {
+      const state = await makeState();
+      const candidateId = "e".repeat(64);
+      state.inventory.structureCandidates = [
+        {
+          candidateId,
+          kind,
+          tagId: "tag-1",
+          pageNumber: 1,
+          text: "Source",
+          preview: "Verified relationship",
+          relatedTagIds: ["tag-2"],
+        },
+      ];
+      const expected = state.inventory.tags[0].snapshot;
+      const atomic = {
+        type: "repair_structure" as const,
+        tagId: "tag-1",
+        candidateId,
+        expected,
+        ...(kind === "describe_chart"
+          ? { alt: "A verified chart description." }
+          : {}),
+      };
+      const role = {
+        type: "set_role" as const,
+        tagId: "tag-2",
+        role: "P",
+        expected,
+      };
+      const unrelated = { ...role, tagId: "tag-3" };
+      const otherType = {
+        type: "set_alt" as const,
+        tagId: "tag-2",
+        alt: "Conflicting image edit",
+        expected,
+      };
+      expect(
+        coalesceNativePdfOperations([role, atomic, unrelated, otherType], state)
+      ).toEqual([atomic, unrelated, otherType]);
+      expect(coalesceNativePdfOperations([role, unrelated], state)).toEqual([
+        role,
+        unrelated,
+      ]);
+    }
+  );
+
+  it("preserves a compatible repair on a continuation candidate's read-only anchor", async () => {
+    const state = await makeState();
+    const candidateId = "f".repeat(64);
+    state.inventory.structureCandidates = [
+      {
+        candidateId,
+        kind: "move_page_continuation",
+        tagId: "tag-2",
+        pageNumber: 1,
+        text: "Continuation",
+        preview: "After the anchor",
+        relatedTagIds: ["tag-1"],
+        readonlyTagIds: ["tag-1"],
+      },
+    ];
+    const expected = state.inventory.tags[0].snapshot;
+    const continuation = {
+      type: "repair_structure" as const,
+      tagId: "tag-2",
+      candidateId,
+      expected,
+    };
+    const anchor = {
+      type: "set_role" as const,
+      tagId: "tag-1",
+      role: "P",
+      expected,
+    };
+    const conflicting = { ...anchor, tagId: "tag-2" };
+    expect(
+      coalesceNativePdfOperations([anchor, continuation, conflicting], state)
+    ).toEqual([anchor, continuation]);
   });
 
   it("uses the immutable source and exact saved PDF, preserving all model-call costs and explicit review limits", async () => {

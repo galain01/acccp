@@ -347,6 +347,35 @@ describe("native PDF service client", () => {
       parseNativePdfState(raw, source).inventory.structureCandidates?.[0].kind
     ).toBe("convert_list");
   });
+  it.each(["rebuild_table", "move_callout", "describe_chart"])(
+    "accepts %s with all bounded participant IDs",
+    (kind) => {
+      const raw = response();
+      const inventory = raw.inventory as unknown as Record<string, unknown>;
+      inventory.tags = Array.from({ length: 42 }, (_, index) => ({
+        ...raw.inventory.tags[0],
+        id: `tag-${index + 1}`,
+      }));
+      const relatedTagIds = Array.from(
+        { length: 41 },
+        (_, index) => `tag-${index + 2}`
+      );
+      inventory.structureCandidates = [
+        {
+          candidateId: "b".repeat(64),
+          kind,
+          tagId: "tag-1",
+          pageNumber: 1,
+          text: "Source",
+          preview: "Verified structural relationship",
+          relatedTagIds,
+        },
+      ];
+      expect(
+        parseNativePdfState(raw, source).inventory.structureCandidates?.[0]
+      ).toMatchObject({ kind, relatedTagIds });
+    }
+  );
   it("rejects malformed structure candidates and lineage before supplying them to the model", () => {
     const candidate = {
       candidateId: "a".repeat(64),
@@ -382,6 +411,43 @@ describe("native PDF service client", () => {
       const raw = response();
       (raw.inventory as unknown as Record<string, unknown>).sourceTagLineage =
         lineage;
+      expect(() => parseNativePdfState(raw, source)).toThrow(
+        "pdf_protocol_error"
+      );
+    }
+  });
+
+  it("limits read-only structure context to the supplied cross-page anchor", () => {
+    const raw = response();
+    const inventory = raw.inventory as unknown as Record<string, unknown>;
+    inventory.tags = [
+      raw.inventory.tags[0],
+      { ...raw.inventory.tags[0], id: "tag-2" },
+    ];
+    const candidate = {
+      candidateId: "e".repeat(64),
+      kind: "move_page_continuation",
+      tagId: "tag-2",
+      pageNumber: 1,
+      text: "Continuation",
+      preview: "After the preceding paragraph",
+      relatedTagIds: ["tag-1"],
+      readonlyTagIds: ["tag-1"],
+    };
+    inventory.structureCandidates = [candidate];
+    expect(
+      parseNativePdfState(raw, source).inventory.structureCandidates?.[0]
+        .readonlyTagIds
+    ).toEqual(["tag-1"]);
+    for (const changed of [
+      { readonlyTagIds: undefined },
+      { readonlyTagIds: [] },
+      { readonlyTagIds: ["tag-2"] },
+      { readonlyTagIds: ["tag-3"] },
+      { readonlyTagIds: ["tag-1", "tag-2"] },
+      { kind: "move_callout" },
+    ]) {
+      inventory.structureCandidates = [{ ...candidate, ...changed }];
       expect(() => parseNativePdfState(raw, source)).toThrow(
         "pdf_protocol_error"
       );

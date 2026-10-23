@@ -30,12 +30,17 @@ export interface NativePdfStructureCandidate {
     | "split_heading"
     | "join_list_continuation"
     | "mark_note_reference"
-    | "convert_list";
+    | "convert_list"
+    | "rebuild_table"
+    | "move_callout"
+    | "move_page_continuation"
+    | "describe_chart";
   tagId: string;
   pageNumber: number;
   text: string;
   preview: string;
   relatedTagIds: string[];
+  readonlyTagIds?: string[];
 }
 export interface NativePdfFinding {
   code: string;
@@ -106,6 +111,7 @@ export type NativePdfOperation = {
       type: "repair_structure";
       candidateId: string;
       role?: "H2" | "H3" | "H4" | "H5" | "H6";
+      alt?: string;
     }
 );
 export interface NativePdfPlan {
@@ -393,15 +399,28 @@ export function parseNativePdfState(
           "join_list_continuation",
           "mark_note_reference",
           "convert_list",
+          "rebuild_table",
+          "move_callout",
+          "move_page_continuation",
+          "describe_chart",
         ].includes(String(candidate.kind)) ||
         !ids.has(String(candidate.tagId)) ||
         !pageNumber(candidate.pageNumber, pages) ||
         !boundedText(candidate.text, 20_000) ||
         !boundedText(candidate.preview, 20_000) ||
         !Array.isArray(candidate.relatedTagIds) ||
-        candidate.relatedTagIds.length > 20 ||
+        candidate.relatedTagIds.length > 200 ||
         candidate.relatedTagIds.some((id) => !ids.has(String(id))) ||
         new Set(candidate.relatedTagIds).size !== candidate.relatedTagIds.length
+      )
+        return fail();
+      if (
+        candidate.kind === "move_page_continuation"
+          ? !Array.isArray(candidate.readonlyTagIds) ||
+            candidate.readonlyTagIds.length !== 1 ||
+            candidate.readonlyTagIds[0] === candidate.tagId ||
+            !candidate.relatedTagIds.includes(candidate.readonlyTagIds[0])
+          : candidate.readonlyTagIds !== undefined
       )
         return fail();
       candidateIds.add(candidate.candidateId);
