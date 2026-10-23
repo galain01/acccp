@@ -53,7 +53,7 @@ class RepairInspectionBudgetTests(unittest.TestCase):
         return worker.response(self.source_path, self.output_path, [], {},
                                _saved_output=self.capture.inspection)
 
-    def test_repair_scans_candidate_once_and_saved_output_twice_independently(self):
+    def test_repair_scans_candidate_and_saved_output_once_each(self):
         scans = Counter()
         real_scan = worker.verify_pdf.structure_inventory
         def scan(reader):
@@ -66,10 +66,11 @@ class RepairInspectionBudgetTests(unittest.TestCase):
             self.apply()
             result = self.response()
         self.assertEqual(scans[worker.digest(self.candidate_bytes)], 1)
-        # One reopened inspection during apply_plan and a separate saved-file
-        # scan in compare_pdfs. The response does not repeat enrichment.
-        self.assertEqual(scans[worker.digest(self.output_path.read_bytes())], 2)
-        compare.assert_called_once_with(self.source_path, self.output_path)
+        # Fresh saved-byte evidence is shared with the independent comparison;
+        # its painting/resources/association/render checks still run in full.
+        self.assertEqual(scans[worker.digest(self.output_path.read_bytes())], 1)
+        compare.assert_called_once_with(self.source_path, self.output_path,
+            _output_inspection=self.capture.inspection.saved_pdf_for(self.output_path.read_bytes()))
         validate.assert_called_once()
         self.assertTrue(result['machineChecks']['preservationPassed'])
         self.assertFalse(result['machineChecks']['conformanceClaim'])
@@ -110,7 +111,8 @@ class RepairInspectionBudgetTests(unittest.TestCase):
             with self.assertRaises(worker.WorkerError) as caught:
                 self.response()
         self.assertEqual(str(caught.exception), 'native_pdf_preservation')
-        compare.assert_called_once_with(self.source_path, self.output_path)
+        compare.assert_called_once_with(self.source_path, self.output_path,
+            _output_inspection=self.capture.inspection.saved_pdf_for(self.output_path.read_bytes()))
 
     def test_changed_source_context_requires_fresh_enrichment(self):
         self.apply()

@@ -48,12 +48,12 @@ class _SavedProof:
         self.parts = parts
 
 
-def apply_operations(source_reader, writer, operations):
+def apply_operations(source_reader, writer, operations, *, _inspection=None):
     if not isinstance(operations, list) or len(operations) > 500:
         semantic.fail()
     # Recompute from source bytes, independently of a previously published
     # inventory or model-supplied candidate list.
-    inspection = semantic._DiscoveryInspection(source_reader)
+    inspection = _inspection_for(source_reader, _inspection)
     options = {item['candidateId']: item for item in discover_candidates(source_reader, _inspection=inspection)}
     original, targets = semantic.nodes(source_reader), semantic.nodes(writer)
     if len(original) != len(targets):

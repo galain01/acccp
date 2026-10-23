@@ -98,7 +98,7 @@ class SupervisorDiagnosticsTests(unittest.TestCase):
 
     def test_negative_exit_preserves_signal_number_without_stream_text(self):
         class Process:
-            returncode = -24
+            returncode = -9
             stdout = io.BytesIO(SENTINEL.encode())
             stderr = io.BytesIO(SENTINEL.encode())
 
@@ -109,7 +109,33 @@ class SupervisorDiagnosticsTests(unittest.TestCase):
         with patch.object(server.subprocess, "Popen", return_value=Process()), contextlib.redirect_stderr(captured):
             response = server.execute("repair", SENTINEL.encode(), self.folder / "tools.json")
         self.assertEqual(FAILURE, response)
-        self.assert_diagnostic(captured.getvalue(), "nonzero_exit", mode="repair", exit_code=-24)
+        self.assert_diagnostic(captured.getvalue(), "nonzero_exit", mode="repair", exit_code=-9)
+
+    def test_cpu_signal_returns_timeout_without_child_output_and_stops_descendants(self):
+        class Process:
+            returncode = -24
+            stdout = io.BytesIO(json.dumps({"error": {"code": "native_pdf_preservation", "message": SENTINEL}}).encode())
+            stderr = io.BytesIO(SENTINEL.encode())
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        process = Process()
+        captured = io.StringIO()
+        with (patch.object(server.subprocess, "Popen", return_value=process),
+              patch.object(server.signal, "SIGXCPU", 24, create=True),
+              patch.object(server, "kill_tree") as killed,
+              contextlib.redirect_stderr(captured)):
+            response = server.execute("repair", SENTINEL.encode(), self.folder / "tools.json")
+        self.assertEqual((504, {"error": {"code": "native_pdf_timeout"}}), response)
+        killed.assert_called_once_with(process)
+        self.assert_diagnostic(captured.getvalue(), "cpu_limit", "native_pdf_timeout", mode="repair", exit_code=-24)
+
+    def test_positive_exit_matching_cpu_signal_is_not_a_cpu_timeout(self):
+        with patch.object(server.signal, "SIGXCPU", 24, create=True):
+            response, log = self.run_child(f"print({SENTINEL!r},file=sys.stderr)\nsys.exit(24)")
+        self.assertEqual(FAILURE, response)
+        self.assert_diagnostic(log, "nonzero_exit", exit_code=24)
 
     def test_timeout_reports_killed_process_without_exception_message(self):
         class Process:
