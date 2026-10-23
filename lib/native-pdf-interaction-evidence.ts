@@ -56,10 +56,9 @@ const business = prefix + "f1_02[0]";
 const choice = (index: number) =>
   prefix + `Boxes3a-b_ReadOrder[0].c1_1[${index}]`;
 const segment = (number: number) => prefix + `f1_${number}[0]`;
-const entered = [name, ...[11, 12, 13, 14, 15].map(segment)];
-const untestedChoices = [2, 3, 4, 5, 6].map(choice);
 const line3b = prefix + "Boxes3a-b_ReadOrder[0].c1_2[0]";
-const unenteredText = [
+const textFields = [
+  name,
   business,
   prefix + "Boxes3a-b_ReadOrder[0].f1_03[0]",
   prefix + "Boxes3a-b_ReadOrder[0].f1_04[0]",
@@ -69,8 +68,10 @@ const unenteredText = [
   prefix + "Address_ReadOrder[0].f1_08[0]",
   prefix + "f1_09[0]",
   prefix + "f1_10[0]",
+  ...[11, 12, 13, 14, 15].map(segment),
 ];
-const remainingControls = "form-remaining-controls";
+const checkboxes = [...[0, 1, 2, 3, 4, 5, 6].map(choice), line3b];
+const allFields = [...textFields, ...checkboxes];
 
 /** Reviewed application evidence, not a ledger supplied by a PDF or a model.
  * See docs/pdf-form-interaction-evidence.md before adding or broadening a record.
@@ -79,128 +80,94 @@ const remainingControls = "form-remaining-controls";
 export const NATIVE_PDF_INTERACTION_TESTS: readonly InteractionTestRecord[] = [
   {
     schemaVersion: 1,
-    evidenceId: "w9-2024-acrobat-nvda-2026-10-22-v1",
+    evidenceId: "w9-2024-acrobat-nvda-2026-10-23-v3",
     sourceSha256:
       "2d420cbb4123dcf1fb82595b2359cfbb5d81f00b9df9d359fcc7af361d093f53",
     testedPdfSha256:
-      "7a7b66d35e57fe29513880b3e2c6775099a610b6d7beb24c5b31f74cbffa58f7",
+      "bb6be908a6e9cc4ef3ee4cf880c4d001b9915cb0901e500c069614dabd164756",
     savedTestCopySha256:
-      "56c07bb2bce1d21a9fdb95c50c341c7c530acdca7a67530ed5bb95f8d6e9d56c",
+      "7799295f8852a4dc5a3bb18702808999cdc724fa5e8d05077b33e9adfeb89bcc",
     interactionFingerprint: {
       schemaVersion: 1,
       sha256:
         "d07869c8d2186e5d545b4ec8adfc2b777c022c141643bd9140c1031d79837ced",
     },
-    testedAt: "2026-10-22",
+    testedAt: "2026-10-23",
     environment: "Adobe Acrobat 64-bit on Windows with NVDA 2026.2",
     pageCount: 6,
     fieldCount: 23,
     coverage: [
       {
         action: "field-announcement",
-        fieldNames: [
-          name,
-          choice(0),
-          choice(1),
-          segment(12),
-          segment(13),
-          segment(15),
-        ],
+        fieldNames: allFields,
         observation:
-          "Heard the required-name instructions, the first two classification choices, and the improved SSN middle/last and EIN last-segment descriptions.",
+          "Heard NVDA announce the descriptions of all 23 form controls, including the name requirement, all classification choices, and every SSN/EIN segment.",
       },
       {
         action: "keyboard-navigation",
-        fieldNames: [name, business, choice(0), choice(1)],
+        fieldNames: allFields,
         observation:
-          "Moved by keyboard through the name, business name and first two classification choices.",
+          "Reached all 23 form controls with the Tab key while NVDA announced each control.",
       },
       {
         action: "checkbox-operation",
-        fieldNames: [choice(0), choice(1)],
+        fieldNames: checkboxes,
         observation:
-          "Used Space to select Individual/sole proprietor, then C corporation; the first choice cleared.",
+          "Used the keyboard to exercise all seven classification choices and the separate line 3b checkbox; choosing another classification cleared the previous choice.",
       },
       {
         action: "text-entry",
-        fieldNames: entered,
+        fieldNames: textFields,
         observation:
-          "Entered fictional data in the name and all five SSN/EIN segments.",
+          "Entered fictional values in all 15 text fields, including business details, exemption codes, addresses, account numbers and all SSN/EIN segments.",
       },
       {
         action: "save-reopen",
-        fieldNames: [...entered, choice(1)],
+        fieldNames: allFields,
         observation:
-          "Saved, closed and reopened the test copy; the entered values persisted and the SSN middle segment's label and value were announced.",
+          "Across the October 22–23 tests, saved and reopened all 15 entered text values and all eight checkbox choices. NVDA announced the five classification selections reopened on October 23, along with the saved business value, LLC code and SSN middle-segment value in the recorded tests.",
       },
     ],
     remainingReviews: [
       {
-        code: remainingControls,
+        code: "form-signing-method",
         severity: "warning",
         pageNumber: 1,
-        location: "Lines 2–7 and the first SSN/EIN segments",
+        location: "Part II, Certification: signature",
         message:
-          "The previous Acrobat/NVDA tests covered selected controls. The other classification choices (S corporation, Partnership, Trust/estate, LLC and Other), line 3b, and the remaining text fields have not been exercised individually. The first SSN/EIN segments accepted and saved text, but their full spoken descriptions were not recorded.",
+          "Acrobat saved the test signature as a graphic and locked the form fields after signing. Placing and verifying that signature using only a keyboard and screen reader has not been established.",
         suggestion:
-          "For business name, check its spoken description, text entry, and saving; keyboard navigation to it already passed. Check announcements and keyboard operation for the other classification choices, line 3b, LLC/Other details, exemption codes, address, requester and account fields. Check keyboard navigation through all SSN/EIN segments and the first segments' announcements. Use fictional values to check saving and reopening the untouched fields and a selected Individual/sole proprietor choice.",
+          "Confirm that a person using a keyboard and screen reader can place and verify the signature, using a signing method accepted by the recipient.",
       },
       {
-        code: "form-certification-method",
+        code: "form-dating-method",
         severity: "warning",
         pageNumber: 1,
-        location: "Part II, Certification: signature, date and item 2",
+        location: "Part II, Certification: date beside the signature",
         message:
-          "The previous tests did not cover signing, adding the date, or crossing out certification item 2 when applicable. These actions may use PDF-reader tools rather than fillable fields.",
+          "Acrobat's Add text tool was unavailable in the tested unsigned form, so adding and verifying the date using a keyboard and screen reader remains unresolved.",
         suggestion:
-          "Confirm that the accepted way to complete those actions works with a keyboard and screen reader. Do not substitute a typed name for a signature without confirming the recipient accepts it.",
+          "Check that the person completing the form can enter the date in the correct place, hear it with a screen reader and find it after reopening the saved form.",
+      },
+      {
+        code: "form-certification-crossout-method",
+        severity: "warning",
+        pageNumber: 1,
+        location: "Part II, Certification: item 2",
+        message:
+          "Acrobat's line tools were unavailable and its Comments panel did not allow changes in the tested unsigned form. A keyboard and screen reader method for crossing out item 2 remains unresolved.",
+        suggestion:
+          "When item 2 needs to be crossed out, check that the person can mark the correct text using a keyboard and identify the change with a screen reader after saving and reopening.",
       },
     ],
     remainingReviewCoverage: [
-      {
-        reviewCode: remainingControls,
-        pageNumber: 1,
-        action: "field-announcement",
-        fieldNames: [
-          ...unenteredText,
-          ...untestedChoices,
-          line3b,
-          segment(11),
-          segment(14),
-        ],
-      },
-      {
-        reviewCode: remainingControls,
-        pageNumber: 1,
-        action: "keyboard-navigation",
-        fieldNames: [
-          ...unenteredText.filter((field) => field !== business),
-          ...untestedChoices,
-          line3b,
-          ...[11, 12, 13, 14, 15].map(segment),
-        ],
-      },
-      {
-        reviewCode: remainingControls,
-        pageNumber: 1,
-        action: "checkbox-operation",
-        fieldNames: [...untestedChoices, line3b],
-      },
-      {
-        reviewCode: remainingControls,
-        pageNumber: 1,
-        action: "text-entry",
-        fieldNames: unenteredText,
-      },
-      {
-        reviewCode: remainingControls,
-        pageNumber: 1,
-        action: "save-reopen",
-        fieldNames: [...unenteredText, choice(0), ...untestedChoices, line3b],
-      },
-      ...(["signing", "dating", "certification-crossout"] as const).map(
-        (action) => ({
-          reviewCode: "form-certification-method",
+      ...([
+        ["signing", "form-signing-method"],
+        ["dating", "form-dating-method"],
+        ["certification-crossout", "form-certification-crossout-method"],
+      ] as const).map(
+        ([action, reviewCode]) => ({
+          reviewCode,
           pageNumber: 1,
           action,
           fieldNames: [],
@@ -329,7 +296,10 @@ export function nativePdfInteractionSummary(
     environment: tests.environment,
     passedChecks: tests.coverage.map((test) => test.observation),
     scopeNote:
-      "This PDF's form controls and settings match the previously tested form. These checks were not rerun during this conversion and do not cover every control or other PDF readers. Specific remaining checks are listed below.",
+      "This PDF's form controls and settings match the previously tested form. The recorded checks apply to the listed actions in the named PDF reader and screen reader; they were not rerun during this conversion." +
+      (tests.remainingReviews.length
+        ? " Specific remaining interactions are listed below."
+        : " Other PDF readers and unlisted actions have not been tested."),
   };
 }
 
