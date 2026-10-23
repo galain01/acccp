@@ -24,7 +24,7 @@ from xml.sax.saxutils import escape
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "research" / "native-pdf"))
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import (ArrayObject, BooleanObject, DecodedStreamObject,
+from pypdf.generic import (ArrayObject, BooleanObject, ByteStringObject, DecodedStreamObject,
                           DictionaryObject, NameObject, TextStringObject)
 import verify_pdf
 from pdf_safety import reject_signed_pdf, resolved
@@ -132,6 +132,28 @@ def decode_pdf(value):
     return data
 
 
+def local_opening_view(reader):
+    """Accept only a catalog view of an existing page, without chained actions.
+
+    Opening-page destinations are passive navigation metadata. Keep them intact
+    and let the independent catalog comparison verify the saved behavior.
+    """
+    catalog = reader.trailer["/Root"]
+    destination = resolved(catalog.get("/OpenAction"))
+    if isinstance(destination, DictionaryObject):
+        if (set(destination) - {"/Type", "/S", "/D"}
+                or destination.get("/S") != "/GoTo"
+                or ("/Type" in destination and destination["/Type"] != "/Action")):
+            return False
+        destination = resolved(destination.get("/D"))
+        if not isinstance(destination, (ArrayObject, NameObject, TextStringObject, ByteStringObject)):
+            return False
+    elif not isinstance(destination, ArrayObject):
+        return False
+    pages = {verify_pdf.reference_key(page): index for index, page in enumerate(reader.pages, 1)}
+    return verify_pdf.LocalDestinations(catalog, pages).resolve(destination)["destinationResolved"]
+
+
 def open_pdf(data):
     if not 1 <= len(data) <= MAX_PDF or not data.startswith(b"%PDF-"):
         fail("pdf_invalid")
@@ -154,6 +176,7 @@ def open_pdf(data):
         finally:
             if rights is not None:
                 root[NameObject("/Perms")] = rights
+        opening_view_owners = {id(root)} if "/OpenAction" in root and local_opening_view(reader) else set()
         # Walk the reachable graph without decoding streams. Even hidden or
         # orphaned actions in an annotation/field cause rejection.
         pending, seen, count = [(reader.trailer["/Root"], 0)], set(), 0
@@ -173,6 +196,7 @@ def open_pdf(data):
                     "/XFA": hybrid.xfa_owner_ids if hybrid else set(),
                     "/JavaScript": hybrid.javascript_owner_ids if hybrid else set(),
                     "/JS": hybrid.javascript_action_ids if hybrid else set(),
+                    "/OpenAction": opening_view_owners,
                 }
                 if any(key in value and id(value) not in exceptions.get(key, set())
                        for key in ("/XFA", "/JavaScript", "/JS", "/EmbeddedFiles", "/EF", "/AF", "/AA", "/OpenAction")):
@@ -986,6 +1010,8 @@ def response(original_path, candidate_path, changes, toolchain, *, preservation_
             "machineChecks": {"preservationPassed": True, "inspectionComplete": complete,
                               "structurePassed": bool(inventory.get("machine_checks_passed")),
                               "pixelsIdentical": all(page.get("pixels_identical") for page in checks["preservation"]["pages"]),
+                              **({"renderingEquivalence": checks["preservation"]["rendering_equivalence"]}
+                                 if "rendering_equivalence" in checks["preservation"] else {}),
                               "targetStandard": "PDF/UA-1 (ISO 14289-1:2014)", "veraPdf": vera, "conformanceClaim": False}}
 
 

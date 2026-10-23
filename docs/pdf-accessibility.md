@@ -26,13 +26,29 @@ databases require their own reviewed migration before activation.
    the pages and content, inspect the structure, and run veraPDF against the
    delivered bytes. A preservation failure prevents publishing a repaired file.
 5. Run an independent model audit against the original and repaired PDFs, the
-   original page images and the reopened structure. Verified identical pixels
-   let the audit use the original page images for visual comparison. Every page
+   original page images and the reopened structure. Verified preservation of
+   page appearance lets the audit use the original page images. Every page
    and tag must be assigned to an audit batch. Incomplete audit or machine
    evidence remains a visible finding.
 6. Save the repaired PDF, review metadata, actual change summaries and findings.
    The result offers **Download repaired PDF**, **Changes made**, and **Items to
    review** with page numbers. PDF results never fetch or display generated HTML.
+
+An opening-page or zoom setting is preserved when it resolves to a page in the
+same PDF. This accepts ordinary initial views, including local GoTo actions;
+it does not allow scripts, chained actions or external opening actions.
+
+Page verification normally requires identical rendered pixels. Splitting an
+unchanged text instruction while adding tags can occasionally alter a few
+antialiased pixels at one render size. A bounded additional check can accept
+that only when the text, drawing instructions, resources and document behavior
+all match, no more than 128 pixels (and 0.01% of the page) differ at 108 dpi,
+and independent renders match exactly at both 72 and 144 dpi. At most eight
+pages may use this check, and the existing render-size limits still apply.
+The saved evidence records the different pixels and additional checks;
+`pixelsIdentical` remains false. A changed word, image, layout, or failed
+additional comparison still prevents output. This does not establish
+accessibility conformance.
 
 The current general repair operations add a missing title or language, identify
 supported text blocks as paragraphs/headings/captions/notes, add missing figure
@@ -63,7 +79,8 @@ not require content tags, but meaningful unowned text or graphics still fail
 the structure check. The independent auditor remains responsible for checking
 whether content marked decorative actually carries meaning.
 
-Model batches keep a page's tags together where possible. Dense pages have one
+Model batches keep a page's tags together where possible and split by serialized
+evidence size as well as page and tag counts. Dense pages have one
 owner for page-wide reviews, while every tag still receives review. A retained
 heading concern can be cleared only by a complete independent review with
 matching saved-tag evidence of the relevant repair. Machine findings and

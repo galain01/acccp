@@ -37,6 +37,10 @@ MAX_PAINT_ATOMS = 2_000_000
 MAX_ARTIFACT_TEXT_CHARS = 16_000
 MAX_TEXT_EXTRACTION_OPERATORS = 5_000_000
 RENDER_SCALE = 1.5
+MAX_RENDER_EQUIVALENCE_PAGES = 8
+MAX_RENDER_DRIFT_PIXELS = 128
+MAX_RENDER_DRIFT_FRACTION = 0.0001
+RENDER_VERIFICATION_SCALES = (1, 2)
 STANDARD_ROLES = {"Document", "Part", "Art", "Sect", "Div", "BlockQuote", "Caption", "TOC", "TOCI", "Index", "NonStruct", "Private", "P", "H", "H1", "H2", "H3", "H4", "H5", "H6", "L", "LI", "Lbl", "LBody", "Table", "TR", "TH", "TD", "THead", "TBody", "TFoot", "Span", "Quote", "Note", "Reference", "BibEntry", "Code", "Link", "Annot", "Ruby", "RB", "RT", "RP", "Warichu", "WT", "WP", "Figure", "Formula", "Form"}
 # These five CDC source occurrences were reviewed as blank-paragraph spacing
 # or footnote indentation, never interword separators. Pin the original file
@@ -460,28 +464,96 @@ def check_structure(reader: PdfReader) -> dict[str, Any]:
     return {"passed": True, "pages": len(pages), "structure_elements": len(seen_nodes), "mcids": total_mcids, "roles": roles, "scope": "text-only page content; semantic correctness requires auditor review"}
 
 
+def rendered_page_image(document: Any, page_number: int, scale: float) -> Any:
+    page = document[page_number]
+    try:
+        width, height = page.get_size()
+        if not math.isfinite(width + height) or width <= 0 or height <= 0 or math.ceil(width * scale) * math.ceil(height * scale) > MAX_PAGE_PIXELS:
+            raise InspectionError("render_pixel_limit")
+        bitmap = page.render(scale=scale, rotation=0, draw_annots=True)
+        try:
+            native_image = bitmap.to_pil()
+            try:
+                return native_image.convert("RGB")
+            finally:
+                native_image.close()
+        finally:
+            bitmap.close()
+    finally:
+        page.close()
+
+
 def rendered_page_hashes(path: Path) -> list[dict[str, Any]]:
     import pypdfium2 as pdfium
     document = pdfium.PdfDocument(str(path))
     result = []
     try:
         for page_number in range(len(document)):
-            page = document[page_number]
+            image = rendered_page_image(document, page_number, RENDER_SCALE)
             try:
-                width, height = page.get_size()
-                if not math.isfinite(width + height) or width <= 0 or height <= 0 or math.ceil(width * RENDER_SCALE) * math.ceil(height * RENDER_SCALE) > MAX_PAGE_PIXELS:
-                    raise InspectionError("render_pixel_limit")
-                bitmap = page.render(scale=RENDER_SCALE, rotation=0, draw_annots=True)
-                try:
-                    image = bitmap.to_pil().convert("RGB")
-                    result.append({"width": image.width, "height": image.height, "sha256": digest(image.tobytes())})
-                finally:
-                    bitmap.close()
+                result.append({"width": image.width, "height": image.height, "sha256": digest(image.tobytes())})
             finally:
-                page.close()
+                image.close()
     finally:
         document.close()
     return result
+
+
+def verify_rendering_equivalence(source: Path, output: Path, page_numbers: list[int]) -> dict[int, dict[str, Any]]:
+    """Confirm tiny renderer drift only after independent paint identity passes.
+
+    Splitting an unchanged text-show sequence at tag boundaries can move a few
+    antialiased pixels at one render scale. This is not pixel identity. Require
+    a small bounded difference at the primary scale AND exact pixel equality
+    at both additional scales. Never use a similarity score as a substitute
+    for the caller's content, resource and behavior checks.
+    """
+    import pypdfium2 as pdfium
+    from PIL import ImageChops
+    if not page_numbers or len(page_numbers) > MAX_RENDER_EQUIVALENCE_PAGES:
+        return {}
+    documents = []
+    evidence = {}
+    try:
+        for path in (source, output):
+            documents.append(pdfium.PdfDocument(str(path)))
+        for page_number in page_numbers:
+            images = []
+            try:
+                for document in documents:
+                    images.append(rendered_page_image(document, page_number - 1, RENDER_SCALE))
+                if images[0].size != images[1].size:
+                    continue
+                difference = ImageChops.difference(*images)
+                try:
+                    changed = sum(pixel != (0, 0, 0) for pixel in difference.getdata())
+                finally:
+                    difference.close()
+                total = images[0].width * images[0].height
+                if not 0 < changed <= min(MAX_RENDER_DRIFT_PIXELS, math.floor(total * MAX_RENDER_DRIFT_FRACTION)):
+                    continue
+            finally:
+                for image in images:
+                    image.close()
+            matched = True
+            for scale in RENDER_VERIFICATION_SCALES:
+                images = []
+                try:
+                    for document in documents:
+                        images.append(rendered_page_image(document, page_number - 1, scale))
+                    if images[0].size != images[1].size or images[0].tobytes() != images[1].tobytes():
+                        matched = False
+                        break
+                finally:
+                    for image in images:
+                        image.close()
+            if matched:
+                evidence[page_number] = {"pageNumber": page_number, "changedPixels": changed,
+                    "totalPixels": total, "verificationScales": list(RENDER_VERIFICATION_SCALES)}
+    finally:
+        for document in documents:
+            document.close()
+    return evidence
 
 
 def page_behavior_values(pair: tuple[Any, Any]) -> tuple[dict[str, Any], dict[str, Any], int]:
@@ -829,6 +901,21 @@ def ownership_required_mcids(ops: list[tuple[Any, bytes]], properties: Any = Non
     return required
 
 
+def scoped_text_operations(ops: list[tuple[Any, bytes]], owners: list[int | None], artifacts: list[bool]) -> list[tuple[tuple[Any, bytes], int | None, bool]]:
+    """Reuse ownership already proved by the complete stream scan.
+
+    Marked-content wrappers have no effect on pypdf's native text decoder.
+    Removing them once from this disposable extraction index avoids charging
+    every MCID for all the tagger's wrappers on the page. All painting/text
+    state remains in order, and the existing work limit still bounds each
+    repeated extraction. Form/image invocations were already excluded from
+    these page-local text views; their separate inspection is unchanged.
+    """
+    ignored = {b"BMC", b"BDC", b"EMC", b"MP", b"DP", b"Do", b"INLINE IMAGE"}
+    return [(operation, owner, artifact) for operation, owner, artifact in zip(ops, owners, artifacts)
+            if operation[1] not in ignored]
+
+
 def structure_inventory(reader: PdfReader) -> dict[str, Any]:
     """Read actual saved tags; do not infer associations from visual proximity."""
     pages = list(reader.pages)
@@ -955,14 +1042,15 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
             info["findings"].append({"code": "artifact_text_needs_semantic_review", "severity": "warning", "page": page_number})
         artifact_text = ""
         artifact_complete = not form_content_uninspected
+        extraction_ops = scoped_text_operations(ops, current_owners, current_artifacts)
         if artifacts:
-            extraction_work += len(ops)
+            extraction_work += len(extraction_ops)
             if extraction_work > MAX_TEXT_EXTRACTION_OPERATORS:
                 artifact_complete = False
             else:
                 # Keep text state while removing every other text-show operation.
                 # Do is omitted because a Form can contain unrelated/internal text.
-                selected = [(operands, operator) for (operands, operator), artifact in zip(ops, current_artifacts) if operator not in (b"Do", b"INLINE IMAGE") and (operator not in (b"Tj", b"TJ", b"'", b'"') or artifact)]
+                selected = [(operands, operator) for (operands, operator), _, artifact in extraction_ops if operator not in (b"Tj", b"TJ", b"'", b'"') or artifact]
                 page_copy = copy.copy(page)
                 page_copy[NameObject("/Contents")] = extraction_stream(selected, reader, page.get('/Resources', {}))
                 artifact_text = page_copy.extract_text() or ""
@@ -971,11 +1059,11 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
                 artifact_text = artifact_text[:MAX_ARTIFACT_TEXT_CHARS] if decoded_text_chars <= MAX_TEXT_CHARS else ""
         info["page_content"].append({"pageNumber": page_number, "mcids": sorted(page_mcids), "ownership_required_mcids": sorted(ownership_required_mcids(ops, properties)), "text_show_operators": text_index, "untagged_text_operators": unowned, "artifact_text_operators": artifacts, "artifactText": artifact_text, "artifactTextComplete": artifact_complete, "occurrence_ids_by_mcid": occurrence_ids})
         for mcid in page_mcids:
-            extraction_work += len(ops)
+            extraction_work += len(extraction_ops)
             if extraction_work > MAX_TEXT_EXTRACTION_OPERATORS:
                 content_text[(page_number, mcid)] = None
                 continue
-            selected = [(operands, operator) for (operands, operator), owner, artifact in zip(ops, current_owners, current_artifacts) if operator not in (b"Do", b"INLINE IMAGE") and (operator not in (b"Tj", b"TJ", b"'", b'"') or (owner == mcid and not artifact))]
+            selected = [(operands, operator) for (operands, operator), owner, artifact in extraction_ops if operator not in (b"Tj", b"TJ", b"'", b'"') or (owner == mcid and not artifact)]
             page_copy = copy.copy(page)
             page_copy[NameObject("/Contents")] = extraction_stream(selected, reader, page.get('/Resources', {}))
             text = page_copy.extract_text() or ""
@@ -1055,12 +1143,13 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
         if unowned:
             gaps.add("form_text_without_native_mcid")
         scope = {"id": f"form-{len(info['form_content']) + 1}", "pageNumber": pn, "mcids": sorted(mcids), "ownership_required_mcids": sorted(ownership_required_mcids(ops, props)), "stream": form, "text": {}, "gaps": gaps}
+        extraction_ops = scoped_text_operations(ops, owners, artifacts)
         for selected_mcid in [None, *sorted(mcids)]:
-            extraction_work += len(ops)
+            extraction_work += len(extraction_ops)
             if extraction_work > MAX_TEXT_EXTRACTION_OPERATORS:
                 gaps.add("form_text_extraction_limit")
                 continue
-            selected = [(args, operator) for (args, operator), owner, artifact in zip(ops, owners, artifacts) if operator not in (b"Do", b"INLINE IMAGE") and (operator not in (b"Tj", b"TJ", b"'", b'"') or (artifact if selected_mcid is None else owner == selected_mcid and not artifact))]
+            selected = [(args, operator) for (args, operator), owner, artifact in extraction_ops if operator not in (b"Tj", b"TJ", b"'", b'"') or (artifact if selected_mcid is None else owner == selected_mcid and not artifact)]
             page_copy = copy.copy(page)
             page_copy[NameObject("/Contents")] = extraction_stream(selected, reader, resources)
             page_copy[NameObject("/Resources")] = resources
@@ -1885,11 +1974,19 @@ def compare_pdfs(source: Path, output: Path, strict_text_subset: bool = False) -
                     finding(key.replace("_identical", "_changed"), "The repaired PDF changed source content, appearance, resources, or page behavior.", index + 1)
             report["preservation"]["pages"].append(page_result)
         source_pixels, output_pixels = rendered_page_hashes(source), rendered_page_hashes(output)
+        differing_pages = [index + 1 for index, (left, right) in enumerate(zip(source_pixels, output_pixels)) if left != right]
+        # No content/behavior/resource mismatch is eligible for a rasterization
+        # exception. The additional exact renders cannot dismiss other findings.
+        equivalent = verify_rendering_equivalence(source, output, differing_pages) if not report["findings"] else {}
         for index, (left, right) in enumerate(zip(source_pixels, output_pixels)):
             same = left == right
             report["preservation"]["pages"][index]["pixels_identical"] = same
-            if not same:
+            if index + 1 in equivalent:
+                report["preservation"]["pages"][index]["rendering_equivalence"] = equivalent[index + 1]
+            if not same and index + 1 not in equivalent:
                 finding("page_pixels_changed", "The repaired page does not render identically to the original.", index + 1)
+        if equivalent:
+            report["preservation"]["rendering_equivalence"] = {"method": "identical-paint-multiscale-v1", "pages": list(equivalent.values())}
         report["preservation"]["passed"] = not report["findings"]
         report["source_structure"] = structure_inventory(before)
         report["structure"] = structure_inventory(after)

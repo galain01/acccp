@@ -333,6 +333,286 @@ describe("prior matching PDF interaction tests", () => {
 });
 
 describe("native PDF model contracts", () => {
+  it("describes rendering evidence accurately when pixels are not identical", async () => {
+    const state = await makeState();
+    state.machineChecks.pixelsIdentical = false;
+    state.machineChecks.renderingEquivalence = {
+      method: "identical-paint-multiscale-v1",
+      pages: [
+        {
+          pageNumber: 1,
+          changedPixels: 8,
+          totalPixels: 1_000_000,
+          verificationScales: [1, 2],
+        },
+      ],
+    };
+    useState(state);
+    const result = await repairNativePdf(state.pdf, "render-equivalence.pdf");
+    if ("error" in result) throw Error(result.error);
+    expect(result.nativePdfChecks.pixelsIdentical).toBe(false);
+    for (const [, parts] of mocks.call.mock.calls) {
+      const descriptions = (parts as LiteLLMContentPart[])
+        .filter((part) => part.type === "text")
+        .map((part) => part.text);
+      expect(descriptions).toContain(
+        "Original physical PDF page 1. The machine-check evidence describes how page appearance was verified."
+      );
+      expect(
+        descriptions.some((value) =>
+          value.includes("confirms the repaired page is identical")
+        )
+      ).toBe(false);
+      expect(
+        descriptions.some((value) => value.includes('"pixelsIdentical":false'))
+      ).toBe(true);
+    }
+  });
+  it("splits a detailed four-page inventory below 200 tags by serialized size", async () => {
+    const state = await makeState(4);
+    state.inventory.tags = Array.from({ length: 186 }, (_, index) => {
+      const item = tag(Math.floor(index / 47) + 1, index + 1);
+      item.text = "Source paragraph. ".repeat(100);
+      item.snapshot.text = item.text;
+      return item;
+    });
+    expect(JSON.stringify(state.inventory.tags).length).toBeGreaterThan(
+      350_000
+    );
+    const batches = nativePdfBatches(state);
+    expect(batches.length).toBeGreaterThan(1);
+    expect(
+      batches.every((batch) => JSON.stringify(batch.tags).length <= 350_000)
+    ).toBe(true);
+    expect(
+      batches.every(
+        (batch) =>
+          batch.tags.length <= 200 &&
+          batch.pages.length <= 4 &&
+          batch.visualPages.length <= 12
+      )
+    ).toBe(true);
+    expect(
+      batches.flatMap((batch) => batch.tags.map((item) => item.id))
+    ).toEqual(state.inventory.tags.map((item) => item.id));
+    expect(batches.flatMap((batch) => batch.pageReviewPages)).toEqual([
+      1, 2, 3, 4,
+    ]);
+    expect(batches.filter((batch) => batch.first)).toHaveLength(1);
+    useState(state);
+    const result = await repairNativePdf(state.pdf, "detailed-inventory.pdf");
+    expect("error" in result).toBe(false);
+    expect(mocks.call).toHaveBeenCalledTimes(batches.length * 2);
+  });
+
+  it("splits a size-heavy single page while retaining exactly one page-wide reviewer", async () => {
+    const state = await makeState();
+    state.inventory.tags = Array.from({ length: 160 }, (_, index) => {
+      const item = tag(1, index + 1);
+      item.text = "x".repeat(2500);
+      item.snapshot.text = item.text;
+      return item;
+    });
+    const batches = nativePdfBatches(state);
+    expect(batches.length).toBeGreaterThan(1);
+    expect(batches.flatMap((batch) => batch.pageReviewPages)).toEqual([1]);
+    expect(
+      batches.flatMap((batch) => batch.tags.map((item) => item.id))
+    ).toEqual(state.inventory.tags.map((item) => item.id));
+    expect(
+      batches.every(
+        (batch) =>
+          batch.pages.join() === "1" &&
+          JSON.stringify(batch.tags).length <= 350_000
+      )
+    ).toBe(true);
+  });
+
+  it("splits combined companion-page scope instead of rejecting individually bounded tags", async () => {
+    const state = await makeState(16);
+    state.inventory.tags[0].content = Array.from({ length: 8 }, (_, index) => ({
+      pageNumber: index + 1,
+    }));
+    state.inventory.tags[1].content = [2, 9, 10, 11, 12, 13, 14, 15].map(
+      (pageNumber) => ({ pageNumber })
+    );
+    const batches = nativePdfBatches(state);
+    expect(batches.every((batch) => batch.visualPages.length <= 12)).toBe(true);
+    expect(
+      batches.find((batch) => batch.tags.some((item) => item.id === "tag-1"))
+        ?.visualPages
+    ).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(
+      batches.flatMap((batch) => batch.tags.map((item) => item.id))
+    ).toEqual(state.inventory.tags.map((item) => item.id));
+    expect(batches.flatMap((batch) => batch.pageReviewPages)).toEqual(
+      Array.from({ length: 16 }, (_, index) => index + 1)
+    );
+  });
+
+  it("includes contextual evidence in the existing 900,000-character scope budget", async () => {
+    const state = await makeState(3);
+    state.inventory.forms = { authoredDescription: "x".repeat(620_000) };
+    for (const item of state.inventory.tags) {
+      item.text = "x".repeat(55_000);
+      item.snapshot.text = item.text;
+    }
+    expect(JSON.stringify(state.inventory.tags).length).toBeLessThan(350_000);
+    const batches = nativePdfBatches(state);
+    expect(batches.length).toBeGreaterThan(1);
+    expect(
+      batches.flatMap((batch) => batch.tags.map((item) => item.id))
+    ).toEqual(state.inventory.tags.map((item) => item.id));
+    useState(state);
+    const result = await repairNativePdf(state.pdf, "context-budget.pdf");
+    expect("error" in result).toBe(false);
+    for (const [, parts] of mocks.call.mock.calls) {
+      const textPart = (parts as LiteLLMContentPart[]).find(
+        (part) => part.type === "text"
+      );
+      if (textPart?.type !== "text") throw Error("Missing model evidence");
+      const evidence = textPart.text
+        .split("\n")
+        .filter((line) => line.startsWith('{"evidenceRole"'));
+      expect(evidence.every((value) => value.length <= 900_000)).toBe(true);
+    }
+  });
+
+  it("still rejects a single tag or global evidence that cannot fit without being discarded", async () => {
+    const state = await makeState();
+    state.inventory.tags[0].text = "x".repeat(180_000);
+    state.inventory.tags[0].snapshot.text = state.inventory.tags[0].text;
+    expect(() => nativePdfBatches(state)).toThrow("pdf_complexity_limit");
+    state.inventory.tags = [tag(1)];
+    state.inventory.forms = { authoredDescription: "x".repeat(900_000) };
+    expect(() => nativePdfBatches(state)).toThrow("pdf_complexity_limit");
+  });
+
+  it("allows exact phase evidence to split batches without losing review ownership", async () => {
+    const state = await makeState(3);
+    const evidence = (batch: ReturnType<typeof nativePdfBatches>[number]) => {
+      const serialized = JSON.stringify({
+        retainedContext: batch.pages.map((pageNumber) => ({
+          pageNumber,
+          content: "x".repeat(320_000),
+        })),
+      });
+      if (serialized.length > 900_000)
+        throw new NativePdfError("pdf_complexity_limit");
+      return serialized;
+    };
+    expect(nativePdfBatches(state)).toHaveLength(1);
+    const batches = nativePdfBatches(state, evidence);
+    expect(batches).toHaveLength(2);
+    expect(batches.flatMap((batch) => batch.pageReviewPages)).toEqual([
+      1, 2, 3,
+    ]);
+    expect(
+      batches.flatMap((batch) => batch.tags.map((item) => item.id))
+    ).toEqual(["tag-1", "tag-2", "tag-3"]);
+    expect(batches.every((batch) => evidence(batch).length <= 900_000)).toBe(
+      true
+    );
+    expect(() =>
+      nativePdfBatches(state, () => {
+        throw new NativePdfError("pdf_protocol_error");
+      })
+    ).toThrow("pdf_protocol_error");
+  });
+
+  it("sizes audit batches with the actual retained findings", async () => {
+    const state = await makeState(3);
+    useState(state);
+    const findings = Array.from({ length: 240 }, (_, index) => ({
+      code: "source-review",
+      severity: "warning",
+      pageNumber: (index % 3) + 1,
+      location: "x".repeat(200),
+      message: `Concern ${index}: ` + "x".repeat(1780),
+      suggestion: "x".repeat(1800),
+    }));
+    mocks.call.mockImplementation((prompt, parts) =>
+      response({
+        ...validContent(prompt, parts),
+        ...(prompt !== NATIVE_PDF_AUDIT_PROMPT ? { findings } : {}),
+      })
+    );
+    const result = await repairNativePdf(
+      state.pdf,
+      "retained-findings-budget.pdf"
+    );
+    if ("error" in result) throw Error(result.error);
+    expect(result.nativePdfChecks.auditComplete).toBe(true);
+    const auditCalls = mocks.call.mock.calls.filter(
+      ([prompt]) => prompt === NATIVE_PDF_AUDIT_PROMPT
+    );
+    expect(auditCalls).toHaveLength(2);
+    expect(
+      auditCalls.flatMap(([, parts]) => scope(parts).pageReviewPages)
+    ).toEqual([1, 2, 3]);
+    for (const [, parts] of auditCalls) {
+      const firstText = (parts as LiteLLMContentPart[]).find(
+        (part) => part.type === "text"
+      );
+      if (firstText?.type !== "text") throw Error("Missing audit evidence");
+      const current = firstText.text.split("\n")[1];
+      expect(current.length).toBeLessThanOrEqual(900_000);
+      expect(
+        JSON.parse(current).outstandingRepairFindings.length
+      ).toBeGreaterThan(0);
+    }
+  });
+
+  it("sizes audit batches with the actual historical inventory as well as the output", async () => {
+    const prepared = await makeState(3);
+    prepared.inventory.forms = { authoredDescription: "x".repeat(620_000) };
+    prepared.inventory.tags.forEach((item) => {
+      item.extractionDetails = "x".repeat(110_000);
+    });
+    const repaired: NativePdfState = {
+      ...prepared,
+      inventory: {
+        ...prepared.inventory,
+        tags: prepared.inventory.tags.map((item) => {
+          const copy = { ...item };
+          delete copy.extractionDetails;
+          return copy;
+        }),
+      },
+    };
+    expect(nativePdfBatches(repaired)).toHaveLength(1);
+    useState(prepared);
+    mocks.worker
+      .mockResolvedValueOnce(prepared)
+      .mockResolvedValueOnce(repaired);
+    const result = await repairNativePdf(
+      prepared.pdf,
+      "historical-inventory-budget.pdf"
+    );
+    if ("error" in result) throw Error(result.error);
+    expect(result.nativePdfChecks.auditComplete).toBe(true);
+    const auditCalls = mocks.call.mock.calls.filter(
+      ([prompt]) => prompt === NATIVE_PDF_AUDIT_PROMPT
+    );
+    expect(auditCalls).toHaveLength(2);
+    expect(
+      auditCalls.flatMap(([, parts]) => scope(parts).assignedTagIds)
+    ).toEqual(["tag-1", "tag-2", "tag-3"]);
+    for (const [, parts] of auditCalls) {
+      const firstText = (parts as LiteLLMContentPart[]).find(
+        (part) => part.type === "text"
+      );
+      if (firstText?.type !== "text") throw Error("Missing audit evidence");
+      const historical = firstText.text.split("\n")[3];
+      expect(historical.length).toBeLessThanOrEqual(900_000);
+      expect(
+        JSON.parse(historical).tags.every(
+          (item: NativePdfTag) => item.extractionDetails === "x".repeat(110_000)
+        )
+      ).toBe(true);
+    }
+  });
+
   it("assigns unpaged wrappers by descendant content without attaching sixty companion pages to the root", async () => {
     const state = await makeState(60);
     const leaves = state.inventory.tags;
