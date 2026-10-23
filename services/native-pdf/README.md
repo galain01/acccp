@@ -125,6 +125,16 @@ inherited runtime injection options. JVM scratch paths and working directories
 are pinned to the request directory. Cleanup follows successful, failed and
 timed-out jobs. Responses never contain native stderr or filesystem paths.
 
+Within one repair request, read-only checks can share a fresh structure
+inspection bound to the same unchanged reader. Enrichment receives a copy so
+editing hints cannot alter the underlying verification evidence. The saved
+output is reopened and inspected again; response inventory reuse requires
+matching saved output bytes and matching source bytes. The final preservation
+comparison still independently opens and inspects the files, and structural
+edits still independently rediscover their authorized boundaries. No inspection
+evidence is accepted from requests or retained between jobs. These savings keep
+the existing processing limits and preservation checks in place.
+
 ## Verification
 
 ```text

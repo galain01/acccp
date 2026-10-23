@@ -6,6 +6,7 @@ inspection code is reused as an independent verifier, never as fixture plans.
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import io
 import json
@@ -350,11 +351,16 @@ def text_block_eligible(tag, tags):
     return len(pages) == 1 and 0 < len(text.strip()) <= 20_000
 
 
-def enrich_inventory(reader, original):
-    # Both consumers inspect this exact, unchanged PdfReader. Keep pristine
-    # evidence local to this call; every reopened output starts a new scan.
-    discovery_inspection = _DiscoveryInspection(reader)
-    inventory = discovery_inspection.copy_for(reader)
+def enrich_inventory(reader, original, *, _inspection=None):
+    # Enrichment, discovery and authored-ID checks may share pristine evidence
+    # for this exact unchanged PdfReader. Reopened outputs receive a new scan.
+    if _inspection is not None and type(_inspection) is not _DiscoveryInspection:
+        fail("native_pdf_preservation")
+    discovery_inspection = _inspection if _inspection is not None else _DiscoveryInspection(reader)
+    try:
+        inventory = discovery_inspection.copy_for(reader)
+    except SemanticStructureError:
+        fail("native_pdf_preservation")
     tags = inventory["tags"]
     if not tags or len(tags) > MAX_TAGS:
         fail("pdf_complexity_limit" if tags else "native_pdf_unsupported")
@@ -560,6 +566,8 @@ def simple_link_paint(page, mcids, rectangle, page_operations=None):
 
 def native_link_descriptions(reader, *, targets=None, include_existing=False):
     """Verified source-tagged, single-page links with literal native labels."""
+    if targets is not None and not targets:
+        return {}
     if reader.trailer["/Root"].get("/StructTreeRoot") is None:
         return {}
     inventory = verify_pdf.structure_inventory(reader)
@@ -667,6 +675,8 @@ def verify_added_link_descriptions(original, candidate):
 
 def add_link_descriptions(original, candidate, writer):
     source_links = native_link_descriptions(original)
+    if not source_links:
+        return []
     candidate_links = native_link_descriptions(candidate, targets=source_links, include_existing=True)
     changes = []
     for key, expected in source_links.items():
@@ -743,7 +753,38 @@ def set_metadata(writer, title=None, language=None):
     return changes
 
 
-def apply_plan(original, candidate, plan, output, *, lineage=None):
+class _SavedOutputInspection:
+    """Private handoff of verified reopened output; never request-supplied data."""
+    __slots__ = ('_source_bytes', '_output_bytes', '_inventory')
+
+    def __init__(self, original, reopened, inspection):
+        if type(inspection) is not _DiscoveryInspection:
+            fail("native_pdf_preservation")
+        self._source_bytes = original.stream.getvalue()
+        self._output_bytes = reopened.stream.getvalue()
+        # Derive the inventory here, rather than accepting a caller's raw dict.
+        self._inventory = enrich_inventory(reopened, original, _inspection=inspection)
+
+    def copy_for(self, source_bytes, output_bytes):
+        if output_bytes != self._output_bytes:
+            fail("native_pdf_preservation")
+        # Hybrid preparation has a separately verified normalized source. Keep
+        # the original response semantics by inspecting again in that context.
+        if source_bytes != self._source_bytes:
+            return None
+        return copy.deepcopy(self._inventory)
+
+
+class _SavedOutputCapture:
+    __slots__ = ('inspection',)
+
+    def __init__(self):
+        self.inspection = None
+
+
+def apply_plan(original, candidate, plan, output, *, lineage=None, _saved_output=None):
+    if _saved_output is not None and (type(_saved_output) is not _SavedOutputCapture or _saved_output.inspection is not None):
+        fail("native_pdf_invalid_plan")
     if not isinstance(plan, dict) or set(plan) - {"schemaVersion", "candidateSha256", "language", "title", "operations"} or type(plan.get("schemaVersion")) is not int or plan["schemaVersion"] != 1 or plan.get("candidateSha256") != digest(candidate.stream.getvalue()):
         fail("native_pdf_invalid_plan")
     operations = plan.get("operations")
@@ -751,10 +792,11 @@ def apply_plan(original, candidate, plan, output, *, lineage=None):
         fail("native_pdf_invalid_plan")
     verify_added_link_descriptions(original, candidate)
     try:
-        verify_authored_ids(original, candidate)
-    except NoteIdError:
+        candidate_inspection = _DiscoveryInspection(candidate)
+        verify_authored_ids(original, candidate, _candidate_inspection=candidate_inspection)
+    except (NoteIdError, verify_pdf.InspectionError, KeyError, IndexError, AttributeError, TypeError):
         fail("native_pdf_preservation")
-    inventory = enrich_inventory(candidate, original)
+    inventory = enrich_inventory(candidate, original, _inspection=candidate_inspection)
     nodes = native_nodes(candidate)
     if len(nodes) != len(inventory["tags"]) or any(str(node.get("/S", "")).lstrip("/") != tag["sourceRole"] for node, tag in zip(nodes, inventory["tags"])):
         fail("native_pdf_preservation")
@@ -836,11 +878,13 @@ def apply_plan(original, candidate, plan, output, *, lineage=None):
     reopened = write_pdf(writer, output)
     try:
         verify_note_ids(note_before, reopened)
-        verify_authored_ids(original, reopened)
-    except NoteIdError:
+        output_inspection = _DiscoveryInspection(reopened)
+        verify_authored_ids(original, reopened, _candidate_inspection=output_inspection)
+    except (NoteIdError, verify_pdf.InspectionError, KeyError, IndexError, AttributeError, TypeError):
         fail("native_pdf_preservation")
     verify_saved_annotations(original, candidate, reopened)
-    actual = enrich_inventory(reopened, original)
+    saved_inspection = _SavedOutputInspection(original, reopened, output_inspection)
+    actual = saved_inspection.copy_for(original.stream.getvalue(), reopened.stream.getvalue())
     if len(actual["tags"]) != len(final_positions):
         fail("native_pdf_preservation")
     for operation in operations:
@@ -856,6 +900,8 @@ def apply_plan(original, candidate, plan, output, *, lineage=None):
             fail("native_pdf_preservation")
         if operation["type"] == "set_table_header" and (tag["role"] != "TH" or tag["attributes"][-1].get("scope") != operation["scope"]):
             fail("native_pdf_preservation")
+    if _saved_output is not None:
+        _saved_output.inspection = saved_inspection
     return changes
 
 
@@ -943,16 +989,21 @@ def normalized_finding(item, inventory):
     return row
 
 
-def response(original_path, candidate_path, changes, toolchain, *, preservation_source_path=None, hybrid_summary=None, lineage=None):
-    before = open_pdf(original_path.read_bytes())
-    after = open_pdf(candidate_path.read_bytes())
+def response(original_path, candidate_path, changes, toolchain, *, preservation_source_path=None, hybrid_summary=None, lineage=None, _saved_output=None):
+    original_bytes, candidate_bytes = original_path.read_bytes(), candidate_path.read_bytes()
+    if _saved_output is not None and type(_saved_output) is not _SavedOutputInspection:
+        fail("native_pdf_preservation")
+    inventory = _saved_output.copy_for(original_bytes, candidate_bytes) if _saved_output is not None else None
+    before = open_pdf(original_bytes)
+    after = open_pdf(candidate_bytes)
     verify_added_link_descriptions(before, after)
     checks = verify_pdf.compare_pdfs(preservation_source_path or original_path, candidate_path)
     # Preservation failures cannot be waived by a model or converted to a
     # normal warning. Incomplete semantic inspection remains a visible issue.
     if checks.get("inspection_incomplete") or not checks.get("preservation", {}).get("passed") or checks.get("findings"):
         fail("native_pdf_preservation")
-    inventory = enrich_inventory(after, before)
+    if inventory is None:
+        inventory = enrich_inventory(after, before)
     if lineage is not None:
         inventory["sourceTagLineage"] = lineage["sourceTagLineage"]
         for tag in inventory["tags"]:
@@ -1007,9 +1058,11 @@ def response(original_path, candidate_path, changes, toolchain, *, preservation_
             findings.append({"code": "pdf_ua_rule_" + re.sub(r"[^A-Za-z0-9_]", "_", clause + "_" + str(rule["testNumber"])),
                              "severity": "warning" if clause.startswith("5") else "error", "location": "Document", "message": message,
                              "suggestion": suggestion, "rule": rule})
+    if original_path.read_bytes() != original_bytes or candidate_path.read_bytes() != candidate_bytes:
+        fail("native_pdf_preservation")
     complete = True  # Required above; incomplete evidence never reaches the auditor.
-    return {"schemaVersion": 1, "sourceSha256": digest(original_path.read_bytes()), "candidateSha256": digest(candidate_path.read_bytes()),
-            "pdfBase64": base64.b64encode(candidate_path.read_bytes()).decode("ascii"), "pageCount": len(after.pages),
+    return {"schemaVersion": 1, "sourceSha256": digest(original_bytes), "candidateSha256": digest(candidate_bytes),
+            "pdfBase64": base64.b64encode(candidate_bytes).decode("ascii"), "pageCount": len(after.pages),
             "inventory": inventory, "findings": findings, "changes": changes,
             "machineChecks": {"preservationPassed": True, "inspectionComplete": complete,
                               "structurePassed": bool(inventory.get("machine_checks_passed")),
@@ -1061,6 +1114,7 @@ def prepared_source(source, source_path, directory):
 def process(mode, request_path, directory, toolchain):
     source_path, output_path = directory / "source.pdf", directory / "output.pdf"
     lineage = None
+    saved_output = _SavedOutputCapture()
     if mode == "prepare":
         source = request_path.read_bytes()
         original, reference_path, changes, hybrid_summary = prepared_source(source, source_path, directory)
@@ -1106,11 +1160,12 @@ def process(mode, request_path, directory, toolchain):
         if comparison.get("inspection_incomplete") or not comparison.get("preservation", {}).get("passed") or comparison.get("findings"):
             fail("native_pdf_preservation")
         lineage = {}
-        changes = apply_plan(original, candidate, data["plan"], output_path, lineage=lineage)
+        changes = apply_plan(original, candidate, data["plan"], output_path, lineage=lineage, _saved_output=saved_output)
     else:
         fail("native_pdf_invalid_plan")
     return response(source_path, output_path, changes, toolchain,
-                    preservation_source_path=reference_path, hybrid_summary=hybrid_summary, lineage=lineage)
+                    preservation_source_path=reference_path, hybrid_summary=hybrid_summary, lineage=lineage,
+                    _saved_output=saved_output.inspection)
 
 
 def main():
