@@ -230,11 +230,12 @@ def _single_child_index(parent, child):
 
 
 class _DiscoveryInspection:
-    """One fresh reader inspection, shared only during worker enrichment.
+    """One fresh reader inspection, shared by checks on that unchanged reader.
 
-    No caller-provided inventory or writer state is accepted. The worker keeps
-    this local to one enrich_inventory call, with no intervening reader edits;
-    applying a plan always rediscovers candidates from a fresh inspection.
+    No caller-provided inventory or writer state is accepted. The worker shares
+    this with authored-ID checks, enrichment and discovery, with no intervening
+    reader edits. Structural plan application always rediscovers candidates
+    from a fresh inspection; every reopened output receives new evidence.
     """
     __slots__ = ('_reader', '_inventory')
 

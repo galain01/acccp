@@ -10,6 +10,7 @@ from pypdf.generic import (ArrayObject, ByteStringObject, DictionaryObject,
                           NameObject, TextStringObject)
 
 from verify_pdf import InspectionError, STANDARD_ROLES, resolved, structure_id_tree, structure_inventory
+from bounded_semantic_structure import _DiscoveryInspection, SemanticStructureError
 
 MAX_TAGS = 5000
 MAX_DEPTH = 64
@@ -155,7 +156,7 @@ def verify_note_ids(before, after):
         raise NoteIdError("note_id_preservation")
 
 
-def verify_authored_ids(original, candidate):
+def verify_authored_ids(original, candidate, *, _candidate_inspection=None):
     """Keep each authored ID bound to the exact same ordered source content.
 
     Tag numbers may shift when a separately authorized structural edit adds a
@@ -163,7 +164,11 @@ def verify_authored_ids(original, candidate):
     the ordinary preservation check independently protects their page programs.
     """
     try:
-        inventories = [structure_inventory(pdf) for pdf in (original, candidate)]
+        if _candidate_inspection is not None and type(_candidate_inspection) is not _DiscoveryInspection:
+            raise NoteIdError("authored_id_preservation")
+        inventories = [structure_inventory(original),
+            _candidate_inspection.copy_for(candidate) if _candidate_inspection is not None
+            else structure_inventory(candidate)]
         if any(item.get("tagged") and not item.get("native_id_tree", {}).get("verified") for item in inventories):
             raise NoteIdError("authored_id_preservation")
         maps = [{tag["nativeIdHex"]: tag for tag in inventory["tags"] if "nativeIdHex" in tag}
@@ -225,7 +230,7 @@ def verify_authored_ids(original, candidate):
             output_tag = maps[1].get(identifier)
             if output_tag is None or association(inventories[0], source_tag) != association(inventories[1], output_tag):
                 raise NoteIdError("authored_id_preservation")
-    except (InspectionError, KeyError, IndexError, AttributeError, TypeError) as error:
+    except (InspectionError, SemanticStructureError, KeyError, IndexError, AttributeError, TypeError) as error:
         raise NoteIdError("authored_id_preservation") from error
 
 
