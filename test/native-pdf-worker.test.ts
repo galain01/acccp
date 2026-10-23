@@ -1,4 +1,12 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  expectTypeOf,
+  it,
+  vi,
+} from "vitest";
 vi.mock("server-only", () => ({}));
 import {
   nativePdfRequest,
@@ -70,6 +78,19 @@ function response() {
     },
   };
 }
+function renderingEquivalence() {
+  return {
+    method: "identical-paint-multiscale-v1",
+    pages: [
+      {
+        pageNumber: 1,
+        changedPixels: 8,
+        totalPixels: 1_000_000,
+        verificationScales: [1, 2],
+      },
+    ],
+  };
+}
 describe("native PDF service client", () => {
   it("accepts only the versioned worker fingerprint shape", () => {
     const raw = response();
@@ -135,6 +156,149 @@ describe("native PDF service client", () => {
     ] as const) {
       const raw = response();
       raw.machineChecks[key] = false;
+      expect(() => parseNativePdfState(raw, source)).toThrow(
+        "pdf_protocol_error"
+      );
+    }
+  });
+  it("keeps nonidentical pixels honest when the worker supplies bounded rendering equivalence", () => {
+    const evidence = renderingEquivalence();
+    const raw = {
+      ...response(),
+      machineChecks: {
+        ...response().machineChecks,
+        pixelsIdentical: false,
+        renderingEquivalence: evidence,
+      },
+    };
+    const state = parseNativePdfState(raw, source);
+    expect(state.machineChecks.pixelsIdentical).toBe(false);
+    expect(state.machineChecks.renderingEquivalence).toEqual(evidence);
+    expectTypeOf(state.machineChecks.pixelsIdentical).toEqualTypeOf<boolean>();
+    expectTypeOf(
+      state.machineChecks.renderingEquivalence?.pages[0].verificationScales
+    ).toEqualTypeOf<[1, 2] | undefined>();
+  });
+  it("accepts the bounded difference threshold without rounding it upward", () => {
+    const raw = response();
+    const evidence = renderingEquivalence();
+    const checks = raw.machineChecks as Record<string, unknown>;
+    checks.pixelsIdentical = false;
+    checks.renderingEquivalence = evidence;
+    evidence.pages[0].changedPixels = 1;
+    evidence.pages[0].totalPixels = 10_000;
+    expect(parseNativePdfState(raw, source).machineChecks.pixelsIdentical).toBe(
+      false
+    );
+    evidence.pages[0].totalPixels = 9_999;
+    expect(() => parseNativePdfState(raw, source)).toThrow(
+      "pdf_protocol_error"
+    );
+    evidence.pages[0].totalPixels = 4_000_000;
+    evidence.pages[0].changedPixels = 128;
+    expect(parseNativePdfState(raw, source).machineChecks.pixelsIdentical).toBe(
+      false
+    );
+  });
+  it("rejects missing, unknown, conflicting or malformed rendering equivalence", () => {
+    const valid = renderingEquivalence();
+    const page = valid.pages[0];
+    const invalidPages = [
+      null,
+      { ...page, pageNumber: 0 },
+      { ...page, pageNumber: 2 },
+      { ...page, pageNumber: "1" },
+      { ...page, changedPixels: 0 },
+      { ...page, changedPixels: -1 },
+      { ...page, changedPixels: 1.5 },
+      { ...page, changedPixels: 129 },
+      { ...page, changedPixels: "8" },
+      { ...page, changedPixels: Infinity },
+      { ...page, totalPixels: 0 },
+      { ...page, totalPixels: -1 },
+      { ...page, totalPixels: 100.5 },
+      { ...page, totalPixels: 4_000_001 },
+      { ...page, totalPixels: "1000000" },
+      { ...page, totalPixels: 70_000 },
+      { ...page, verificationScales: undefined },
+      { ...page, verificationScales: [1] },
+      { ...page, verificationScales: [2, 1] },
+      { ...page, verificationScales: [1, 2, 3] },
+      { ...page, verificationScales: [1, "2"] },
+      { ...page, verificationScales: [1, 1.5] },
+      { ...page, modelApproved: true },
+    ];
+    const invalidEvidence = [
+      undefined,
+      null,
+      {},
+      { ...valid, method: "model-approved" },
+      { ...valid, pages: [] },
+      { ...valid, pages: [page, page] },
+      { ...valid, pages: "passed" },
+      { ...valid, modelApproved: true },
+      ...invalidPages.map((value) => ({ ...valid, pages: [value] })),
+    ];
+    for (const evidence of invalidEvidence) {
+      const raw = response();
+      const checks = raw.machineChecks as Record<string, unknown>;
+      checks.pixelsIdentical = false;
+      checks.renderingEquivalence = evidence;
+      expect(() => parseNativePdfState(raw, source)).toThrow(
+        "pdf_protocol_error"
+      );
+    }
+    for (const evidence of [undefined, null, valid, { ...valid, pages: [] }]) {
+      const raw = response();
+      (raw.machineChecks as Record<string, unknown>).renderingEquivalence =
+        evidence;
+      expect(() => parseNativePdfState(raw, source)).toThrow(
+        "pdf_protocol_error"
+      );
+    }
+  });
+  it("limits rendering evidence to eight distinct physical pages", () => {
+    const raw = response();
+    raw.pageCount = 9;
+    raw.inventory.page_content = Array.from({ length: 9 }, (_, index) => ({
+      ...raw.inventory.page_content[0],
+      pageNumber: index + 1,
+    }));
+    const evidence = renderingEquivalence();
+    evidence.pages = Array.from({ length: 8 }, (_, index) => ({
+      ...evidence.pages[0],
+      pageNumber: index + 1,
+    }));
+    Object.assign(raw.machineChecks, {
+      pixelsIdentical: false,
+      renderingEquivalence: evidence,
+    });
+    expect(
+      parseNativePdfState(raw, source).machineChecks.renderingEquivalence?.pages
+    ).toHaveLength(8);
+    evidence.pages.push({ ...evidence.pages[0], pageNumber: 9 });
+    expect(() => parseNativePdfState(raw, source)).toThrow(
+      "pdf_protocol_error"
+    );
+  });
+  it("never uses rendering equivalence to waive preservation or inspection failures", () => {
+    for (const key of ["preservationPassed", "inspectionComplete"] as const) {
+      const raw = response();
+      raw.machineChecks[key] = false;
+      Object.assign(raw.machineChecks, {
+        pixelsIdentical: false,
+        renderingEquivalence: renderingEquivalence(),
+      });
+      expect(() => parseNativePdfState(raw, source)).toThrow(
+        "pdf_protocol_error"
+      );
+    }
+    for (const pixelsIdentical of [undefined, null, 1, "true", "false"]) {
+      const raw = response();
+      Object.assign(raw.machineChecks, {
+        pixelsIdentical,
+        renderingEquivalence: renderingEquivalence(),
+      });
       expect(() => parseNativePdfState(raw, source)).toThrow(
         "pdf_protocol_error"
       );

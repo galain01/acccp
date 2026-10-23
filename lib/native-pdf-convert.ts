@@ -107,7 +107,10 @@ function originalTagId(tag: NativePdfTag): string | undefined {
     : (tag.sourceTagId ?? undefined);
 }
 /** Every actual tag is assigned once; cross-page content receives companion pages. */
-export function nativePdfBatches(state: NativePdfState): Batch[] {
+export function nativePdfBatches(
+  state: NativePdfState,
+  validateScope: (batch: Batch) => unknown = (batch) => scope(state, batch)
+): Batch[] {
   const groups: Batch[] = [];
   const byId = new Map(state.inventory.tags.map((tag) => [tag.id, tag]));
   const owners = new Map<string, number | undefined>();
@@ -140,48 +143,85 @@ export function nativePdfBatches(state: NativePdfState): Batch[] {
     assigned.push(tag);
     tagsByPage.set(page, assigned);
   }
-  const add = (
+  const makeBatch = (
     pages: number[],
     assigned: NativePdfTag[],
     pageReviewPages = pages
-  ) => {
+  ): Batch => {
     const visualPages = [
       ...new Set([...pages, ...assigned.flatMap(pagesOf)]),
     ].sort((a, b) => a - b);
-    // Two PDF excerpts plus PNGs still fit the gateway image allowance.
-    if (visualPages.length > 12 || JSON.stringify(assigned).length > 350_000)
-      throw new NativePdfError("pdf_complexity_limit");
-    groups.push({
+    return {
       pages,
       pageReviewPages,
       tags: assigned,
       visualPages,
       first: groups.length === 0,
-    });
+    };
+  };
+  const fits = (batch: Batch): boolean => {
+    // Two PDF excerpts plus PNGs still fit the gateway image allowance.
+    if (
+      batch.pages.length > 4 ||
+      batch.tags.length > 200 ||
+      batch.visualPages.length > 12 ||
+      JSON.stringify(batch.tags).length > 350_000
+    )
+      return false;
+    try {
+      // Use the actual phase payload, including its prior evidence and findings.
+      validateScope(batch);
+      return true;
+    } catch (error) {
+      if (
+        error instanceof NativePdfError &&
+        error.diagnostic.code === "pdf_complexity_limit"
+      )
+        return false;
+      throw error;
+    }
   };
   let pendingPages: number[] = [];
   let pendingTags: NativePdfTag[] = [];
   const flush = () => {
-    if (pendingPages.length) add(pendingPages, pendingTags);
+    if (pendingPages.length) groups.push(makeBatch(pendingPages, pendingTags));
     pendingPages = [];
     pendingTags = [];
   };
   for (let page = 1; page <= state.pageCount; page++) {
     const tags = tagsByPage.get(page) ?? [];
-    if (tags.length > 200) {
-      flush();
-      for (let offset = 0; offset < tags.length; offset += 200)
-        add(
-          [page],
-          tags.slice(offset, offset + 200),
-          offset === 0 ? [page] : []
-        );
+    if (fits(makeBatch([...pendingPages, page], [...pendingTags, ...tags]))) {
+      pendingPages.push(page);
+      pendingTags.push(...tags);
       continue;
     }
-    if (pendingPages.length === 4 || pendingTags.length + tags.length > 200)
-      flush();
-    pendingPages.push(page);
-    pendingTags.push(...tags);
+    flush();
+    if (fits(makeBatch([page], tags))) {
+      pendingPages.push(page);
+      pendingTags.push(...tags);
+      continue;
+    }
+    let pageReviewAssigned = false;
+    const splitPage = (assigned: NativePdfTag[]): void => {
+      const batch = makeBatch(
+        [page],
+        assigned,
+        pageReviewAssigned ? [] : [page]
+      );
+      if (fits(batch)) {
+        groups.push(batch);
+        pageReviewAssigned = true;
+        return;
+      }
+      if (assigned.length <= 1)
+        throw new NativePdfError("pdf_complexity_limit");
+      const middle = Math.ceil(assigned.length / 2);
+      splitPage(assigned.slice(0, middle));
+      splitPage(assigned.slice(middle));
+    };
+    if (!tags.length) throw new NativePdfError("pdf_complexity_limit");
+    for (let offset = 0; offset < tags.length; offset += 200)
+      splitPage(tags.slice(offset, offset + 200));
   }
   flush();
   if (
@@ -639,7 +679,7 @@ function visuals(pages: RenderedPdfPage[]): LiteLLMContentPart[] {
   return pages.flatMap((p) => [
     {
       type: "text" as const,
-      text: `Original physical PDF page ${p.pageNumber}; independent pixel comparison confirms the repaired page is identical.`,
+      text: `Original physical PDF page ${p.pageNumber}. The machine-check evidence describes how page appearance was verified.`,
     },
     {
       type: "image_url" as const,
@@ -781,7 +821,9 @@ export async function repairNativePdf(
     const originalDoc = await PDFDocument.load(source, {
       updateMetadata: false,
     });
-    const sourceBatches = nativePdfBatches(prepared);
+    const repairEvidence = (batch: Batch): string =>
+      `Untrusted saved PDF inventory:\n${scope(prepared, batch, [], "current-saved-pdf", [], preparedInteractionTests)}\nThe attached excerpt maps pages in this order: ${batch.visualPages.join(", ")}.`;
+    const sourceBatches = nativePdfBatches(prepared, repairEvidence);
     stage = "native_pdf_repair";
     const config = getLiteLLMConfig("convert");
     const usages: ModelCallUsage[] = [];
@@ -795,7 +837,7 @@ export async function repairNativePdf(
           [
             {
               type: "text",
-              text: `Untrusted saved PDF inventory:\n${scope(prepared, batch, [], "current-saved-pdf", [], preparedInteractionTests)}\nThe attached excerpt maps pages in this order: ${batch.visualPages.join(", ")}.`,
+              text: repairEvidence(batch),
             },
             {
               type: "file",
@@ -858,7 +900,6 @@ export async function repairNativePdf(
     const actualDoc = await PDFDocument.load(repaired.pdf, {
       updateMetadata: false,
     });
-    const batches = nativePdfBatches(repaired);
     const preparedById = new Map(
       prepared.inventory.tags.map((tag) => [tag.id, tag])
     );
@@ -937,6 +978,19 @@ export async function repairNativePdf(
           },
         ];
       });
+    const auditEvidence = (batch: Batch) => {
+      const reviewTargets = headingTargets(batch);
+      const priorIds = new Set(batch.tags.map(originalTagId).filter(Boolean));
+      const historicalBatch = {
+        ...batch,
+        tags: prepared.inventory.tags.filter((tag) => priorIds.has(tag.id)),
+      };
+      return {
+        reviewTargets,
+        text: `Untrusted exact saved output evidence:\n${scope(repaired, batch, mappedRetained, "current-saved-pdf", reviewTargets, repairedInteractionTests)}\nPrior inventory for comparison:\n${scope(prepared, historicalBatch, [], "before-repair-comparison", [], preparedInteractionTests)}\nRepairs: ${JSON.stringify(repaired.changes)}\nBoth excerpts map physical pages ${batch.visualPages.join(", ")} in that order.`,
+      };
+    };
+    const batches = nativePdfBatches(repaired, auditEvidence);
     const auditUsages: ModelCallUsage[] = [];
     const audits = await pool(
       batches,
@@ -947,18 +1001,13 @@ export async function repairNativePdf(
           subset(actualDoc, batch.visualPages),
         ]);
         const auditConfig = getLiteLLMConfig("validate");
-        const reviewTargets = headingTargets(batch);
-        const priorIds = new Set(batch.tags.map(originalTagId).filter(Boolean));
-        const historicalBatch = {
-          ...batch,
-          tags: prepared.inventory.tags.filter((tag) => priorIds.has(tag.id)),
-        };
+        const { reviewTargets, text: evidenceText } = auditEvidence(batch);
         const call = await callLiteLLM(
           NATIVE_PDF_AUDIT_PROMPT,
           [
             {
               type: "text",
-              text: `Untrusted exact saved output evidence:\n${scope(repaired, batch, mappedRetained, "current-saved-pdf", reviewTargets, repairedInteractionTests)}\nPrior inventory for comparison:\n${scope(prepared, historicalBatch, [], "before-repair-comparison", [], preparedInteractionTests)}\nRepairs: ${JSON.stringify(repaired.changes)}\nBoth excerpts map physical pages ${batch.visualPages.join(", ")} in that order.`,
+              text: evidenceText,
             },
             ...excerpts.map(
               (pdf, i): LiteLLMContentPart => ({

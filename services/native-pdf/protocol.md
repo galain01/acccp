@@ -1,5 +1,22 @@
 # Native PDF worker protocol, version 1
 
+Catalog `/OpenAction` may be an explicit local page destination or a GoTo
+action containing only `/Type` (optional `/Action`), `/S` and `/D`. Named GoTo
+destinations must resolve unambiguously. The page, view mode and coordinates
+must be valid. Chained, external and executable opening actions remain
+unsupported. Saved catalog behavior is independently compared with the source.
+
+`machineChecks.pixelsIdentical` is an honest boolean. When false, a successful
+response must include `renderingEquivalence` with method
+`identical-paint-multiscale-v1` and one to eight unique physical-page records:
+`{pageNumber, changedPixels, totalPixels, verificationScales: [1, 2]}`.
+Every record requires identical text, normalized drawing instructions,
+resources and behavior, at most 128 changed pixels and 0.01% changed pixels at
+scale 1.5, and exact pixel equality at both scales 1 and 2. Existing per-page
+render limits apply at every scale. This evidence is produced by the worker,
+never accepted from model proposals. Pixel-identical responses omit it.
+Other preservation failures and incomplete checks still reject the output.
+
 Preparation also fills missing annotation descriptions on eligible simple text
 links using verified original tagged text, up to 200 per document. Additional
 links remain unchanged for normal validation and review. Untagged sources are

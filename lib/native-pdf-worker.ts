@@ -47,6 +47,15 @@ export interface NativePdfFinding {
   location?: string;
   interactionReview?: FormInteractionReview;
 }
+export interface NativePdfRenderingEquivalence {
+  method: "identical-paint-multiscale-v1";
+  pages: {
+    pageNumber: number;
+    changedPixels: number;
+    totalPixels: number;
+    verificationScales: [1, 2];
+  }[];
+}
 export interface NativePdfState {
   schemaVersion: 1;
   sourceSha256: string;
@@ -72,7 +81,8 @@ export interface NativePdfState {
   }[];
   machineChecks: {
     preservationPassed: true;
-    pixelsIdentical: true;
+    pixelsIdentical: boolean;
+    renderingEquivalence?: NativePdfRenderingEquivalence;
     inspectionComplete: true;
     structurePassed: boolean;
     targetStandard: string;
@@ -155,6 +165,58 @@ const orderedMcids = (value: unknown): boolean =>
       id >= 0 &&
       (index === 0 || id > value[index - 1])
   );
+
+/** Only the worker's bounded, deterministic rendering proof can explain a difference. */
+function completeRenderingEvidence(
+  checks: Record<string, unknown>,
+  pages: number
+): boolean {
+  if (checks.pixelsIdentical === true)
+    return !("renderingEquivalence" in checks);
+  if (checks.pixelsIdentical !== false) return false;
+  const evidence = checks.renderingEquivalence;
+  if (
+    !objectRecord(evidence) ||
+    Object.keys(evidence).some((key) => !["method", "pages"].includes(key)) ||
+    evidence.method !== "identical-paint-multiscale-v1" ||
+    !Array.isArray(evidence.pages) ||
+    evidence.pages.length < 1 ||
+    evidence.pages.length > 8
+  )
+    return false;
+  const seen = new Set<number>();
+  for (const page of evidence.pages) {
+    if (
+      !objectRecord(page) ||
+      Object.keys(page).some(
+        (key) =>
+          ![
+            "pageNumber",
+            "changedPixels",
+            "totalPixels",
+            "verificationScales",
+          ].includes(key)
+      ) ||
+      !pageNumber(page.pageNumber, pages) ||
+      seen.has(Number(page.pageNumber)) ||
+      !Number.isSafeInteger(page.changedPixels) ||
+      Number(page.changedPixels) < 1 ||
+      Number(page.changedPixels) > 128 ||
+      !Number.isSafeInteger(page.totalPixels) ||
+      Number(page.totalPixels) < 1 ||
+      Number(page.totalPixels) > 4_000_000 ||
+      Number(page.changedPixels) >
+        Math.floor(Number(page.totalPixels) * 0.0001) ||
+      !Array.isArray(page.verificationScales) ||
+      page.verificationScales.length !== 2 ||
+      page.verificationScales[0] !== 1 ||
+      page.verificationScales[1] !== 2
+    )
+      return false;
+    seen.add(Number(page.pageNumber));
+  }
+  return true;
+}
 
 /** Array positions are used to select physical-page evidence for each audit. */
 function completePageEvidence(
@@ -240,7 +302,7 @@ export function parseNativePdfState(
     !boundedText(inv.language ?? "", 100) ||
     !objectRecord(checks) ||
     checks.preservationPassed !== true ||
-    checks.pixelsIdentical !== true ||
+    !completeRenderingEvidence(checks, pages) ||
     checks.inspectionComplete !== true ||
     typeof checks.structurePassed !== "boolean" ||
     checks.conformanceClaim !== false ||
