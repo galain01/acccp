@@ -3,6 +3,7 @@ const mocks = vi.hoisted(() => ({
   createClient: vi.fn(),
   signUpload: vi.fn(),
   signDownload: vi.fn(),
+  upload: vi.fn(),
   fetch: vi.fn(),
 }));
 vi.mock("@supabase/supabase-js", () => ({ createClient: mocks.createClient }));
@@ -14,6 +15,7 @@ beforeEach(() => {
       from: () => ({
         createSignedUploadUrl: mocks.signUpload,
         createSignedUrl: mocks.signDownload,
+        upload: mocks.upload,
       }),
     },
   });
@@ -30,6 +32,31 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 describe("direct upload storage transport", () => {
+  it("passes immutable upload policy and cancellation to the storage SDK", async () => {
+    mocks.upload.mockResolvedValue({ error: null });
+    const { uploadObject } = await import("@/lib/storage");
+    const signal = new AbortController().signal;
+    await uploadObject(
+      "owned/publication/output",
+      Buffer.from("synthetic"),
+      "application/pdf",
+      { upsert: false, signal }
+    );
+    expect(mocks.upload).toHaveBeenCalledWith(
+      "owned/publication/output",
+      Buffer.from("synthetic"),
+      { contentType: "application/pdf", upsert: false }
+    );
+    const options = mocks.createClient.mock.calls.at(-1)![2];
+    await options.global.fetch("https://storage.test/upload", {
+      method: "POST",
+    });
+    expect(mocks.fetch).toHaveBeenCalledWith("https://storage.test/upload", {
+      method: "POST",
+      signal,
+    });
+  });
+
   it("cancels signed read URL creation with the caller's signal", async () => {
     const controller = new AbortController();
     mocks.fetch.mockImplementation(

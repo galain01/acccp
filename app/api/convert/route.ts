@@ -30,7 +30,7 @@
 import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { NextRequest, NextResponse } from "next/server";
-import { and, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, eq, isNull, sql } from "drizzle-orm";
 
 import { verifyRoleOrUnauthorized } from "@/lib/auth";
 import { convertPowerPoint } from "@/lib/powerpoint-convert";
@@ -76,6 +76,11 @@ import {
   withRetainedDocument,
   type DocumentTransaction,
 } from "@/lib/document-retention";
+import {
+  publishConversionArtifacts,
+  PublicationUncertainError,
+  type GeneratedArtifact,
+} from "@/lib/conversion-publication";
 import { retentionExpiresAt } from "@/lib/retention";
 import { countPdfPages } from "@/lib/pdf-page-count";
 import { recordFailureCount } from "@/lib/failure-metrics";
@@ -96,11 +101,6 @@ import {
 } from "@/lib/db/schema";
 import {
   downloadObject,
-  htmlOutputKey,
-  pptxOutputKey,
-  docxOutputKey,
-  pdfOutputKey,
-  outputReviewKey,
   sourceDocxKey,
   sourcePdfKey,
   sourcePptxKey,
@@ -158,7 +158,7 @@ function supersededResponse(
   return json(
     {
       error:
-        "A newer conversion has started. Refresh this document to see its current result.",
+        "The saved conversion state has changed. Refresh this document to see its current result.",
       documentId,
       jobId,
       outputTarget,
@@ -175,7 +175,10 @@ async function isCurrentAttempt(
   attemptNumber: number
 ): Promise<boolean> {
   const [current] = await tx
-    .select({ attemptNumber: conversionJobs.attemptCount })
+    .select({
+      attemptNumber: conversionJobs.attemptCount,
+      status: conversionJobs.status,
+    })
     .from(conversionJobs)
     .where(
       and(
@@ -183,7 +186,9 @@ async function isCurrentAttempt(
         eq(conversionJobs.documentId, documentId)
       )
     );
-  return current?.attemptNumber === attemptNumber;
+  return (
+    current?.attemptNumber === attemptNumber && current.status === "processing"
+  );
 }
 
 /** Stable receipts prevent a failed/ambiguous save from charging the same calls twice. */
@@ -548,9 +553,9 @@ async function convertRequest(req: NextRequest) {
 
   // A saved document keeps its destination; retries update that same job.
   const job = await withRetainedDocument(documentId, async (tx, document) => {
-    if (isNative) {
-      // The retained-document row lock serializes competing starts for this
-      // presentation. A request that lost its response must not bill twice.
+    {
+      // The retained-document row lock serializes starts for every target.
+      // A request that lost its response must not start another billable attempt.
       const [active] = await tx
         .select({ status: conversionJobs.status })
         .from(conversionJobs)
@@ -684,13 +689,6 @@ async function convertRequest(req: NextRequest) {
 
   if (isWord && "html" in result) result = withWordRenderingReview(result);
 
-  const outputKey = isPowerPoint
-    ? pptxOutputKey(sessionId, documentId, jobId)
-    : isNativeWord
-      ? docxOutputKey(sessionId, documentId, jobId)
-      : isNativePdf
-        ? pdfOutputKey(sessionId, documentId, jobId)
-        : htmlOutputKey(sessionId, documentId);
   const outputBody =
     "pptx" in result
       ? result.pptx
@@ -711,7 +709,6 @@ async function convertRequest(req: NextRequest) {
     isNativePdf && "interactionTestSummary" in result
       ? readPdfInteractionTestSummary(result.interactionTestSummary)
       : undefined;
-  const reviewKey = outputReviewKey(sessionId, documentId, jobId);
   const reviewBody = JSON.stringify({
     outputTarget,
     profileVersion,
@@ -726,149 +723,83 @@ async function convertRequest(req: NextRequest) {
       ? { reviewPreviews: result.reviewPreviews }
       : {}),
   });
+  const generated: GeneratedArtifact[] = [
+    {
+      artifactType: isPowerPoint
+        ? "pptx_output"
+        : isNativeWord
+          ? "docx_output"
+          : isNativePdf
+            ? "pdf_output"
+            : "html_output",
+      filename: outputFilename(filename, outputTarget),
+      mimeType: outputMimeType,
+      body: outputBody,
+      previewSnippet: "html" in result ? result.html.slice(0, 500) : null,
+    },
+    {
+      artifactType: "review_metadata",
+      filename: "review.json",
+      mimeType: "application/json",
+      body: reviewBody,
+      isUserDownloadable: false,
+    },
+    ...(isWord && !isNativeWord
+      ? [
+          {
+            artifactType: "source_pdf" as const,
+            filename: pdfFilename,
+            mimeType: PDF_MIME_TYPE,
+            body: buffer,
+          },
+        ]
+      : []),
+  ];
   const savingStartedAt = performance.now();
   try {
-    const published = await withRetainedDocument(
-      documentId,
+    const published = await publishConversionArtifacts(
+      {
+        sessionId,
+        documentId,
+        jobId,
+        userId,
+        attemptNumber: job.attemptNumber,
+        outputTarget,
+      },
+      generated,
       async (tx, document) => {
-        if (
-          !(await isCurrentAttempt(tx, documentId, jobId, job.attemptNumber))
-        ) {
-          await recordConversionCalls(
-            tx,
-            jobId,
-            job.attemptNumber,
-            result.calls
-          );
-          return false;
-        }
         const expiresAt = retentionExpiresAt(document.createdAt);
-        if (isReconversion && isWord && !isNativeWord) {
-          // A failed model attempt must not replace the PDF paired with the last
-          // saved HTML and artifact metadata. Persist this render only on success.
-          await uploadObject(
-            sourcePdfKey(sessionId, documentId),
-            buffer,
-            PDF_MIME_TYPE
-          );
-        }
-        await uploadObject(outputKey, outputBody, outputMimeType);
-        if (isNative)
-          await uploadObject(reviewKey, reviewBody, "application/json");
-
-        const artifactsUpdatedAt = new Date().toISOString();
-
-        // A chosen PowerPoint export has its own immutable path. Preserve that
-        // discovery row on reconversion so purge can still remove the old file.
-        if (isPowerPoint) {
-          await tx
-            .update(artifacts)
-            .set({ artifactStatus: "expired" })
-            .where(
-              and(
-                eq(artifacts.jobId, jobId),
-                inArray(artifacts.artifactType, [
-                  "pptx_output",
-                  "review_metadata",
-                ]),
-                eq(artifacts.artifactStatus, "available")
-              )
-            );
-        }
-
-        // uq_available_artifact_per_job_type allows one available artifact per type,
-        // so a re-convert updates the existing row rather than inserting a second.
-        for (const artifact of [
-          ...(isWord
-            ? [
-                {
-                  artifactType: "source_docx" as const,
-                  filename,
-                  mimeType: DOCX_MIME_TYPE,
-                  storageKey: sourceDocxKey(sessionId, documentId),
-                  fileSizeBytes: sourceBuffer.byteLength,
-                  previewSnippet: null,
-                },
-              ]
-            : []),
-          ...(isPowerPoint
-            ? [
-                {
-                  artifactType: "source_pptx" as const,
-                  filename,
-                  mimeType: PPTX_MIME_TYPE,
-                  storageKey: sourcePptxKey(sessionId, documentId),
-                  fileSizeBytes: sourceBuffer.byteLength,
-                  previewSnippet: null,
-                },
-              ]
-            : isNativeWord
-              ? []
-              : [
-                  {
-                    artifactType: "source_pdf" as const,
-                    filename: pdfFilename,
-                    mimeType: PDF_MIME_TYPE,
-                    storageKey: sourcePdfKey(sessionId, documentId),
-                    fileSizeBytes: buffer.byteLength,
-                    previewSnippet: null,
-                  },
-                ]),
-          {
-            artifactType: isPowerPoint
-              ? ("pptx_output" as const)
-              : isNativeWord
-                ? ("docx_output" as const)
-                : isNativePdf
-                  ? ("pdf_output" as const)
-                  : ("html_output" as const),
-            filename: outputFilename(filename, outputTarget),
-            mimeType: isPowerPoint
-              ? PPTX_MIME_TYPE
-              : isNativeWord
-                ? DOCX_MIME_TYPE
-                : isNativePdf
-                  ? PDF_MIME_TYPE
-                  : "text/html",
-            storageKey: outputKey,
-            fileSizeBytes: Buffer.byteLength(outputBody),
-            previewSnippet: "html" in result ? result.html.slice(0, 500) : null,
-          },
-          ...(isNative
-            ? [
-                {
-                  artifactType: "review_metadata" as const,
-                  filename: "review.json",
-                  mimeType: "application/json",
-                  storageKey: reviewKey,
-                  fileSizeBytes: Buffer.byteLength(reviewBody),
-                  previewSnippet: null,
-                },
-              ]
-            : []),
-        ]) {
-          await tx
-            .insert(artifacts)
-            .values({
-              jobId,
-              artifactStatus: "available",
-              ...artifact,
-              expiresAt,
-            })
-            .onConflictDoUpdate({
-              target: [artifacts.jobId, artifacts.artifactType],
-              targetWhere: sql`artifact_status = 'available'`,
-              set: {
-                filename: artifact.filename,
-                mimeType: artifact.mimeType,
-                storageKey: artifact.storageKey,
-                fileSizeBytes: artifact.fileSizeBytes,
-                previewSnippet: artifact.previewSnippet,
-                createdAt: artifactsUpdatedAt,
-                expiresAt,
-              },
-            });
-        }
+        // Original uploads are immutable canonical objects. Generated Word PDF
+        // previews are published with the output and never overwrite that pair.
+        const original = {
+          artifactType: isPowerPoint
+            ? ("source_pptx" as const)
+            : isWord
+              ? ("source_docx" as const)
+              : ("source_pdf" as const),
+          filename,
+          mimeType: sourceMimeType,
+          storageKey: isPowerPoint
+            ? sourcePptxKey(sessionId, documentId)
+            : isWord
+              ? sourceDocxKey(sessionId, documentId)
+              : sourcePdfKey(sessionId, documentId),
+          fileSizeBytes: sourceBuffer.byteLength,
+          previewSnippet: null,
+        };
+        await tx
+          .insert(artifacts)
+          .values({
+            jobId,
+            artifactStatus: "available",
+            ...original,
+            expiresAt,
+          })
+          .onConflictDoUpdate({
+            target: [artifacts.jobId, artifacts.artifactType],
+            targetWhere: sql`artifact_status = 'available'`,
+            set: { ...original, expiresAt },
+          });
 
         // Findings have no natural key, so replace the previous run's wholesale.
         await tx
@@ -916,8 +847,6 @@ async function convertRequest(req: NextRequest) {
           },
         });
 
-        await recordConversionCalls(tx, jobId, job.attemptNumber, result.calls);
-
         // Complete last so duration includes every successful artifact, finding,
         // event and model-call write. A rollback leaves no successful duration.
         const completedAt = new Date().toISOString();
@@ -936,12 +865,18 @@ async function convertRequest(req: NextRequest) {
             ),
           })
           .where(eq(conversionJobs.id, jobId));
-        return true;
-      }
+      },
+      (tx) => recordConversionCalls(tx, jobId, job.attemptNumber, result.calls)
     );
     if (!published) return supersededResponse(documentId, jobId, outputTarget);
   } catch (error) {
     if (error instanceof DocumentUnavailableError) throw error;
+    if (error instanceof PublicationUncertainError) {
+      return json(
+        { error: error.message, jobId, documentId, outputTarget },
+        503
+      );
+    }
     const diagnostic = createJobDiagnostic({
       stage: "save_output",
       code: "output_storage_failed",
@@ -949,14 +884,30 @@ async function convertRequest(req: NextRequest) {
       elapsedMs: Math.max(0, Math.round(performance.now() - savingStartedAt)),
     });
     const message = describeJobDiagnostic(diagnostic);
-    const recorded = await recordJobFailure(
-      documentId,
-      jobId,
-      job.attemptNumber,
-      "output_storage_failed",
-      diagnostic,
-      result.calls
-    );
+    let recorded: boolean;
+    try {
+      recorded = await recordJobFailure(
+        documentId,
+        jobId,
+        job.attemptNumber,
+        "output_storage_failed",
+        diagnostic,
+        result.calls
+      );
+    } catch (failureError) {
+      if (failureError instanceof DocumentUnavailableError) throw failureError;
+      // Failure accounting can itself have an unknown commit outcome. Preserve
+      // retry identity and let the user refresh without asserting a job state.
+      return json(
+        {
+          error: new PublicationUncertainError().message,
+          jobId,
+          documentId,
+          outputTarget,
+        },
+        503
+      );
+    }
     if (!recorded) return supersededResponse(documentId, jobId, outputTarget);
     console.error(`[api/convert] job=${jobId} output persistence failed`);
     return json({ error: message, jobId, documentId, outputTarget }, 500);

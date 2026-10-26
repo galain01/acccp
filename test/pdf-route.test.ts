@@ -126,6 +126,7 @@ function chain(value: unknown = []) {
   const builder = {
     from: vi.fn(),
     leftJoin: vi.fn(),
+    innerJoin: vi.fn(),
     where: vi.fn(),
     values: vi.fn(),
     set: vi.fn(),
@@ -137,6 +138,7 @@ function chain(value: unknown = []) {
   for (const method of [
     builder.from,
     builder.leftJoin,
+    builder.innerJoin,
     builder.where,
     builder.values,
     builder.set,
@@ -185,6 +187,27 @@ function ownedDocument(filename = "course.pdf") {
   return { sessionQuery, documentQuery };
 }
 
+function immutableKey(type: string) {
+  return expect.stringMatching(
+    new RegExp(`^session-1/doc-1/job-1/publication-[0-9a-f-]+/${type}$`)
+  );
+}
+
+function expectPendingReceipts(types: string[]) {
+  expect(artifactValues()).toEqual(
+    types.map((artifactType) =>
+      expect.objectContaining({
+        artifactType,
+        artifactStatus: "expired",
+        isUserDownloadable: false,
+        storageKey: immutableKey(artifactType),
+        checksumSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+        expiresAt: "2026-09-15T00:00:00.000Z",
+      })
+    )
+  );
+}
+
 function artifactValues() {
   return mocks.db.insert.mock.results
     .filter((_, index) => mocks.db.insert.mock.calls[index][0] === artifacts)
@@ -193,7 +216,7 @@ function artifactValues() {
 
 describe("document conversion route", () => {
   const inserted = new Map<unknown, ReturnType<typeof chain>>();
-  const updated = chain();
+  const updated = chain([{ id: "promoted-receipt" }]);
   afterEach(() => {
     vi.useRealTimers();
     if (vi.isMockFunction(performance.now))
@@ -210,16 +233,22 @@ describe("document conversion route", () => {
           _id: string,
           action: (
             tx: typeof mocks.db,
-            document: { createdAt: string }
+            document: { createdAt: string; sessionId: string }
           ) => unknown
-        ) => action(mocks.db, { createdAt: "2026-09-01T00:00:00.000Z" })
+        ) =>
+          action(mocks.db, {
+            createdAt: "2026-09-01T00:00:00.000Z",
+            sessionId: "session-1",
+          })
       );
     mocks.purgeDocumentIfEligible.mockResolvedValue("purged");
     mocks.auth.mockResolvedValue({ session: { user: { id: "user-1" } } });
     mocks.db.select.mockImplementation((fields) =>
       fields?.attemptNumber
-        ? chain([{ attemptNumber: 2 }])
-        : chain([{ id: "session-1" }])
+        ? chain([{ attemptNumber: 2, status: "processing" }])
+        : fields
+          ? chain([{ id: "session-1" }])
+          : chain([])
     );
     mocks.db.insert.mockImplementation((table: unknown) => {
       const result =
@@ -293,6 +322,31 @@ describe("document conversion route", () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
   });
 
+  it("uses a new immutable output path for each Canvas retry", async () => {
+    ownedDocument();
+    expect((await POST(request({ documentId: "doc-1" }))).status).toBe(200);
+    const first = mocks.upload.mock.calls.find((call) =>
+      call[2].startsWith("text/html")
+    );
+    mocks.upload.mockClear();
+    ownedDocument();
+    expect((await POST(request({ documentId: "doc-1" }))).status).toBe(200);
+    const second = mocks.upload.mock.calls.find((call) =>
+      call[2].startsWith("text/html")
+    );
+    expect(first?.[0]).not.toBe(second?.[0]);
+    expect(second?.[3]).toEqual(expect.objectContaining({ upsert: false }));
+  });
+
+  it("rejects an overlapping Canvas attempt before starting model work", async () => {
+    ownedDocument();
+    mocks.db.select.mockReturnValueOnce(chain([{ status: "processing" }]));
+    const response = await POST(request({ documentId: "doc-1" }));
+    expect(response.status).toBe(409);
+    expect(mocks.convert).not.toHaveBeenCalled();
+    expect(inserted.get(conversionJobs)).toBeUndefined();
+  });
+
   it("stores native PowerPoint output, its review and all usage on a separate target", async () => {
     const response = await POST(
       request({
@@ -321,15 +375,15 @@ describe("document conversion route", () => {
     expect(mocks.countPages).not.toHaveBeenCalled();
     expect(mocks.upload.mock.calls.map(([key]) => key)).toEqual([
       "session-1/doc-1/source.pptx",
-      "session-1/doc-1/job-1/output.pptx",
-      "session-1/doc-1/job-1/review.json",
+      immutableKey("pptx_output"),
+      immutableKey("review_metadata"),
     ]);
     expect(mocks.upload.mock.calls[0][2]).toBe(PPTX_MIME_TYPE);
     expect(mocks.upload.mock.calls[1][2]).toBe(PPTX_MIME_TYPE);
     expect(artifactValues().map((value) => value.artifactType)).toEqual([
-      "source_pptx",
       "pptx_output",
       "review_metadata",
+      "source_pptx",
     ]);
     expect(inserted.get(conversionJobs)?.values).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -380,8 +434,8 @@ describe("document conversion route", () => {
     expect(mocks.countPages).not.toHaveBeenCalled();
     expect(mocks.upload.mock.calls.map(([key]) => key)).toEqual([
       "session-1/doc-1/source.docx",
-      "session-1/doc-1/job-1/output.docx",
-      "session-1/doc-1/job-1/review.json",
+      immutableKey("docx_output"),
+      immutableKey("review_metadata"),
     ]);
     expect(mocks.upload.mock.calls[0].slice(1)).toEqual([
       Buffer.from(DOCX),
@@ -395,12 +449,12 @@ describe("document conversion route", () => {
       findings: [],
     });
     expect(artifactValues().map((value) => value.artifactType)).toEqual([
-      "source_docx",
       "docx_output",
       "review_metadata",
+      "source_docx",
     ]);
     expect(
-      artifactValues().every((value) => value.previewSnippet === null)
+      artifactValues().every((value) => value.previewSnippet == null)
     ).toBe(true);
     expect(inserted.get(conversionJobs)?.values).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -454,8 +508,8 @@ describe("document conversion route", () => {
     );
     expect(inserted.has(documents)).toBe(false);
     expect(mocks.upload.mock.calls.map(([key]) => key)).toEqual([
-      "session-1/doc-1/job-1/output.docx",
-      "session-1/doc-1/job-1/review.json",
+      immutableKey("docx_output"),
+      immutableKey("review_metadata"),
     ]);
   });
 
@@ -549,7 +603,7 @@ describe("document conversion route", () => {
     expect(artifactValues()).toEqual([]);
   });
 
-  it.each(["output.docx", "review.json"])(
+  it.each(["docx_output", "review_metadata"])(
     "retains all native Word usage if %s cannot be stored",
     async (failedFile) => {
       mocks.upload
@@ -579,7 +633,7 @@ describe("document conversion route", () => {
         expect.objectContaining({ stage: "convert", costUsd: "0.001" }),
         expect.objectContaining({ stage: "validate", costUsd: "0.001" }),
       ]);
-      expect(artifactValues()).toEqual([]);
+      expectPendingReceipts(["docx_output", "review_metadata"]);
     }
   );
 
@@ -621,15 +675,15 @@ describe("document conversion route", () => {
     expect(mocks.download).toHaveBeenCalledWith("session-1/doc-1/source.pptx");
     expect(inserted.has(documents)).toBe(false);
     expect(mocks.upload.mock.calls.map(([key]) => key)).toEqual([
-      "session-1/doc-1/job-1/output.pptx",
-      "session-1/doc-1/job-1/review.json",
+      immutableKey("pptx_output"),
+      immutableKey("review_metadata"),
     ]);
   });
 
   it("preserves old reviewed-output storage keys as retired discovery rows before reconversion upserts", async () => {
     ownedDocument("slides.pptx");
     mocks.download.mockResolvedValueOnce(Buffer.from(DOCX));
-    const retired = chain();
+    const retired = chain([{ id: "promoted-receipt" }]);
     mocks.db.update.mockImplementation((table) =>
       table === artifacts ? retired : updated
     );
@@ -653,7 +707,7 @@ describe("document conversion route", () => {
     const firstArtifactInsertIndex = mocks.db.insert.mock.calls.findIndex(
       ([table]) => table === artifacts
     );
-    expect(retired.set.mock.invocationCallOrder[0]).toBeLessThan(
+    expect(retired.set.mock.invocationCallOrder[0]).toBeGreaterThan(
       mocks.db.insert.mock.invocationCallOrder[firstArtifactInsertIndex]
     );
     expect(
@@ -830,13 +884,19 @@ describe("document conversion route", () => {
     );
     expect(artifactValues()).toEqual([
       expect.objectContaining({
+        artifactType: "html_output",
+        filename: "course.html",
+        storageKey: immutableKey("html_output"),
+      }),
+      expect.objectContaining({
+        artifactType: "review_metadata",
+        artifactStatus: "expired",
+        filename: "conversion-publication.json",
+      }),
+      expect.objectContaining({
         artifactType: "source_pdf",
         mimeType: "application/pdf",
         storageKey: "session-1/doc-1/source.pdf",
-      }),
-      expect.objectContaining({
-        artifactType: "html_output",
-        filename: "course.html",
       }),
     ]);
     expect(inserted.get(validationFindings)?.values).toHaveBeenCalledWith([
@@ -950,11 +1010,11 @@ describe("document conversion route", () => {
     expect(
       (await POST(request({ name: "course.docx", contents: DOCX }))).status
     ).toBe(200);
-    // 100 rendering + 20 parsing + 90 storage + 200 model + 60 metadata.
+    // 100 rendering + 20 parsing + 150 storage + 200 model + 70 metadata.
     expect(updated.set).toHaveBeenCalledWith(
       expect.objectContaining({
         status: "completed",
-        processingDurationMs: 470,
+        processingDurationMs: 540,
       })
     );
     expect(now.mock.invocationCallOrder[0]).toBeLessThan(
@@ -1028,8 +1088,10 @@ describe("document conversion route", () => {
     expect(mocks.download).toHaveBeenCalledWith("session-1/doc-1/source.pdf");
     expect(mocks.renderWord).not.toHaveBeenCalled();
     expect(mocks.db.insert).not.toHaveBeenCalledWith(documents);
-    expect(mocks.upload).toHaveBeenCalledTimes(1);
-    expect(mocks.upload.mock.calls[0][0]).toBe("session-1/doc-1/output.html");
+    expect(mocks.upload.mock.calls.map(([key]) => key)).toEqual([
+      immutableKey("html_output"),
+      immutableKey("review_metadata"),
+    ]);
     expect(
       inserted.get(conversionJobs)?.onConflictDoUpdate
     ).toHaveBeenCalledWith(
@@ -1078,22 +1140,28 @@ describe("document conversion route", () => {
     );
     expect(artifactValues()).toEqual([
       expect.objectContaining({
-        artifactType: "source_docx",
-        filename: "course.DOCX",
-        mimeType: DOCX_MIME_TYPE,
-        storageKey: "session-1/doc-1/source.docx",
-        fileSizeBytes: Buffer.byteLength(DOCX),
+        artifactType: "html_output",
+        filename: "course.html",
+        storageKey: immutableKey("html_output"),
+      }),
+      expect.objectContaining({
+        artifactType: "review_metadata",
+        artifactStatus: "expired",
+        filename: "conversion-publication.json",
       }),
       expect.objectContaining({
         artifactType: "source_pdf",
         filename: "course.pdf",
         mimeType: "application/pdf",
-        storageKey: "session-1/doc-1/source.pdf",
+        storageKey: immutableKey("source_pdf"),
         fileSizeBytes: Buffer.byteLength(PDF),
       }),
       expect.objectContaining({
-        artifactType: "html_output",
-        filename: "course.html",
+        artifactType: "source_docx",
+        filename: "course.DOCX",
+        mimeType: DOCX_MIME_TYPE,
+        storageKey: "session-1/doc-1/source.docx",
+        fileSizeBytes: Buffer.byteLength(DOCX),
       }),
     ]);
   });
@@ -1114,16 +1182,18 @@ describe("document conversion route", () => {
     expect(mocks.convert).toHaveBeenCalledWith(Buffer.from(PDF), "course.pdf");
     expect(mocks.db.insert).not.toHaveBeenCalledWith(documents);
     expect(mocks.upload.mock.calls.map(([key]) => key)).toEqual([
-      "session-1/doc-1/source.pdf",
-      "session-1/doc-1/output.html",
+      immutableKey("html_output"),
+      immutableKey("review_metadata"),
+      immutableKey("source_pdf"),
     ]);
     expect(mocks.upload.mock.invocationCallOrder[0]).toBeGreaterThan(
       mocks.convert.mock.invocationCallOrder[0]
     );
     expect(artifactValues().map((artifact) => artifact.artifactType)).toEqual([
-      "source_docx",
-      "source_pdf",
       "html_output",
+      "review_metadata",
+      "source_pdf",
+      "source_docx",
     ]);
   });
 
@@ -1252,7 +1322,10 @@ describe("document conversion route", () => {
   it("keeps the saved Word original and records usage when storing its new PDF fails after model success", async () => {
     ownedDocument("course.docx");
     mocks.download.mockResolvedValueOnce(Buffer.from(DOCX));
-    mocks.upload.mockRejectedValueOnce(new Error("private storage details"));
+    mocks.upload.mockImplementation(async (key: string) => {
+      if (key.endsWith("/source_pdf"))
+        throw new Error("private storage details");
+    });
 
     const response = await POST(request({ documentId: "doc-1" }));
 
@@ -1269,11 +1342,13 @@ describe("document conversion route", () => {
     ]);
     expect(mocks.db.delete).not.toHaveBeenCalled();
     expect(mocks.upload.mock.calls.map(([key]) => key)).toEqual([
-      "session-1/doc-1/source.pdf",
+      immutableKey("html_output"),
+      immutableKey("review_metadata"),
+      immutableKey("source_pdf"),
     ]);
     expect(mocks.remove).not.toHaveBeenCalled();
     expect(mocks.convert).toHaveBeenCalled();
-    expect(artifactValues()).toEqual([]);
+    expectPendingReceipts(["html_output", "review_metadata", "source_pdf"]);
     expect(
       JSON.stringify([
         await response.json(),
@@ -1289,7 +1364,7 @@ describe("document conversion route", () => {
     "marks the job failed and retains billing when $name HTML storage fails",
     async (input) => {
       mocks.upload.mockImplementation(async (key: string) => {
-        if (key.endsWith("output.html"))
+        if (key.endsWith("/html_output"))
           throw new Error("private worker credentials and document text");
       });
       const response = await POST(request(input));
@@ -1307,7 +1382,11 @@ describe("document conversion route", () => {
       expect(inserted.get(jobEvents)?.values).toHaveBeenCalledWith(
         expect.objectContaining({ eventType: "output_storage_failed" })
       );
-      expect(artifactValues()).toEqual([]);
+      expectPendingReceipts(
+        input.name.endsWith(".docx")
+          ? ["html_output", "review_metadata", "source_pdf"]
+          : ["html_output", "review_metadata"]
+      );
       expect(mocks.remove).not.toHaveBeenCalled();
       expect(
         JSON.stringify([
@@ -1552,7 +1631,101 @@ describe("document conversion route", () => {
     expect(inserted.get(modelCalls)?.values).toHaveBeenCalledTimes(1);
   });
 
-  it("uses the same billable-call receipt if an ambiguous publication falls through to failure accounting", async () => {
+  it("does not downgrade an already completed attempt when failure accounting arrives late", async () => {
+    ownedDocument();
+    mocks.convert.mockImplementationOnce(async () => {
+      mocks.db.select.mockReturnValueOnce(
+        chain([{ attemptNumber: 2, status: "completed" }])
+      );
+      return { error: "Late failure", calls: [usage] };
+    });
+
+    const response = await POST(request({ documentId: "doc-1" }));
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      documentId: "doc-1",
+      jobId: "job-1",
+    });
+    expect(mocks.db.update).not.toHaveBeenCalled();
+    expect(inserted.get(jobEvents)).toBeUndefined();
+    expect(inserted.get(dailyFailureMetrics)).toBeUndefined();
+    expect(inserted.get(modelCalls)?.values).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns the saved retry identity without downgrading the job when publication cannot be reconciled", async () => {
+    ownedDocument();
+    let publicationMayHaveCommitted = false;
+    mocks.withRetainedDocument.mockImplementation(async (_id, action) => {
+      if (publicationMayHaveCommitted)
+        throw new Error("private database recovery details");
+      const result = await action(mocks.db, {
+        createdAt: "2026-09-01T00:00:00.000Z",
+        sessionId: "session-1",
+      });
+      if (
+        mocks.upload.mock.calls.some(([key]) => key.includes("/publication-"))
+      ) {
+        publicationMayHaveCommitted = true;
+        throw new Error("private commit response details");
+      }
+      return result;
+    });
+
+    const response = await POST(request({ documentId: "doc-1" }));
+    expect(response.status).toBe(503);
+    const body = await response.json();
+    expect(body).toMatchObject({
+      documentId: "doc-1",
+      jobId: "job-1",
+      outputTarget: "canvas_html",
+    });
+    expect(body.error).toContain("Refresh this document");
+    expect(updated.set).toHaveBeenCalledWith(
+      expect.objectContaining({ status: "completed" })
+    );
+    expect(
+      updated.set.mock.calls.some(([value]) => value.status === "failed")
+    ).toBe(false);
+    expect(inserted.get(dailyFailureMetrics)).toBeUndefined();
+    expect(inserted.get(modelCalls)?.values).toHaveBeenCalledTimes(1);
+    expect(mocks.remove).not.toHaveBeenCalled();
+    expect(
+      JSON.stringify([body, vi.mocked(console.error).mock.calls])
+    ).not.toContain("private");
+  });
+
+  it("preserves retry identity when failure accounting is unavailable after a confirmed unpublished save", async () => {
+    ownedDocument();
+    mocks.upload.mockRejectedValueOnce(new Error("private storage failure"));
+    const retained = mocks.withRetainedDocument.getMockImplementation()!;
+    let transactions = 0;
+    mocks.withRetainedDocument.mockImplementation(async (...args) => {
+      // Source, start, reservation, rejected upload, reconciliation, then the
+      // separate failure-accounting transaction whose connection is unavailable.
+      if (++transactions === 6)
+        throw new Error("private failure accounting connection");
+      return retained(...args);
+    });
+
+    const response = await POST(request({ documentId: "doc-1" }));
+    expect(response.status).toBe(503);
+    const body = await response.json();
+    expect(body).toMatchObject({
+      documentId: "doc-1",
+      jobId: "job-1",
+      outputTarget: "canvas_html",
+    });
+    expect(body.error).toContain("Refresh this document");
+    expectPendingReceipts(["html_output", "review_metadata"]);
+    expect(mocks.remove).not.toHaveBeenCalled();
+    expect(mocks.db.update).not.toHaveBeenCalled();
+    expect(inserted.get(modelCalls)?.values).toHaveBeenCalledTimes(1);
+    expect(
+      JSON.stringify([body, vi.mocked(console.error).mock.calls])
+    ).not.toContain("private");
+  });
+
+  it("uses the same billable-call receipt when a failed publication reaches failure accounting", async () => {
     ownedDocument();
     updated.where.mockRejectedValueOnce(
       new Error("ambiguous transaction result")
@@ -1659,7 +1832,10 @@ describe("document conversion route", () => {
     mocks.withRetainedDocument.mockImplementation((_id, action) => {
       if (++lockCount === 3)
         vi.setSystemTime(new Date("2026-09-02T00:00:00.001Z"));
-      return action(mocks.db, { createdAt: "2026-09-01T00:00:00.000Z" });
+      return action(mocks.db, {
+        createdAt: "2026-09-01T00:00:00.000Z",
+        sessionId: "session-1",
+      });
     });
     mocks.convert.mockResolvedValueOnce({
       error: "Conversion failed",

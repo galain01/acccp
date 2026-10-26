@@ -83,7 +83,7 @@ export async function uploadObject(
   key: string,
   body: Buffer | string,
   contentType: string,
-  options?: { signal?: AbortSignal }
+  options?: { signal?: AbortSignal; upsert?: boolean }
 ): Promise<void> {
   const requestStorage = options?.signal
     ? createClient(supabaseUrl!, serviceRoleKey!, {
@@ -96,7 +96,7 @@ export async function uploadObject(
     : storage;
   const { error } = await requestStorage.upload(key, body, {
     contentType,
-    upsert: true, // Re-converting overwrites the previous output.
+    upsert: options?.upsert ?? true,
   });
   if (error)
     throw new Error(`Storage upload failed for ${key}: ${error.message}`);
