@@ -65,8 +65,9 @@ not retried or bypassed.
 The new worker integration regression failed before the correction at the same
 `authored_id_preservation` boundary. The focused generated-ID, existing structure
 and worker suites then passed 71 tests. The full native suite passed 341 tests on
-Windows with one expected POSIX-only skip; Linux CI must cover that test without
-skipping. Invalid/duplicate/oversized IDs, ambiguous parents/cycles, existing bad
+Windows with one expected POSIX-only skip. Linux CI for the code candidate
+`9bafa455505eba8053662bf14a2c48ba2ebd2805` passed all 341 without skipping.
+Invalid/duplicate/oversized IDs, ambiguous parents/cycles, existing bad
 indexes, binary ID ordering, changed cross-references/catalog metadata and the
 separate Note-ID repair path have regression coverage.
 
@@ -81,8 +82,32 @@ pixel identity, a semantic repair, or accessibility conformance.
 A two-page synthetic continued list reliably reproduces the missing index in the
 pinned real tagger. The smoke now requires that case to acquire a verified saved
 index while preserving both pages and their content. Mocked executable tests and
-this installed-tool test are recorded separately. Remaining public cases must be
-rerun on the final candidate; do not infer their success from case01.
+this installed-tool test are recorded separately.
+
+All ten sources were subsequently rerun through the actual loopback worker at
+that code candidate: 01/04/05/06/08/09/10 prepared, 02/03 returned preservation
+refusals, and 07 remained unsupported. No model call was made in this preparation
+pass; every source hash remained unchanged. All seven intermediate outputs still
+failed veraPDF conformance checks. Zero completed model repairs, semantic audits
+or application downloads are established by this pass.
+
+Independent reopening/rendering covers all 36 prepared pages. Geometry, pypdf
+extraction and canonical field names/types/values match. PDFium extraction on
+case01 page2 omits two generated spaces: `is that self-archiving` becomes
+`isthatself-archiving`. All non-whitespace characters retain their order and the
+page's pixels match, but word-boundary/speech equivalence remains unverified.
+The separate page6 multiscale exception above remains explicit. All original,
+prepared-file and comparison-image hashes were independently rechecked.
+
+[CI run 40384947408](https://github.com/galain01/acccp/actions/runs/40384947408)
+completed successfully for this head: 341 native tests without skips, 2,288 app
+tests, 64 isolated PostgreSQL tests, typecheck/format, production build, a 21-page
+traced-renderer smoke and 15 signed-out runtime checks with zero configured-service
+contacts. The new native-tool job also passed the actual installed-tool smoke as
+the unprivileged Linux worker. GitHub tested temporary merge `d1bcfa74505699b9adbb11c6b436dc02bf16e2fe`
+with main `58adb76a30ffed4263b853eb438a95ba8cc4b7b8`; no PR was merged and no
+image was published or deployed. This CI result does not establish the blocked
+authenticated application or model-assisted acceptance journeys.
 
 ## Findings that remain unresolved
 
