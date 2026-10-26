@@ -5,6 +5,11 @@ import { db } from "./db";
 import { documents, sessions, users } from "./db/schema";
 import { withRetainedDocument } from "./document-retention";
 import {
+  reserveDocumentSubmission,
+  assertSubmissionWindowOpen,
+} from "./document-submission";
+import { readSubmissionToken } from "./document-submission-token";
+import {
   MAX_PPTX_FILE_SIZE_BYTES,
   PPTX_MIME_TYPE,
   validateDocumentInput,
@@ -30,6 +35,7 @@ export interface PowerPointUploadRequest {
   filename: string;
   fileSizeBytes: number;
   checksumSha256: string;
+  submissionToken?: string;
 }
 
 export function isPowerPointUploadRequest(
@@ -38,7 +44,11 @@ export function isPowerPointUploadRequest(
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const v = value as Record<string, unknown>;
   return (
-    Object.keys(v).length === 4 &&
+    (Object.keys(v).length === 4 ||
+      (Object.keys(v).length === 5 &&
+        typeof v.submissionToken === "string" &&
+        v.submissionToken.length > 0 &&
+        v.submissionToken.length <= 4096)) &&
     typeof v.sessionId === "string" &&
     UUID.test(v.sessionId) &&
     typeof v.filename === "string" &&
@@ -78,6 +88,12 @@ export async function reservePowerPointUpload(
   if (!isPowerPointUploadRequest(input))
     throw new DocumentUploadError(
       "Choose a PowerPoint presentation no larger than 25 MB."
+    );
+  if (input.submissionToken)
+    return reservePreparedPowerPointUpload(
+      userId,
+      input,
+      input.submissionToken
     );
   const document = await db.transaction(async (tx) => {
     await tx.execute(
@@ -146,6 +162,75 @@ export async function reservePowerPointUpload(
       .set({ uploadExpiresAt: signed.expiresAt })
       .where(eq(documents.id, document.id));
     return { documentId: document.id, uploadUrl: signed.uploadUrl };
+  });
+}
+
+async function reservePreparedPowerPointUpload(
+  userId: string,
+  input: PowerPointUploadRequest,
+  token: string
+) {
+  const claims = readSubmissionToken(token, userId, { allowExpired: true });
+  if (
+    claims.outputTarget !== "accessible_pptx" ||
+    claims.sessionId !== input.sessionId ||
+    claims.filename !== input.filename ||
+    claims.fileSizeBytes !== input.fileSizeBytes ||
+    claims.checksumSha256 !== input.checksumSha256
+  )
+    throw new DocumentUploadError(
+      "The presentation does not match its upload preparation.",
+      409
+    );
+  await reserveDocumentSubmission(userId, token);
+  return withRetainedDocument(claims.documentId, async (tx, document) => {
+    await ownedSession(tx, userId, input.sessionId);
+    const key = sourcePptxKey(input.sessionId, claims.documentId);
+    let stored: Buffer | undefined;
+    try {
+      stored = await downloadObjectBounded(key, MAX_PPTX_FILE_SIZE_BYTES);
+    } catch (error) {
+      if (error instanceof StorageObjectSizeError)
+        throw new DocumentUploadError(
+          "The uploaded presentation exceeds 25 MB.",
+          413
+        );
+    }
+    if (stored) {
+      if (
+        stored.length !== claims.fileSizeBytes ||
+        createHash("sha256").update(stored).digest("hex") !==
+          claims.checksumSha256 ||
+        validateDocumentInput(stored, claims.filename)
+      )
+        throw new DocumentUploadError(
+          "The stored presentation does not match this file. Select the file again.",
+          415
+        );
+      if (!document.uploadCompletedAt)
+        await tx
+          .update(documents)
+          .set({ uploadCompletedAt: sql`clock_timestamp()` })
+          .where(eq(documents.id, claims.documentId));
+      return { documentId: claims.documentId, sourceReady: true as const };
+    }
+    readSubmissionToken(token, userId); // Re-sign only within the original preparation window.
+    await assertSubmissionWindowOpen(tx, claims);
+    const signed = await createSignedUploadUrl(key);
+    if (
+      !document.uploadExpiresAt ||
+      Date.parse(signed.expiresAt) > Date.parse(document.uploadExpiresAt)
+    )
+      throw new DocumentUploadError(
+        "Could not prepare the presentation upload. Try again.",
+        503
+      );
+    await assertSubmissionWindowOpen(tx, claims);
+    return {
+      documentId: claims.documentId,
+      uploadUrl: signed.uploadUrl,
+      sourceReady: false as const,
+    };
   });
 }
 

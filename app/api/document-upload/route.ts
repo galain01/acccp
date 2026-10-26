@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { verifyRoleOrUnauthorized } from "@/lib/auth";
 import { DocumentUnavailableError } from "@/lib/document-retention";
+import { DocumentSubmissionError } from "@/lib/document-submission-token";
 import {
   DocumentUploadError,
   isPowerPointUploadRequest,
@@ -64,7 +65,10 @@ export async function POST(request: NextRequest) {
   } catch (error) {
     if (error instanceof DocumentUnavailableError)
       return json({ error: "This upload is no longer available." }, 404);
-    if (error instanceof DocumentUploadError)
+    if (
+      error instanceof DocumentUploadError ||
+      error instanceof DocumentSubmissionError
+    )
       return json({ error: error.message }, error.status);
     return json(
       { error: "Could not prepare the presentation upload. Please try again." },

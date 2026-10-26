@@ -14,10 +14,10 @@ The interface labels file sizes “MB”; these code limits use MiB (1,048,576 b
 
 ## Upload and conversion
 
-1. The browser computes the selected file's SHA-256 and posts its session ID, filename, size, and hash to `/api/document-upload`.
+1. The updated browser computes the selected file's SHA-256 and first obtains a stateless signed preparation from `/api/document-submission`, retaining its server-generated document ID before any persistence. It then posts the metadata and preparation token to `/api/document-upload`. See [initial upload recovery](document-submission-recovery.md) for identity, cancellation and replay rules; callers without a token keep the legacy flow.
 2. The server verifies the instructor/admin role and active session ownership, then commits a document reservation before requesting a signed upload URL. An account can have at most three outstanding reservations; the account row lock makes this check apply across its sessions.
 3. The browser sends the raw file with a single `PUT` to that URL. The capability permits creation at one server-chosen path, with overwrite disabled. The browser receives no storage service credentials. An interrupted upload must be retried; it cannot resume from a byte offset.
-4. `/api/convert` receives the document ID. Under the retention lock, it reads the canonical object with a 25 MiB streaming bound and verifies the recorded size, SHA-256, and file envelope before marking the upload complete. Package inspection then runs before model work.
+4. `/api/convert` receives the document ID and, for the initial prepared submission, its token. Under the retention lock, it reads the canonical object with a 25 MiB streaming bound and verifies the recorded size, SHA-256, and file envelope before marking the upload complete. A repeated prepared reservation recognizes an already uploaded exact source without overwriting it; a repeated initial conversion cannot start a second attempt. Package inspection then runs before model work.
 
 The browser processes a batch serially. This controls work in that browser; other browsers and users can still convert simultaneously. A recent active PowerPoint attempt blocks duplicate starts for the same document. Publication and failure handling compare attempt numbers so an older request cannot replace a newer result. Billable calls retain a stable receipt per attempt.
 
@@ -34,6 +34,8 @@ The generated PDF still travels back from the renderer to the application, where
 ## Retention and abandoned uploads
 
 Signed upload URLs normally last two hours. Before signing, the application reserves a conservative 125-minute deadline; after receiving the token, it records its actual expiry before returning the URL. Interrupted signing therefore leaves a cleanup receipt.
+
+Prepared submissions instead commit a fixed cleanup deadline of their original ten-minute preparation expiry plus 125 minutes. This covers a two-hour capability issued anywhere in that preparation window. Re-signing checks the database clock before and after signing and withholds any URL beyond the committed cap; it never refreshes the preparation or original document retention. Explicit removal uses token-authenticated cancellation even before the first row exists. Ordinary upload response failures retain their reservation for exact-source reconciliation.
 
 Deleting a document hides it immediately. Physical deletion waits until the upload token expires plus a one-hour allowance for an upload already in progress, so a still-valid upload URL cannot recreate an object whose receipt has been removed. The allowance is conservative; it is not a provider guarantee about arbitrarily stalled uploads. Abandoned reservations become eligible for cleanup after that window.
 

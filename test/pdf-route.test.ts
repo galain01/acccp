@@ -24,6 +24,8 @@ const mocks = vi.hoisted(() => ({
   remove: vi.fn(),
   withRetainedDocument: vi.fn(),
   purgeDocumentIfEligible: vi.fn(),
+  persistSubmissionSource: vi.fn(),
+  assertSubmissionCanStart: vi.fn(),
   db: {
     select: vi.fn(),
     insert: vi.fn(),
@@ -34,6 +36,10 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@/lib/auth", () => ({ verifyRoleOrUnauthorized: mocks.auth }));
+vi.mock("@/lib/document-submission", () => ({
+  persistSubmissionSource: mocks.persistSubmissionSource,
+  assertSubmissionCanStart: mocks.assertSubmissionCanStart,
+}));
 vi.mock("@/lib/document-upload", () => ({
   readAndFinalizePowerPointUpload: mocks.finalizeUpload,
   DocumentUploadError: class extends Error {
@@ -89,6 +95,11 @@ vi.mock("@/lib/storage", () => ({
 }));
 
 import { POST } from "@/app/api/convert/route";
+import {
+  issueSubmissionToken,
+  readSubmissionToken,
+  DocumentSubmissionError,
+} from "@/lib/document-submission-token";
 import { DocumentUploadError } from "@/lib/document-upload";
 import { DocumentUnavailableError } from "@/lib/document-retention";
 import { WordToPdfError } from "@/lib/word-to-pdf";
@@ -214,11 +225,73 @@ function artifactValues() {
     .map((result) => result.value.values.mock.calls[0][0]);
 }
 
+function preparedRequest(
+  options: {
+    extension?: "pdf" | "docx";
+    referenced?: boolean;
+    token?: string | File;
+  } = {}
+) {
+  const userId = "11111111-1111-4111-8111-111111111111";
+  const sessionId = "22222222-2222-4222-8222-222222222222";
+  const filename = `course.${options.extension ?? "pdf"}`;
+  const contents = options.extension === "docx" ? DOCX : PDF;
+  const source = Buffer.from(contents);
+  vi.stubEnv(
+    "BETTER_AUTH_SECRET",
+    "synthetic-prepared-convert-secret-32-chars"
+  );
+  const ticket = issueSubmissionToken(userId, {
+    sessionId,
+    filename,
+    fileSizeBytes: source.length,
+    checksumSha256: createHash("sha256").update(source).digest("hex"),
+    outputTarget: "canvas_html",
+  });
+  mocks.auth.mockResolvedValue({ session: { user: { id: userId } } });
+  mocks.withRetainedDocument.mockImplementation(async (_id, action) =>
+    action(mocks.db, { sessionId, createdAt: "2026-09-01T00:00:00.000Z" })
+  );
+  const form = new FormData();
+  form.set("sessionId", sessionId);
+  form.set("outputTarget", "canvas_html");
+  form.set("submissionToken", options.token ?? ticket.submissionToken);
+  if (options.referenced) {
+    form.set("documentId", ticket.documentId);
+    mocks.db.select
+      .mockReturnValueOnce(chain([{ id: sessionId }]))
+      .mockReturnValueOnce(
+        chain([
+          {
+            id: ticket.documentId,
+            originalFilename: filename,
+            outputTarget: "canvas_html",
+          },
+        ])
+      );
+    mocks.download.mockResolvedValue(source);
+  } else {
+    form.set("file", new File([contents], filename));
+  }
+  return {
+    userId,
+    sessionId,
+    filename,
+    source,
+    ticket,
+    request: new NextRequest("https://example.test/api/convert", {
+      method: "POST",
+      body: form,
+    }),
+  };
+}
+
 describe("document conversion route", () => {
   const inserted = new Map<unknown, ReturnType<typeof chain>>();
   const updated = chain([{ id: "promoted-receipt" }]);
   afterEach(() => {
     vi.useRealTimers();
+    vi.unstubAllEnvs();
     if (vi.isMockFunction(performance.now))
       vi.mocked(performance.now).mockRestore();
   });
@@ -242,6 +315,12 @@ describe("document conversion route", () => {
           })
       );
     mocks.purgeDocumentIfEligible.mockResolvedValue("purged");
+    mocks.assertSubmissionCanStart.mockReset().mockResolvedValue(undefined);
+    mocks.persistSubmissionSource
+      .mockReset()
+      .mockImplementation(async (owner, token) =>
+        readSubmissionToken(token, owner, { allowExpired: true })
+      );
     mocks.auth.mockResolvedValue({ session: { user: { id: "user-1" } } });
     mocks.db.select.mockImplementation((fields) =>
       fields?.attemptNumber
@@ -320,6 +399,139 @@ describe("document conversion route", () => {
     });
     vi.spyOn(console, "log").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  it.each(["", "not-a-signed-token", new File(["opaque"], "token.txt")])(
+    "rejects malformed initial-submission tokens before persistence or model calls",
+    async (token) => {
+      const prepared = preparedRequest({ token });
+      expect((await POST(prepared.request)).status).toBe(400);
+      expect(mocks.persistSubmissionSource).not.toHaveBeenCalled();
+      expect(mocks.db.insert).not.toHaveBeenCalled();
+      expect(mocks.convert).not.toHaveBeenCalled();
+      expect(mocks.renderWord).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(["pdf", "docx"] as const)(
+    "confirms a referenced prepared %s source before rendering or model work",
+    async (extension) => {
+      const prepared = preparedRequest({ extension, referenced: true });
+      const response = await POST(prepared.request);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        documentId: prepared.ticket.documentId,
+        outputTarget: "canvas_html",
+      });
+      expect(mocks.persistSubmissionSource).toHaveBeenCalledExactlyOnceWith(
+        prepared.userId,
+        prepared.ticket.submissionToken,
+        prepared.source
+      );
+      expect(
+        mocks.persistSubmissionSource.mock.invocationCallOrder[0]
+      ).toBeLessThan(mocks.convert.mock.invocationCallOrder[0]);
+      if (extension === "docx")
+        expect(
+          mocks.persistSubmissionSource.mock.invocationCallOrder[0]
+        ).toBeLessThan(mocks.renderWord.mock.invocationCallOrder[0]);
+      expect(mocks.assertSubmissionCanStart).toHaveBeenCalledTimes(2);
+      expect(mocks.db.insert).not.toHaveBeenCalledWith(documents);
+      expect(mocks.upload.mock.calls.map(([key]) => key)).not.toContain(
+        `${prepared.sessionId}/${prepared.ticket.documentId}/source.${extension}`
+      );
+    }
+  );
+
+  it("persists a new prepared source under its known identity before any engine call", async () => {
+    const prepared = preparedRequest();
+    expect((await POST(prepared.request)).status).toBe(200);
+    expect(mocks.persistSubmissionSource).toHaveBeenCalledExactlyOnceWith(
+      prepared.userId,
+      prepared.ticket.submissionToken,
+      prepared.source
+    );
+    expect(mocks.db.insert).not.toHaveBeenCalledWith(documents);
+    expect(
+      mocks.persistSubmissionSource.mock.invocationCallOrder[0]
+    ).toBeLessThan(mocks.convert.mock.invocationCallOrder[0]);
+  });
+
+  it.each(["before rendering", "at job start"])(
+    "refuses an initial-submission replay %s with its identity and no new model call",
+    async (when) => {
+      const prepared = preparedRequest({ extension: "docx", referenced: true });
+      const rejection = new DocumentSubmissionError(
+        "This upload has already been submitted.",
+        409
+      );
+      if (when === "before rendering")
+        mocks.assertSubmissionCanStart.mockRejectedValueOnce(rejection);
+      else
+        mocks.assertSubmissionCanStart
+          .mockResolvedValueOnce(undefined)
+          .mockRejectedValueOnce(rejection);
+      const response = await POST(prepared.request);
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({
+        documentId: prepared.ticket.documentId,
+        outputTarget: "canvas_html",
+      });
+      expect(mocks.convert).not.toHaveBeenCalled();
+      expect(mocks.convertWord).not.toHaveBeenCalled();
+      expect(mocks.db.insert).not.toHaveBeenCalledWith(conversionJobs);
+      if (when === "before rendering")
+        expect(mocks.renderWord).not.toHaveBeenCalled();
+    }
+  );
+
+  it("retains prepared identity after an unconfirmed source save without calling an engine", async () => {
+    const prepared = preparedRequest();
+    mocks.persistSubmissionSource.mockRejectedValueOnce(
+      new Error("private source storage response")
+    );
+    const response = await POST(prepared.request);
+    expect(response.status).toBe(503);
+    const body = await response.json();
+    expect(body).toMatchObject({
+      documentId: prepared.ticket.documentId,
+      outputTarget: "canvas_html",
+    });
+    expect(JSON.stringify(body)).not.toContain("private");
+    expect(mocks.convert).not.toHaveBeenCalled();
+    expect(mocks.db.insert).not.toHaveBeenCalledWith(conversionJobs);
+  });
+
+  it("settles only the unstarted prepared Word job after rendering fails and retains its identity", async () => {
+    const prepared = preparedRequest({ extension: "docx" });
+    mocks.renderWord.mockRejectedValueOnce(
+      new WordToPdfError("Word rendering unavailable.", 503)
+    );
+    const response = await POST(prepared.request);
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({
+      documentId: prepared.ticket.documentId,
+      outputTarget: "canvas_html",
+    });
+    expect(mocks.convert).not.toHaveBeenCalled();
+    expect(mocks.convertWord).not.toHaveBeenCalled();
+    expect(mocks.db.insert).not.toHaveBeenCalledWith(conversionJobs);
+    expect(mocks.db.update).toHaveBeenCalledWith(conversionJobs);
+    expect(updated.set).toHaveBeenCalledWith(
+      expect.objectContaining({ status: "failed", errorCode: "word_rejected" })
+    );
+    const where = new PgDialect().sqlToQuery(
+      updated.where.mock.calls[0][0] as SQL
+    );
+    expect(where.params).toEqual([
+      prepared.ticket.documentId,
+      "canvas_html",
+      0,
+      "queued",
+    ]);
+    expect(inserted.has(dailyFailureMetrics)).toBe(true);
+    expect(mocks.purgeDocumentIfEligible).not.toHaveBeenCalled();
+    expect(mocks.remove).not.toHaveBeenCalled();
   });
 
   it("uses a new immutable output path for each Canvas retry", async () => {

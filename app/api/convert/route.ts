@@ -28,6 +28,15 @@
  */
 
 import { createHash } from "node:crypto";
+import {
+  assertSubmissionCanStart,
+  persistSubmissionSource,
+} from "@/lib/document-submission";
+import {
+  DocumentSubmissionError,
+  readSubmissionToken,
+  type SubmissionClaims,
+} from "@/lib/document-submission-token";
 import { performance } from "node:perf_hooks";
 import { NextRequest, NextResponse } from "next/server";
 import { and, eq, isNull, sql } from "drizzle-orm";
@@ -314,6 +323,26 @@ async function convertRequest(req: NextRequest) {
     return json({ error: "Choose a supported output format." }, 400);
   }
   const profileVersion = OUTPUT_PROFILES[outputTarget].version;
+  const submissionToken = formData.get("submissionToken");
+  let submission: SubmissionClaims | undefined;
+  if (submissionToken !== null) {
+    if (typeof submissionToken !== "string")
+      return json({ error: "Invalid upload preparation." }, 400);
+    submission = readSubmissionToken(submissionToken, userId, {
+      allowExpired: true,
+    });
+    if (
+      submission.sessionId !== sessionId ||
+      submission.outputTarget !== outputTarget
+    )
+      return json(
+        {
+          error:
+            "The upload preparation does not match this session or output format.",
+        },
+        409
+      );
+  }
 
   // Establishes ownership for every write below.
   const [session] = await db
@@ -331,6 +360,15 @@ async function convertRequest(req: NextRequest) {
   const existingDocumentId = formData.get("documentId");
   const isReconversion =
     typeof existingDocumentId === "string" && existingDocumentId;
+  if (
+    submission &&
+    isReconversion &&
+    submission.documentId !== existingDocumentId
+  )
+    return json(
+      { error: "The upload preparation does not match this document." },
+      409
+    );
 
   let documentId: string;
   let filename: string;
@@ -461,7 +499,80 @@ async function convertRequest(req: NextRequest) {
 
     // The HTML path renders Word before creating rows. Native engines prepare
     // their source as part of the recorded job, including any failure diagnostics.
-    documentId = "";
+    documentId = submission?.documentId ?? "";
+    if (submission) {
+      if (filename !== submission.filename)
+        return json(
+          { error: "The source filename does not match its preparation." },
+          409
+        );
+      try {
+        await persistSubmissionSource(
+          userId,
+          submissionToken as string,
+          sourceBuffer
+        );
+      } catch (error) {
+        const status =
+          error instanceof DocumentSubmissionError ? error.status : 503;
+        return json(
+          {
+            error:
+              error instanceof DocumentSubmissionError
+                ? error.message
+                : "Could not confirm the source upload. Refresh before trying again.",
+            documentId,
+            outputTarget,
+          },
+          status
+        );
+      }
+    }
+  }
+
+  if (
+    submission &&
+    (filename !== submission.filename ||
+      sourceBuffer.length !== submission.fileSizeBytes ||
+      createHash("sha256").update(sourceBuffer).digest("hex") !==
+        submission.checksumSha256)
+  )
+    return json(
+      {
+        error: "The source does not match its upload preparation.",
+        documentId,
+        outputTarget,
+      },
+      415
+    );
+
+  if (submission) {
+    try {
+      // A referenced original may have survived an unacknowledged readiness
+      // commit. Confirm readiness before using it for any recorded conversion.
+      if (isReconversion && !isPptxFilename(filename))
+        await persistSubmissionSource(
+          userId,
+          submissionToken as string,
+          sourceBuffer
+        );
+      await withRetainedDocument(documentId, (tx) =>
+        assertSubmissionCanStart(tx, submission)
+      );
+    } catch (error) {
+      if (error instanceof DocumentUnavailableError) throw error;
+      return json(
+        {
+          error:
+            error instanceof DocumentSubmissionError
+              ? error.message
+              : "Could not confirm the source upload. Refresh before trying again.",
+          documentId,
+          outputTarget,
+        },
+        error instanceof DocumentSubmissionError ? error.status : 503
+      );
+    }
   }
 
   // Measure server processing after source validation, including Word
@@ -482,8 +593,8 @@ async function convertRequest(req: NextRequest) {
         : sourceBuffer;
   } catch (error) {
     if (!(error instanceof WordToPdfError)) throw error;
-    // Word rendering precedes document/job creation. Keep that behavior and
-    // any earlier saved job, but count the failed attempt without identifiers.
+    // Legacy rendering precedes persistence. Prepared uploads already have a
+    // queued identity: settle only that unstarted job, preserving any later run.
     const diagnostic = createJobDiagnostic({
       ...error.diagnostic,
       stage: "word_to_pdf",
@@ -494,11 +605,41 @@ async function convertRequest(req: NextRequest) {
       ),
     });
     try {
-      await recordFailureCount(db, diagnostic, new Date().toISOString());
+      if (submission) {
+        await withRetainedDocument(documentId, async (tx) => {
+          const failedAt = new Date().toISOString();
+          const changed = await tx
+            .update(conversionJobs)
+            .set({
+              status: "failed",
+              errorCode: diagnostic.code,
+              errorMessage: describeJobDiagnostic(diagnostic),
+              completedAt: failedAt,
+              updatedAt: failedAt,
+            })
+            .where(
+              and(
+                eq(conversionJobs.documentId, documentId),
+                eq(conversionJobs.outputTarget, outputTarget),
+                eq(conversionJobs.attemptCount, 0),
+                eq(conversionJobs.status, "queued")
+              )
+            )
+            .returning({ id: conversionJobs.id });
+          if (changed.length)
+            await recordFailureCount(tx, diagnostic, failedAt);
+        });
+      } else await recordFailureCount(db, diagnostic, new Date().toISOString());
     } catch {
       console.error("[api/convert] Word failure total could not be saved");
     }
-    return json({ error: describeJobDiagnostic(diagnostic) }, error.status);
+    return json(
+      {
+        error: describeJobDiagnostic(diagnostic),
+        ...(submission ? { documentId, outputTarget } : {}),
+      },
+      error.status
+    );
   }
   const sourceMimeType = isPowerPoint
     ? PPTX_MIME_TYPE
@@ -507,7 +648,7 @@ async function convertRequest(req: NextRequest) {
       : PDF_MIME_TYPE;
   const pageCount = isNative ? null : await countPdfPages(buffer);
 
-  if (!isReconversion) {
+  if (!isReconversion && !submission) {
     const [created] = await db
       .insert(documents)
       .values({
@@ -553,6 +694,7 @@ async function convertRequest(req: NextRequest) {
 
   // A saved document keeps its destination; retries update that same job.
   const job = await withRetainedDocument(documentId, async (tx, document) => {
+    if (submission) await assertSubmissionCanStart(tx, submission);
     {
       // The retained-document row lock serializes starts for every target.
       // A request that lost its response must not start another billable attempt.
@@ -608,9 +750,16 @@ async function convertRequest(req: NextRequest) {
       });
     return savedJob;
   }).catch(async (error) => {
+    if (submission && error instanceof DocumentSubmissionError)
+      throw new DocumentSubmissionError(
+        error.message,
+        error.status,
+        documentId,
+        outputTarget
+      );
     // A new PDF without a job would lose its chosen native destination when
     // listed again. Keep failed starts discoverable by the existing purge.
-    if (isNativePdf && !isReconversion) {
+    if (isNativePdf && !isReconversion && !submission) {
       await db
         .update(documents)
         .set({ deletedAt: new Date().toISOString() })
@@ -938,6 +1087,17 @@ export async function POST(req: NextRequest) {
   } catch (error) {
     if (error instanceof DocumentUploadError) {
       return json({ error: error.message }, error.status);
+    }
+    if (error instanceof DocumentSubmissionError) {
+      return json(
+        {
+          error: error.message,
+          ...(error.documentId
+            ? { documentId: error.documentId, outputTarget: error.outputTarget }
+            : {}),
+        },
+        error.status
+      );
     }
     if (error instanceof ConversionInProgressError) {
       return json({ error: error.message, documentId: error.documentId }, 409);
