@@ -267,6 +267,12 @@ seconds. The supervisor checks the saved bytes again before passing only the
 repair JSON to the PDF processor. Transport files are deleted in all outcomes;
 the app deletes the remote object and tracks failed cleanup for its purge.
 
+`SUPABASE_DOCUMENTS_BUCKET` optionally selects a separate private bucket for an
+isolated environment (default `documents`). Set the same value in app and worker.
+The transport matches that exact bucket; it does not accept arbitrary bucket
+names supplied by a request. Names contain only lowercase letters, digits,
+underscores and hyphens, beginning with a letter or digit, at most 100 characters.
+
 Bounds: 4 MiB PDF input and candidate, 60 pages, 5,000 tags, 500,000 text
 characters, 12 MiB repair JSON, 16 KiB stored-reference HTTP body, 16 MiB
 response, one active job per process, a 90-second work budget per request including

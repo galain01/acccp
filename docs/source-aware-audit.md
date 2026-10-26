@@ -17,7 +17,7 @@ Source review comments and image placeholders also generate findings without rel
 
 - `LITELLM_CONVERSION_MODEL`: optional first-stage model.
 - `LITELLM_AUDIT_MODEL`: optional second-stage model.
-- `LITELLM_MODEL`: shared fallback, then `gpt-5.6-sol-2026-07-09` if blank/unset.
+- `LITELLM_MODEL`: shared fallback, then `gpt-6.1-sol-2026-09-29` if blank/unset.
 
 Both stages use the existing LiteLLM URL and authorized key. Overrides must name models accessible to that key and capable of accepting PDF and image input. Changes in Vercel require a redeployment. No new variables are required for rollout; leaving the overrides unset keeps the current model for both stages. Per-call actual models, tokens, and reported/estimated costs remain recorded separately. Reattaching the PDF and page images increases audit input usage; compare observed total cost and latency rather than assuming the short report makes the audit inexpensive.
 

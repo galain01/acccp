@@ -20,7 +20,9 @@ if (!supabaseUrl) throw new Error("Missing env var: SUPABASE_URL");
 if (!serviceRoleKey)
   throw new Error("Missing env var: SUPABASE_SERVICE_ROLE_KEY");
 
-export const DOCUMENTS_BUCKET = "documents";
+/** A separate private bucket allows isolated local validation in an existing project. */
+export const DOCUMENTS_BUCKET =
+  process.env.SUPABASE_DOCUMENTS_BUCKET?.trim() || "documents";
 
 export { DOCX_MIME_TYPE, PPTX_MIME_TYPE } from "./document-input";
 

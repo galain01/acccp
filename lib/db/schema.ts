@@ -358,7 +358,7 @@ export const artifacts = pgTable(
       .using(
         "btree",
         table.jobId.asc().nullsLast().op("uuid_ops"),
-        table.artifactType.asc().nullsLast().op("uuid_ops")
+        table.artifactType.asc().nullsLast().op("enum_ops")
       )
       .where(sql`(artifact_status = 'available'::artifact_status)`),
     foreignKey({

@@ -58,6 +58,19 @@ class Connection:
 
 
 class StoredTransportTests(unittest.TestCase):
+    def test_configured_private_bucket_is_exact_and_cannot_inject_a_path_or_pattern(self):
+        bucket = "acccp-validation-20261026-test"
+        custom = reference(requestUrl=URL.replace("/documents/", "/" + bucket + "/"))
+        value, host, target = transport.validate_reference(custom, ORIGIN, bucket)
+        self.assertIn("/" + bucket + "/", target)
+        with self.assertRaises(transport.TransportError):
+            transport.validate_reference(reference(), ORIGIN, bucket)
+        with self.assertRaises(transport.TransportError):
+            transport.validate_reference(custom, ORIGIN)
+        for invalid in ("", "../documents", "a/b", "a%2fb", ".*", "a\\b", " a", "a" * 101):
+            with self.subTest(bucket=invalid), self.assertRaises(transport.TransportError):
+                transport.validate_reference(custom, ORIGIN, invalid)
+
     def test_only_exact_private_signed_path_and_schema_are_accepted(self):
         value, host, target = transport.validate_reference(reference(), ORIGIN)
         self.assertEqual("example-project.supabase.co", host)

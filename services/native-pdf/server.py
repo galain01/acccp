@@ -164,16 +164,16 @@ def execute(mode, body, toolchain, *, timeout=None):
             return failure("invalid_result", process)
 
 
-def fetch_stored(body, origin, *, timeout=stored_transport.FETCH_DEADLINE):
+def fetch_stored(body, origin, *, timeout=stored_transport.FETCH_DEADLINE, bucket="documents"):
     """Fetch separately so no signed URL reaches a PDF document processor."""
-    stored_transport.validate_reference(body, origin)
+    stored_transport.validate_reference(body, origin, bucket)
     with tempfile.TemporaryDirectory(prefix="native-pdf-transport-") as temporary:
         folder = Path(temporary)
         request, result = folder / "reference.json", folder / "request.json"
         request.write_bytes(body)
         environment = child_environment()
         environment.update(TMPDIR=str(folder), TEMP=str(folder), TMP=str(folder), HOME=str(folder))
-        process = subprocess.Popen([sys.executable, str(TRANSPORT), str(request), str(result), origin],
+        process = subprocess.Popen([sys.executable, str(TRANSPORT), str(request), str(result), origin, bucket],
                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                    env=environment, cwd=folder, start_new_session=os.name == "posix",
                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -189,7 +189,7 @@ def fetch_stored(body, origin, *, timeout=stored_transport.FETCH_DEADLINE):
             raise stored_transport.TransportError("pdf_complexity_limit")
         payload = result.read_bytes()
         # Independently verify the saved transport child's exact bytes.
-        reference, _, _ = stored_transport.validate_reference(body, origin)
+        reference, _, _ = stored_transport.validate_reference(body, origin, bucket)
         if len(payload) != reference["requestBytes"] or hashlib.sha256(payload).hexdigest() != reference["requestSha256"]:
             raise stored_transport.TransportError()
         return payload
@@ -296,7 +296,8 @@ class Handler(BaseHTTPRequestHandler):
             if len(body) != int(lengths[0]):
                 return self.send_json(400, {"error": {"code": "pdf_invalid"}})
             if self.path == "/repair-stored":
-                body = fetch_stored(body, getattr(self.server, "storage_origin", ""), timeout=self.remaining_time(deadline))
+                body = fetch_stored(body, getattr(self.server, "storage_origin", ""), timeout=self.remaining_time(deadline),
+                                    bucket=getattr(self.server, "storage_bucket", "documents"))
             mode = "prepare" if self.path == "/prepare" else "repair"
             status, response = execute(mode, body, self.server.toolchain, timeout=self.remaining_time(deadline))
             return self.send_json(status, response)
@@ -322,6 +323,7 @@ def main():
     server = Server((options.host, options.port), Handler)
     server.api_key, server.toolchain = key, options.toolchain.resolve()
     server.storage_origin = os.environ.get("SUPABASE_URL", "").rstrip("/")
+    server.storage_bucket = os.environ.get("SUPABASE_DOCUMENTS_BUCKET", "").strip() or "documents"
     server.serve_forever(poll_interval=0.5)
 
 

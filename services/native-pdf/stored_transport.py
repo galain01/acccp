@@ -16,8 +16,7 @@ MAX_REFERENCE = 16 * 1024
 MAX_REQUEST = 12 * 1024 * 1024
 FETCH_DEADLINE = 15
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
-PATH = re.compile(r"/storage/v1/object/sign/documents/" + UUID + "/" + UUID + "/" + UUID +
-                  "/native-pdf-request-" + UUID + r"\.json\Z")
+REQUEST_PATH = UUID + "/" + UUID + "/" + UUID + "/native-pdf-request-" + UUID + r"\.json\Z"
 TOKEN = re.compile(r"token=[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\Z")
 EXIT_CODES = {"native_pdf_invalid_plan": 2, "native_pdf_worker_failed": 3,
               "native_pdf_timeout": 4, "pdf_complexity_limit": 5}
@@ -47,8 +46,11 @@ def unique_pairs(pairs):
     return value
 
 
-def validate_reference(body, origin):
+def validate_reference(body, origin, bucket="documents"):
     hostname = origin_hostname(origin)
+    if not isinstance(bucket, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,99}", bucket):
+        raise TransportError("native_pdf_worker_failed")
+    path = re.compile(r"/storage/v1/object/sign/" + re.escape(bucket) + "/" + REQUEST_PATH)
     if not isinstance(body, bytes) or not 0 < len(body) <= MAX_REFERENCE:
         raise TransportError()
     try:
@@ -70,14 +72,14 @@ def validate_reference(body, origin):
     except ValueError:
         raise TransportError() from None
     if (parts.scheme != "https" or parts.netloc != hostname or parts.username or parts.password
-            or parts.port is not None or parts.fragment or not PATH.fullmatch(parts.path)
+            or parts.port is not None or parts.fragment or not path.fullmatch(parts.path)
             or not TOKEN.fullmatch(parts.query)):
         raise TransportError()
     return value, hostname, parts.path + "?" + parts.query
 
 
-def fetch_request(body, origin):
-    value, hostname, target = validate_reference(body, origin)
+def fetch_request(body, origin, bucket="documents"):
+    value, hostname, target = validate_reference(body, origin, bucket)
     deadline = time.monotonic() + FETCH_DEADLINE
     # HTTPConnection does not consult proxy variables or follow redirects.
     # The child has no inherited SSL_CERT_FILE or application credentials.
@@ -121,9 +123,10 @@ def fetch_request(body, origin):
 
 
 def main():
-    if len(sys.argv) != 4:
+    if len(sys.argv) not in (4, 5):
         raise TransportError()
     request, result, origin = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+    bucket = sys.argv[4] if len(sys.argv) == 5 else "documents"
     if os.name == "posix":
         import resource
         resource.setrlimit(resource.RLIMIT_AS, (256 * 1024 ** 2, 256 * 1024 ** 2))
@@ -134,7 +137,7 @@ def main():
     if request.stat().st_size > MAX_REFERENCE:
         raise TransportError()
     with result.open("xb") as output:
-        output.write(fetch_request(request.read_bytes(), origin))
+        output.write(fetch_request(request.read_bytes(), origin, bucket))
 
 
 if __name__ == "__main__":

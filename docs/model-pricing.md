@@ -2,7 +2,7 @@
 
 ## Selecting conversion and audit models
 
-The two stages can use independent proxy model IDs. Set `LITELLM_CONVERSION_MODEL` for the PDF-to-HTML stage and `LITELLM_AUDIT_MODEL` for the review stage. Each optional value is trimmed; an unset, empty, or whitespace-only value falls back to `LITELLM_MODEL`, then to the existing `gpt-5.6-sol-2026-07-09` default. Leave both stage overrides unset to keep the current model for both stages. Callers that do not select a stage continue to use `LITELLM_MODEL` or the default.
+The two stages can use independent proxy model IDs. Set `LITELLM_CONVERSION_MODEL` for conversion/repair and `LITELLM_AUDIT_MODEL` for the review stage. Each optional value is trimmed; an unset, empty, or whitespace-only value falls back to `LITELLM_MODEL`, then to `gpt-6.1-sol-2026-09-29`. Leave both stage overrides unset to use the shared model for both stages. Callers that do not select a stage continue to use `LITELLM_MODEL` or the default. Load a model's matching API key as well as its name; a key alone does not select that model. Local validation can load the saved `.env.sol61.local` profile explicitly after the base connection settings.
 
 Both stages use the same server-only `LITELLM_API_KEY` and `LITELLM_BASE_URL`. The key must authorize each selected model, and each model must support the PDF input sent to that stage. Change these optional settings in your local environment or deployment configuration and restart/redeploy to apply them; do not put keys in tracked files. Pricing and token usage remain attached to each call's model and stage, so choosing a different auditor does not reprice past conversions. A model without gateway pricing or a supported published fallback remains unpriced rather than being counted as free.
 
