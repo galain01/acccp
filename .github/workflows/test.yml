@@ -30,6 +30,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Standard-library tests only: no Java tools, external documents or services.
+      - name: Check native PDF supervisor lifecycle
+        run: python -m unittest discover -s services/native-pdf -p "test_server*.py"
+
       - uses: actions/setup-node@v4
         with:
           node-version: 24

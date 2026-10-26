@@ -269,13 +269,22 @@ the app deletes the remote object and tracks failed cleanup for its purge.
 
 Bounds: 4 MiB PDF input and candidate, 60 pages, 5,000 tags, 500,000 text
 characters, 12 MiB repair JSON, 16 KiB stored-reference HTTP body, 16 MiB
-response, one active job per process, 90 seconds per worker request including
-the signed-object download. Busy jobs fail immediately with HTTP 503.
+response, one active job per process, a 90-second work budget per request including
+body intake and the signed-object download. Each phase receives only the
+remaining budget, and body reads check an absolute deadline so trickling input
+cannot extend it. Busy jobs fail immediately with HTTP 503.
+Bounded process cleanup and response delivery may add elapsed time after this
+work budget; it is not an exact HTTP response-time guarantee.
 All request-local files are deleted after success or failure, including Java
 scratch files pinned by `-Djava.io.tmpdir`. An isolated
 processor receives only fixed runtime paths, no application secrets. Process
 timeouts and OS resource limits supplement the container's memory limits;
-they do not constitute an OS sandbox. Existing tags are preserved; only
+they do not constitute an OS sandbox. In the production Linux service, its
+owned process group is terminated after every processor exit, before draining
+pipes, reading results, or deleting request files. This includes crashes and
+successes with leftover children. Windows development timeout cleanup uses
+`taskkill` and does not promise containment of children orphaned before their
+parent exits. Existing tags are preserved; only
 untagged PDFs go through OpenDataLoader. Every `page_content` row includes
 `selectableTextPresent` and `requiresVisualTextReview`. The mandatory auditor
 determines whether visible words need OCR or the page contains a graphic with

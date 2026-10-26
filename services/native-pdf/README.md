@@ -125,6 +125,18 @@ inherited runtime injection options. JVM scratch paths and working directories
 are pinned to the request directory. Cleanup follows successful, failed and
 timed-out jobs. Responses never contain native stderr or filesystem paths.
 
+The same 90-second work budget covers authenticated body intake, any signed-object
+download, and PDF processing. Intake checks elapsed time between bounded socket
+reads; incoming trickled bytes do not restart that budget. Exhausted requests
+do not start another processor. On the production Linux service, every terminal
+processor outcome also terminates its owned process group before pipe draining,
+result reading, and temporary-file cleanup. This includes successful exits and
+crashes that leave native children alive. The Windows development fallback uses
+`taskkill` for timeouts; it does not provide Linux-equivalent orphan containment
+after a parent has already exited.
+Bounded process cleanup and response delivery can add elapsed time after the
+work budget; it is not an exact HTTP response-time guarantee.
+
 Within one repair request, read-only checks can share a fresh structure
 inspection bound to the same unchanged reader. Enrichment receives a copy so
 editing hints cannot alter the underlying verification evidence. The saved
@@ -149,6 +161,10 @@ complete validator evidence, and honest
 evidence for pages without selectable text. HTTP tests exercise authentication,
 ambiguous headers, input limits, capacity, subprocess credential isolation,
 actual timeout cleanup and controlled failures.
+The existing Linux CI job also runs the standard-library supervisor tests,
+including a synthetic processor that exits while its child remains alive.
+The `/proc`-based integration check is explicitly skipped on other platforms;
+deadline and cleanup-order regression tests run on both Windows and Linux.
 Stored-transport tests also cover URL scope, verified TLS, redirects, bounded
 reads, exact hashes, child credential isolation and download timeout cleanup.
 
