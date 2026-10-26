@@ -1,2 +1,5 @@
 *.ts text eol=lf
 *.tsx text eol=lf
+
+# Pinned instruction-file checksums must survive Windows and Linux checkouts.
+.agents/** text eol=lf

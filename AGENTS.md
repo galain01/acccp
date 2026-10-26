@@ -4,6 +4,13 @@
 This version has breaking changes — APIs, conventions, and file structure may all differ from your training data. Read the relevant guide in `node_modules/next/dist/docs/` before writing any code. Heed deprecation notices.
 <!-- END:nextjs-agent-rules -->
 
+## Reliability engineering guidance
+
+- Reviewed Addy Osmani engineering skills are installed locally in `.agents/skills/`; see `.agents/README.md` and its pinned provenance. Preserve `.agents/references/` and the security skill's nested reference files. No helper scripts or global configuration are required.
+- For remediation changes, start with the current engine source and `docs/reliability-review.md`, write bounded acceptance criteria, reproduce defects with synthetic/local fixtures, then verify fixes independently. Use the source-driven, test-driven, debugging, review, simplification and security guidance as applicable. Existing user authorization governs task scope and takes precedence over generic approval gates.
+- Preserve original formats/content and all independent preservation checks. Test both accepted and refused fixture classes; incomplete audits, unresolved machine findings and unsupported features must remain visible. Tests with mocked models do not establish semantic accessibility, screen-reader behavior or conformance.
+- `docs/reliability-refactor.md` records the first bounded increment and its verification. Deployment, migrations, new services, credentials and paid model calls require their own applicable authorization.
+
 ## shadcn / UI structure
 
 - UI primitives live in `components/ui/`. Add new ones via `npx shadcn@latest add <name>`.
