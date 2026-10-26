@@ -112,6 +112,15 @@ export const maxDuration = 300;
 
 const PROVIDER = "litellm";
 
+type DocumentConversionResult = Awaited<
+  ReturnType<
+    | typeof convertPowerPoint
+    | typeof convertWord
+    | typeof repairNativePdf
+    | typeof convertPdf
+  >
+>;
+
 class ConversionInProgressError extends Error {
   constructor(readonly documentId: string) {
     super(
@@ -611,27 +620,44 @@ async function convertRequest(req: NextRequest) {
 
   // Deliberately outside a transaction: this is a multi-second model call and
   // would pin a pooled connection for its whole duration.
-  let result = isPowerPoint
-    ? await convertPowerPoint(sourceBuffer, filename, {
+  let result: DocumentConversionResult;
+  try {
+    if (isPowerPoint) {
+      result = await convertPowerPoint(sourceBuffer, filename, {
         renderPowerPoint: createStoredPowerPointRenderer(
           documentId,
           sessionId,
           jobId
         ),
-      })
-    : isNativeWord
-      ? await convertWord(sourceBuffer, filename)
-      : isNativePdf
-        ? await repairNativePdf(sourceBuffer, filename, {
-            transport: createNativePdfTransport({
-              documentId,
-              jobId,
-              sessionId,
-              userId,
-              attemptNumber: job.attemptNumber,
-            }),
-          })
-        : await convertPdf(buffer, pdfFilename);
+      });
+    } else if (isNativeWord) {
+      result = await convertWord(sourceBuffer, filename);
+    } else if (isNativePdf) {
+      result = await repairNativePdf(sourceBuffer, filename, {
+        transport: createNativePdfTransport({
+          documentId,
+          jobId,
+          sessionId,
+          userId,
+          attemptNumber: job.attemptNumber,
+        }),
+      });
+    } else {
+      result = await convertPdf(buffer, pdfFilename);
+    }
+  } catch (error) {
+    if (error instanceof DocumentUnavailableError) throw error;
+    // Engines normally return controlled failures and incurred usage. If an
+    // unexpected exception escapes, still finish this attempt and retain the
+    // source identity for retries. Never trust exception-attached usage or text.
+    result = {
+      error: "Conversion failed",
+      diagnostic: createJobDiagnostic({
+        stage: "conversion",
+        code: "unknown_error",
+      }),
+    };
+  }
 
   if ("error" in result) {
     const diagnostic = createJobDiagnostic({

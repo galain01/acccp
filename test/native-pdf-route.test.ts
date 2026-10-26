@@ -580,6 +580,121 @@ describe("native PDF conversion route", () => {
     expect(mocks.convert).not.toHaveBeenCalled();
   });
 
+  it.each([
+    {
+      name: "course.pdf",
+      contents: PDF,
+      outputTarget: "accessible_pdf",
+      engine: mocks.repairNativePdf,
+    },
+    {
+      name: "course.docx",
+      contents: DOCX,
+      outputTarget: "accessible_docx",
+      engine: mocks.convertWord,
+    },
+    {
+      name: "course.pptx",
+      contents: DOCX,
+      outputTarget: "accessible_pptx",
+      engine: mocks.convertPowerPoint,
+    },
+    {
+      name: "course.pdf",
+      contents: PDF,
+      outputTarget: "canvas_html",
+      engine: mocks.convert,
+    },
+  ])(
+    "records an unexpected $outputTarget engine rejection and preserves retry identity",
+    async (input) => {
+      const privateError = Object.assign(
+        new Error("private document text; provider-secret"),
+        {
+          diagnostic: { code: "provider_auth", model: "private-value" },
+          calls: [{ ...usage, model: "private-value" }],
+        }
+      );
+      input.engine.mockRejectedValueOnce(privateError);
+      const response = await POST(request(input));
+      expect(response.status).toBe(500);
+      const body = await response.json();
+      expect(body).toMatchObject({
+        documentId: "doc-1",
+        jobId: "job-1",
+        outputTarget: input.outputTarget,
+      });
+      expect(updated.set).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: "failed",
+          errorCode: "unknown_error",
+          completedAt: expect.any(String),
+          processingDurationMs: null,
+        })
+      );
+      expect(inserted.get(jobEvents)?.values).toHaveBeenCalledWith(
+        expect.objectContaining({
+          eventType: "conversion_failed",
+          metadata: expect.objectContaining({
+            diagnostic: expect.objectContaining({
+              stage: "conversion",
+              code: "unknown_error",
+              attemptNumber: 2,
+            }),
+          }),
+        })
+      );
+      expect(inserted.has(dailyFailureMetrics)).toBe(true);
+      expect(inserted.has(modelCalls)).toBe(false);
+      expect(artifactValues()).toEqual([]);
+      expect(mocks.upload).toHaveBeenCalledTimes(1);
+      expect(
+        JSON.stringify([
+          body,
+          mocks.db.insert.mock.results.map((r) => r.value.values.mock.calls),
+          mocks.db.update.mock.results.map((r) => r.value.set.mock.calls),
+          vi.mocked(console.error).mock.calls,
+        ])
+      ).not.toMatch(/private document|provider-secret|private-value/);
+      expect(input.engine).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it("does not fail a newer attempt after an older engine unexpectedly rejects", async () => {
+    mocks.repairNativePdf.mockImplementationOnce(async () => {
+      mocks.db.select.mockReturnValueOnce(chain([{ attemptNumber: 3 }]));
+      throw new Error("private worker error");
+    });
+    const response = await POST(request());
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      documentId: "doc-1",
+      jobId: "job-1",
+      outputTarget: "accessible_pdf",
+    });
+    expect(updated.set).not.toHaveBeenCalledWith(
+      expect.objectContaining({ status: "failed" })
+    );
+    expect(inserted.has(jobEvents)).toBe(false);
+    expect(artifactValues()).toEqual([]);
+  });
+
+  it("honors expiry when recording an unexpected engine rejection", async () => {
+    mocks.repairNativePdf.mockImplementationOnce(async () => {
+      mocks.withRetainedDocument.mockRejectedValueOnce(
+        new DocumentUnavailableError()
+      );
+      throw new Error("private worker error");
+    });
+    const response = await POST(request());
+    expect(response.status).toBe(410);
+    expect(updated.set).not.toHaveBeenCalledWith(
+      expect.objectContaining({ status: "failed" })
+    );
+    expect(inserted.has(jobEvents)).toBe(false);
+    expect(artifactValues()).toEqual([]);
+  });
+
   it.each(["output.pdf", "review.json"])(
     "retains both model stages if %s cannot be saved",
     async (failedFile) => {
