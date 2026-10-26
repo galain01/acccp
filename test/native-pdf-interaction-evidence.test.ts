@@ -134,7 +134,9 @@ describe("reviewed PDF form interaction evidence", () => {
     expect(summary.scopeNote).toContain("not rerun");
     expect(summary.scopeNote).toContain("listed actions");
     expect(summary.scopeNote).not.toContain("do not cover every control");
-    expect(tests.coverage.some((check) => check.action === "signing")).toBe(false);
+    expect(tests.coverage.some((check) => check.action === "signing")).toBe(
+      false
+    );
     expect(JSON.stringify(summary)).not.toContain("ACCESSIBILITY TEST ONLY");
   });
   it.each([
@@ -211,7 +213,9 @@ describe("reviewed PDF form interaction evidence", () => {
       newDefect,
       unsupported,
     ]);
-    expect(result.some((finding) => finding.code === "form-remaining-controls")).toBe(false);
+    expect(
+      result.some((finding) => finding.code === "form-remaining-controls")
+    ).toBe(false);
   });
   it("retains an error even if it uses the legacy reminder code", () => {
     const { state } = fixture();
@@ -259,9 +263,12 @@ describe("reviewed PDF form interaction evidence", () => {
       ...tests,
       coverage: tests.coverage.map((check) => ({
         ...check,
-        fieldIds: check.fieldIds.filter((id) =>
-          !(check.action === "keyboard-navigation" && id === firstSegment.fieldId) &&
-          !(check.action === "save-reopen" && id === firstChoice.fieldId)
+        fieldIds: check.fieldIds.filter(
+          (id) =>
+            !(
+              check.action === "keyboard-navigation" &&
+              id === firstSegment.fieldId
+            ) && !(check.action === "save-reopen" && id === firstChoice.fieldId)
         ),
       })),
       remainingReviewCoverage: [],
@@ -330,15 +337,25 @@ describe("reviewed PDF form interaction evidence", () => {
       message: "The field description conflicts with the nearby instruction.",
     };
     expect(
-      reconcileNativePdfInteractionFindings([generic, font], [allControls, defect], state, tests)
+      reconcileNativePdfInteractionFindings(
+        [generic, font],
+        [allControls, defect],
+        state,
+        tests
+      )
     ).toEqual([font, ...tests.remainingReviews, defect]);
   });
   it("describes test scope honestly when no registered reminders remain", () => {
     const { state } = fixture();
     const tests = getNativePdfInteractionTests(state, record.sourceSha256)!;
-    const summary = nativePdfInteractionSummary({ ...tests, remainingReviews: [] });
+    const summary = nativePdfInteractionSummary({
+      ...tests,
+      remainingReviews: [],
+    });
     expect(summary.scopeNote).toContain("not rerun");
-    expect(summary.scopeNote).toContain("Other PDF readers and unlisted actions");
+    expect(summary.scopeNote).toContain(
+      "Other PDF readers and unlisted actions"
+    );
     expect(summary.scopeNote).not.toContain("listed below");
   });
   it.each(["signing", "dating", "certification-crossout"] as const)(
@@ -350,12 +367,18 @@ describe("reviewed PDF form interaction evidence", () => {
         ...request(fields[0].fieldId),
         interactionReview: { basis: "not-tested", action, fieldIds: [] },
       };
-      expect(tests.coverage.some((check) => check.action === action)).toBe(false);
+      expect(tests.coverage.some((check) => check.action === action)).toBe(
+        false
+      );
       const remaining = tests.remainingReviewCoverage.filter(
         (check) => check.action === action
       );
       expect(remaining).toHaveLength(1);
-      expect(tests.remainingReviews.some((review) => review.code === remaining[0].reviewCode)).toBe(true);
+      expect(
+        tests.remainingReviews.some(
+          (review) => review.code === remaining[0].reviewCode
+        )
+      ).toBe(true);
       expect(
         reconcileNativePdfInteractionFindings([], [reminder], state, tests)
       ).toEqual(tests.remainingReviews);

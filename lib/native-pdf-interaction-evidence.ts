@@ -161,18 +161,18 @@ export const NATIVE_PDF_INTERACTION_TESTS: readonly InteractionTestRecord[] = [
       },
     ],
     remainingReviewCoverage: [
-      ...([
-        ["signing", "form-signing-method"],
-        ["dating", "form-dating-method"],
-        ["certification-crossout", "form-certification-crossout-method"],
-      ] as const).map(
-        ([action, reviewCode]) => ({
-          reviewCode,
-          pageNumber: 1,
-          action,
-          fieldNames: [],
-        })
-      ),
+      ...(
+        [
+          ["signing", "form-signing-method"],
+          ["dating", "form-dating-method"],
+          ["certification-crossout", "form-certification-crossout-method"],
+        ] as const
+      ).map(([action, reviewCode]) => ({
+        reviewCode,
+        pageNumber: 1,
+        action,
+        fieldNames: [],
+      })),
     ],
   },
 ];
