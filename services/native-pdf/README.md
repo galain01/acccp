@@ -149,9 +149,20 @@ the existing processing limits and preservation checks in place.
 
 ## Verification
 
+From the repository root, use Python 3.12 (the production minor version) and
+an isolated environment with the exact dependencies in `requirements.txt`:
+
 ```text
+python -m pip install --disable-pip-version-check --only-binary=:all: -r services/native-pdf/requirements.txt
+python -m pip check
 python -m unittest discover -s services/native-pdf -p "test_*.py"
 ```
+
+The existing Linux CI test job runs this full suite with the same pinned
+`pypdf`, `pypdfium2`, and `Pillow` versions used by the worker. Wheel-only
+installation rejects a source-build fallback. Installation and test steps each
+have a five-minute ceiling; no extra CI job, hosted service, or Java-tool
+download is needed. These checks run before the existing TypeScript checks.
 
 The worker tests cover saved-file changes and pixel/content preservation,
 authored alternatives, simple native table headers with paragraph children,
@@ -161,12 +172,29 @@ complete validator evidence, and honest
 evidence for pages without selectable text. HTTP tests exercise authentication,
 ambiguous headers, input limits, capacity, subprocess credential isolation,
 actual timeout cleanup and controlled failures.
-The existing Linux CI job also runs the standard-library supervisor tests,
-including a synthetic processor that exits while its child remains alive.
+The full suite includes the supervisor tests and a synthetic processor that
+exits while its child remains alive.
 The `/proc`-based integration check is explicitly skipped on other platforms;
 deadline and cleanup-order regression tests run on both Windows and Linux.
 Stored-transport tests also cover URL scope, verified TLS, redirects, bounded
 reads, exact hashes, child credential isolation and download timeout cleanup.
+
+Tests construct synthetic PDFs in memory or temporary directories and use
+real saved-file inspection, PDFium rendering, and preservation comparisons.
+The HTTP supervisor tests open only local loopback sockets and launch
+temporary Python helpers; remote transport connections are mocked. Tests
+import the synthetic fixture builders from `build-smoke.py` without running
+its guarded `main`, and they do not import or execute `install-tools.py`.
+No model calls, uploaded documents, application credentials, or production
+services are used.
+
+The suite does not execute the Java tagging and validation tools; validator
+responses are mocked. It does not replace the separate installed-tool
+container smoke test, interactive Adobe/XFA or
+screen-reader testing, or a release review. In particular, PDFium can warn
+that its binary lacks XFA support: the synthetic tests check preserved native
+appearance and form metadata, not XFA behavior in an interactive reader.
+Passing CI does not establish PDF/UA conformance for arbitrary documents.
 
 On 2026-10-21 the local HTTP service successfully prepared and repaired the
 synthetic workshop PDF with the real pinned Java tools. The output retained

@@ -17,10 +17,8 @@ jobs:
           node-version: 24
           cache: npm
 
-      # npm install instead of npm ci: the lockfile is maintained on Windows, where
-      # npm drops wasm/Linux-only optional deps that npm ci on Linux then requires
       - name: Install dependencies
-        run: npm install
+        run: npm ci --ignore-scripts
 
       - name: Check formatting
         run: npm run format:check
@@ -34,22 +32,55 @@ jobs:
         with:
           python-version: '3.12'
 
-      # Standard-library tests only: no Java tools, external documents or services.
-      - name: Check native PDF supervisor lifecycle
-        run: python -m unittest discover -s services/native-pdf -p "test_server*.py"
+      # Exact production dependency versions, wheels only; no package build scripts.
+      - name: Install native PDF test dependencies
+        timeout-minutes: 5
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: -r services/native-pdf/requirements.txt
+
+      # Synthetic fixtures and loopback HTTP only. Java tools and remote calls are mocked.
+      - name: Check native PDF engine and supervisor
+        timeout-minutes: 5
+        run: |
+          python -m pip check
+          python -m unittest discover -s services/native-pdf -p "test_*.py"
 
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
 
-      # npm install instead of npm ci: the lockfile is maintained on Windows, where
-      # npm drops wasm/Linux-only optional deps that npm ci on Linux then requires
       - name: Install dependencies
-        run: npm install
+        run: npm ci --ignore-scripts
 
       - name: Typecheck
         run: npm run typecheck
 
       - name: Run tests
         run: npm run test
+
+      - name: Install isolated PostgreSQL test runtime
+        timeout-minutes: 3
+        run: npm ci --prefix .github/test-runtime --ignore-scripts
+
+      - name: Verify immutable artifact publication
+        timeout-minutes: 3
+        env:
+          PGLITE_RUNTIME_DIR: ${{ github.workspace }}/.github/test-runtime
+        run: node node_modules/vitest/vitest.mjs run --config test/conversion-publication-postgres.config.mjs
+
+      # Synthetic build/runtime checks: no production credentials or services.
+      - name: Build and verify traced PDF rendering
+        timeout-minutes: 5
+        env:
+          DATABASE_URL: postgresql://build:build@127.0.0.1:1/acccp_build
+          SUPABASE_URL: http://127.0.0.1:1
+          SUPABASE_SERVICE_ROLE_KEY: build-placeholder-not-a-credential
+          BETTER_AUTH_SECRET: build-only-placeholder-not-a-real-secret-20261026
+          BETTER_AUTH_URL: http://localhost:3000
+          NEXT_TELEMETRY_DISABLED: '1'
+        run: npm run build
+
+      - name: Verify signed-out framework runtime
+        timeout-minutes: 2
+        run: node scripts/check-framework-runtime.mjs

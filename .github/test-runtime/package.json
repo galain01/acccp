@@ -1,0 +1,9 @@
+{
+  "name": "pglite-runtime",
+  "private": true,
+  "packageManager": "npm@11.11.0",
+  "dependencies": {
+    "@electric-sql/pglite": "0.5.8",
+    "drizzle-orm": "0.45.2"
+  }
+}
