@@ -208,6 +208,39 @@ try {
   assert.equal(JSON.parse(session.text), null);
   checks.push("auth session: signed out");
 
+  // These small bodies must reach Better Auth through Next's real request
+  // proxy. An oversized body exits before request reconstruction and cannot
+  // catch ordinary login failures. Invalid domains prevent DB/email access.
+  for (const [path, body] of [
+    [
+      "/api/auth/email-otp/send-verification-otp",
+      { email: "synthetic@example.invalid", type: "sign-in" },
+    ],
+    [
+      "/api/auth/sign-in/email-otp",
+      { email: "synthetic@example.invalid", otp: "000000" },
+    ],
+  ]) {
+    const result = await request(base, path, {
+      method: "POST",
+      headers: { Origin: base, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    assert.equal(result.response.status, 403, `${path}: email-domain gate`);
+    assert.equal(
+      JSON.parse(result.text).message,
+      "Sign-in is restricted to @osu.edu email addresses."
+    );
+    checks.push(`${path}: ordinary POST reaches email-domain gate`);
+  }
+  const malformedAuth = await request(base, "/api/auth/sign-in/email-otp", {
+    method: "POST",
+    headers: { Origin: base, "Content-Type": "application/json" },
+    body: "{",
+  });
+  assert.equal(malformedAuth.response.status, 400);
+  checks.push("auth malformed JSON: 400 before service access");
+
   const oversizedAuth = await request(base, "/api/auth/sign-in/email-otp", {
     method: "POST",
     headers: { Origin: base, "Content-Type": "application/json" },

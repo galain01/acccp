@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { NextRequest } from "next/server";
 
 const fixture = vi.hoisted(() => {
   process.env.BETTER_AUTH_URL = "https://acccp.example";
@@ -43,9 +44,23 @@ vi.mock("better-auth/adapters/drizzle", async () => {
 
 import { GET, POST } from "@/app/api/auth/[...all]/route";
 
+function frameworkRequest(
+  url: string,
+  init?: ConstructorParameters<typeof NextRequest>[1]
+): Request {
+  // Match Next's app-route request proxy getter/method binding. Native Request
+  // or NextRequest alone does not exercise the production proxy boundary.
+  return new Proxy(new NextRequest(url, init), {
+    get(target, property) {
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
 function post(path: string, body: unknown) {
   return POST(
-    new Request(`https://acccp.example/api/auth${path}`, {
+    frameworkRequest(`https://acccp.example/api/auth${path}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -69,7 +84,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("bounded real Better Auth parsing", () => {
+describe("bounded real Better Auth parsing with framework-proxied requests", () => {
   it("preserves the ordinary OTP, session cookie, session lookup and sign-out flow", async () => {
     const email = "synthetic@osu.edu";
     const sent = await post("/email-otp/send-verification-otp", {
@@ -87,16 +102,21 @@ describe("bounded real Better Auth parsing", () => {
     );
     const cookie = cookies.map((value) => value.split(";")[0]).join("; ");
     const session = await GET(
-      new Request("https://acccp.example/api/auth/get-session", {
+      frameworkRequest("https://acccp.example/api/auth/get-session", {
         headers: { Cookie: cookie },
       })
     );
     expect(session.status).toBe(200);
     expect((await session.json()).user.email).toBe(email);
     const signedOut = await POST(
-      new Request("https://acccp.example/api/auth/sign-out", {
+      frameworkRequest("https://acccp.example/api/auth/sign-out", {
         method: "POST",
-        headers: { Cookie: cookie, Origin: "https://acccp.example" },
+        headers: {
+          Cookie: cookie,
+          Origin: "https://acccp.example",
+          "Content-Type": "application/json",
+        },
+        body: "{}",
       })
     );
     expect(signedOut.status).toBe(200);
@@ -131,7 +151,7 @@ describe("bounded real Better Auth parsing", () => {
 
   it("keeps invalid small JSON as the auth handler's normal client error", async () => {
     const response = await POST(
-      new Request("https://acccp.example/api/auth/sign-in/email-otp", {
+      frameworkRequest("https://acccp.example/api/auth/sign-in/email-otp", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: "{",
