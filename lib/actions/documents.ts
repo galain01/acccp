@@ -60,8 +60,10 @@ export async function listDocuments(
           uploadedAt: documents.createdAt,
           jobId: conversionJobs.id,
           status: conversionJobs.status,
+          attemptCount: conversionJobs.attemptCount,
           errorMessage: conversionJobs.errorMessage,
           outputTarget: conversionJobs.outputTarget,
+          sourceReady: sql<boolean>`${documents.uploadCompletedAt} is not null or ${documents.uploadExpiresAt} is null`,
           savedOutputArtifactId: sql<string | null>`(
         select ${artifacts.id} from ${artifacts}
         where ${artifacts.jobId} = ${conversionJobs.id}
@@ -180,12 +182,24 @@ export async function listDocuments(
           name: row.name,
           size: row.size,
           uploadedAt: new Date(row.uploadedAt),
-          status: toConversionStatus(row.status),
+          status:
+            row.status === "queued" && row.attemptCount === 0
+              ? row.sourceReady
+                ? "idle"
+                : "error"
+              : toConversionStatus(row.status),
+          sourceReady: row.sourceReady,
           hasAvailableOutput: Boolean(row.savedOutputArtifactId),
           savedOutputArtifactId: row.savedOutputArtifactId ?? undefined,
           // `documents` has no locked column, so the lock resets on reload.
           locked: false,
-          errorMessage: row.errorMessage ?? undefined,
+          errorMessage:
+            row.errorMessage ??
+            (row.status === "queued" &&
+            row.attemptCount === 0 &&
+            !row.sourceReady
+              ? "The source upload did not finish. Select the file again to continue."
+              : undefined),
           errors: row.jobId ? findingsByJobId.get(row.jobId) : undefined,
         }));
     },

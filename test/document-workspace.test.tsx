@@ -27,6 +27,13 @@ vi.mock("@/lib/document-upload-client", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/document-upload-client")>()),
   uploadPowerPointDocument: vi.fn(),
 }));
+vi.mock("@/lib/document-submission-client", async (importOriginal) => ({
+  ...(await importOriginal<
+    typeof import("@/lib/document-submission-client")
+  >()),
+  prepareDocumentSubmission: vi.fn(),
+  cancelDocumentSubmission: vi.fn().mockResolvedValue(undefined),
+}));
 
 // Only replace the browser file picker. Selection, status changes, buttons,
 // and request construction remain the actual workspace and document table.
@@ -63,6 +70,10 @@ import {
   uploadPowerPointDocument,
 } from "@/lib/document-upload-client";
 import { getPowerPointReview } from "@/lib/actions/powerpoint-review";
+import {
+  prepareDocumentSubmission,
+  cancelDocumentSubmission,
+} from "@/lib/document-submission-client";
 
 const SESSION_ID = "synthetic-session";
 let host: HTMLDivElement;
@@ -224,6 +235,19 @@ function requests(): FormData[] {
 }
 
 beforeEach(() => {
+  vi.mocked(prepareDocumentSubmission)
+    .mockReset()
+    .mockImplementation(async ({ file, onPrepared }) => {
+      const prepared = {
+        documentId: `prepared-${file.name}`,
+        submissionToken: `token-${file.name}`,
+        expiresAt: new Date(Date.now() + 600_000).toISOString(),
+        checksumSha256: "a".repeat(64),
+      };
+      onPrepared(prepared);
+      return prepared;
+    });
+  vi.mocked(cancelDocumentSubmission).mockClear().mockResolvedValue(undefined);
   vi.mocked(deleteDocument).mockResolvedValue(undefined);
   vi.mocked(listDocuments)
     .mockReset()
@@ -264,6 +288,98 @@ afterEach(async () => {
 });
 
 describe("DocumentWorkspace conversion selection", () => {
+  it("retries an unready saved source with the same file and prepared token", async () => {
+    await mountHtmlWorkflow();
+    await upload("uncertain.pdf");
+    fetchMock.mockRejectedValueOnce(
+      new TypeError("upload acknowledgement lost")
+    );
+    vi.mocked(listDocuments).mockResolvedValue([
+      savedDocument("prepared-uncertain.pdf", "error", {
+        outputTarget: "canvas_html",
+        sourceReady: false,
+      }),
+    ]);
+    await click(button("Improve accessibility"));
+    await click(button("Improve accessibility"));
+    const submitted = requests();
+    expect(submitted).toHaveLength(2);
+    expect(submitted[1].get("submissionToken")).toBe("token-uncertain.pdf");
+    expect(submitted[1].has("documentId")).toBe(false);
+    expect((submitted[1].get("file") as File).name).toBe("uncertain.pdf");
+    expect(prepareDocumentSubmission).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels a preparation learned after removal before sending any source bytes", async () => {
+    let finish!: () => void;
+    vi.mocked(prepareDocumentSubmission).mockImplementationOnce(
+      ({ onPrepared }) =>
+        new Promise((resolve) => {
+          finish = () => {
+            const prepared = {
+              documentId: "late-prepared",
+              submissionToken: "late-token",
+              expiresAt: new Date(Date.now() + 600_000).toISOString(),
+              checksumSha256: "a".repeat(64),
+            };
+            onPrepared(prepared);
+            resolve(prepared);
+          };
+        })
+    );
+    await mount();
+    await upload("removed.pdf");
+    await click(button("Improve accessibility"));
+    await click(button("Remove removed.pdf"));
+    await act(async () => finish());
+    expect(cancelDocumentSubmission).toHaveBeenCalledExactlyOnceWith(
+      "late-token"
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(host.querySelectorAll("tbody tr")).toHaveLength(0);
+  });
+
+  it("reports an unconfirmed cancellation without claiming the saved source was deleted", async () => {
+    let finish!: () => void;
+    vi.mocked(uploadPowerPointDocument).mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          finish = () => reject(new DOMException("Aborted", "AbortError"));
+        })
+    );
+    vi.mocked(cancelDocumentSubmission).mockRejectedValue(new Error("offline"));
+    await mount();
+    await upload("removed.pptx");
+    await click(button("Improve accessibility"));
+    await click(button("Remove removed.pptx"));
+    await act(async () => finish());
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain(
+      "cancellation could not be confirmed"
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("recovers a first-upload response loss using the identity learned before sending bytes", async () => {
+    await mountHtmlWorkflow();
+    await upload("new.pdf");
+    fetchMock.mockRejectedValueOnce(new TypeError("response lost"));
+    vi.mocked(listDocuments).mockResolvedValue([
+      savedDocument("prepared-new.pdf", "success", {
+        outputTarget: "canvas_html",
+        sourceReady: true,
+        savedOutputArtifactId: "saved-artifact",
+        hasAvailableOutput: true,
+      }),
+    ]);
+    await click(button("Improve accessibility"));
+    expect(prepareDocumentSubmission).toHaveBeenCalledTimes(1);
+    expect(requests()[0].get("submissionToken")).toBe("token-new.pdf");
+    expect(listDocuments).toHaveBeenCalledWith(SESSION_ID);
+    expect(row("new.pdf").textContent).toContain("Success");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(isDisabled(button("Improve accessibility"))).toBe(true);
+  });
+
   it.each(["http", "network"])(
     "reloads the earlier result after a confirmed %s retry failure",
     async (failure) => {
@@ -505,6 +621,12 @@ describe("DocumentWorkspace conversion selection", () => {
   });
 
   it("retries a saved native Word failure with its fixed target and document ID", async () => {
+    vi.mocked(listDocuments).mockResolvedValue([
+      savedDocument("word-saved", "error", {
+        outputTarget: "accessible_docx",
+        sourceReady: true,
+      }),
+    ]);
     fetchMock.mockResolvedValueOnce({
       ok: false,
       json: async () => ({
@@ -574,7 +696,7 @@ describe("DocumentWorkspace conversion selection", () => {
     expect(deleteDocument).not.toHaveBeenCalled();
   });
 
-  it("deletes an incomplete upload reservation and retries with a fresh reservation", async () => {
+  it("retains an uncertain upload and retries the same prepared identity", async () => {
     vi.mocked(uploadPowerPointDocument).mockImplementationOnce(
       async ({ onReserved }) => {
         onReserved("failed-upload");
@@ -585,11 +707,16 @@ describe("DocumentWorkspace conversion selection", () => {
     await selectOutput("original");
     await upload("retry.pptx");
     await click(button("Improve accessibility"));
-    expect(deleteDocument).toHaveBeenCalledExactlyOnceWith("failed-upload");
+    expect(deleteDocument).not.toHaveBeenCalled();
+    expect(cancelDocumentSubmission).not.toHaveBeenCalled();
     expect(fetchMock).not.toHaveBeenCalled();
     expect(row("retry.pptx").textContent).toContain("Error");
     await click(button("Improve accessibility"));
     expect(uploadPowerPointDocument).toHaveBeenCalledTimes(2);
+    expect(prepareDocumentSubmission).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(uploadPowerPointDocument).mock.calls[0][0].prepared).toBe(
+      vi.mocked(uploadPowerPointDocument).mock.calls[1][0].prepared
+    );
     expect(requests()[0].get("documentId")).toBe("uploaded-retry.pptx");
     expect(row("retry.pptx").textContent).toContain("Ready to review");
   });
@@ -612,7 +739,10 @@ describe("DocumentWorkspace conversion selection", () => {
     await click(button("Improve accessibility"));
     await click(button("Remove removed.pptx"));
     await act(async () => finishReservation());
-    expect(deleteDocument).toHaveBeenCalledExactlyOnceWith("late-reservation");
+    expect(cancelDocumentSubmission).toHaveBeenCalledExactlyOnceWith(
+      "token-removed.pptx"
+    );
+    expect(deleteDocument).not.toHaveBeenCalled();
     expect(fetchMock).not.toHaveBeenCalled();
     expect(host.querySelectorAll("tbody tr")).toHaveLength(0);
   });
@@ -638,7 +768,10 @@ describe("DocumentWorkspace conversion selection", () => {
     await click(button("Improve accessibility"));
     await click(button("Remove removed.pptx"));
     expect(uploadSignal.aborted).toBe(true);
-    expect(deleteDocument).toHaveBeenCalledExactlyOnceWith("pending-storage");
+    expect(cancelDocumentSubmission).toHaveBeenCalledExactlyOnceWith(
+      "token-removed.pptx"
+    );
+    expect(deleteDocument).not.toHaveBeenCalled();
     expect(fetchMock).not.toHaveBeenCalled();
     expect(host.querySelectorAll("tbody tr")).toHaveLength(0);
   });
@@ -711,7 +844,7 @@ describe("DocumentWorkspace conversion selection", () => {
 
   it("updates the saved row and reopened result with findings for the chosen PowerPoint version", async () => {
     vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
-    vi.mocked(getPowerPointReview).mockResolvedValue({
+    vi.mocked(getPowerPointReview).mockResolvedValueOnce({
       revisionToken: "a".repeat(64),
       changes: [
         {
@@ -730,12 +863,21 @@ describe("DocumentWorkspace conversion selection", () => {
       reviewedChangeIds: [],
       descriptionEdits: {},
     });
+    vi.mocked(getPowerPointReview).mockResolvedValue({
+      revisionToken: "b".repeat(64),
+      changes: [],
+      findings: [],
+      includedChangeIds: [],
+      reviewedChangeIds: [],
+      descriptionEdits: {},
+    });
     fetchMock.mockResolvedValueOnce({
       ok: true,
       json: async () => ({
         url: "https://storage.example.test/selected.pptx",
         filename: "selected.pptx",
         revisionToken: "b".repeat(64),
+        savedOutputArtifactId: "f2063de0-12a9-4e5b-993d-572fcb673690",
         changes: [],
         findings: [
           {
@@ -759,8 +901,15 @@ describe("DocumentWorkspace conversion selection", () => {
     ]);
     await click(button("lecture.pptx"));
     await click(button("Review changes", document.body));
+    expect(getPowerPointReview).toHaveBeenCalledOnce();
     await click(button("Restore original", document.body));
     await click(button("Check and download PowerPoint", document.body));
+    expect(getPowerPointReview).toHaveBeenCalledTimes(2);
+    expect(document.body.textContent).toContain(
+      "No applied changes were recorded for this presentation."
+    );
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/powerpoint-review");
     expect(row("lecture.pptx").textContent).toContain("Needs a fix");
     expect(document.body.textContent).toContain(
       "Restoring this change leaves the slide without an identified title."
@@ -771,7 +920,13 @@ describe("DocumentWorkspace conversion selection", () => {
       "Restoring this change leaves the slide without an identified title."
     );
     expect(button("Download PowerPoint", document.body)).toBeDefined();
-    expect(getPowerPointReview).toHaveBeenCalledOnce();
+    await click(button("Download PowerPoint", document.body));
+    expect(getDocumentOutputDownload).toHaveBeenLastCalledWith(
+      "lecture",
+      "accessible_pptx",
+      "f2063de0-12a9-4e5b-993d-572fcb673690"
+    );
+    expect(getPowerPointReview).toHaveBeenCalledTimes(2);
   });
   it("keeps each upload's output format when the selector changes and skips completed PowerPoints", async () => {
     await mountHtmlWorkflow([
@@ -1231,6 +1386,12 @@ describe("DocumentWorkspace conversion selection", () => {
   });
 
   it("retries a failed newly uploaded document using the source the server already saved", async () => {
+    vi.mocked(listDocuments).mockResolvedValue([
+      savedDocument("saved-before-model-error", "error", {
+        outputTarget: "canvas_html",
+        sourceReady: true,
+      }),
+    ]);
     fetchMock.mockResolvedValueOnce({
       ok: false,
       json: async () => ({

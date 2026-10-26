@@ -449,7 +449,8 @@ export default function ConversionResultDialog({
                 onExportComplete={(result) => {
                   setReviewedSnapshot({
                     documentId,
-                    artifactId: savedOutputArtifactId,
+                    artifactId:
+                      result.savedOutputArtifactId ?? savedOutputArtifactId,
                     result,
                   });
                   onReviewExport?.(result);

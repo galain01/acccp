@@ -11,10 +11,12 @@ export type ConversionStatus =
   | "error";
 
 export interface UploadedDocument {
-  /** Stable key for the UI. Equals `documentId` once the document is persisted. */
+  /** Stable key for the UI; saved rows use `documentId`, local rows keep their key. */
   id: string;
-  /** documents.id. Present after the source is saved, before or during conversion. */
+  /** Server-assigned identity, available before persistence for prepared submissions. */
   documentId?: string;
+  /** The original source has been verified; false reservations cannot be converted by ID yet. */
+  sourceReady?: boolean;
   jobId?: string;
   /** Implemented destination; fixed once processing starts. Legacy rows default to HTML. */
   outputTarget?: OutputTarget;

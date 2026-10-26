@@ -29,6 +29,34 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("private PowerPoint browser upload", () => {
+  it("reuses a verified prepared source after an uncertain PUT instead of uploading again", async () => {
+    fetchMock
+      .mockReset()
+      .mockResolvedValueOnce(
+        Response.json({ documentId: "reserved-document", sourceReady: true })
+      );
+    const prepared = {
+      documentId: "reserved-document",
+      submissionToken: "signed.preparation",
+      checksumSha256: "a".repeat(64),
+      expiresAt: new Date(Date.now() + 600_000).toISOString(),
+    };
+    await expect(
+      uploadPowerPointDocument({
+        file: file(),
+        sessionId: "session",
+        signal: new AbortController().signal,
+        onReserved: vi.fn(),
+        prepared,
+      })
+    ).resolves.toBe("reserved-document");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toMatchObject({
+      submissionToken: prepared.submissionToken,
+      checksumSha256: prepared.checksumSha256,
+    });
+  });
+
   it("explains the unfinished-upload limit without encouraging immediate retries", async () => {
     fetchMock
       .mockReset()
@@ -42,7 +70,7 @@ describe("private PowerPoint browser upload", () => {
         onReserved,
       })
     ).rejects.toThrow(
-      "Too many unfinished PowerPoint uploads. Finish an existing upload, or wait up to three hours for abandoned uploads to clear."
+      "Too many unfinished PowerPoint uploads. Finish an existing upload, or wait for unfinished upload windows to expire."
     );
     expect(onReserved).not.toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledTimes(1);

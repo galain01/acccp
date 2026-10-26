@@ -107,6 +107,8 @@ function makeDocRow(
     uploadedAt: string;
     jobId: string | null;
     status: string | null;
+    sourceReady: boolean;
+    attemptCount: number;
     errorMessage: string | null;
     outputTarget: string;
     interactionTestSummary: unknown;
@@ -151,6 +153,22 @@ function expectRetainedScope(condition: SQL) {
 
 describe("listDocuments", () => {
   beforeEach(() => vi.clearAllMocks());
+
+  it.each([false, true])(
+    "makes an unstarted reservation recoverable with sourceReady=%s",
+    async (sourceReady) => {
+      vi.mocked(db.select).mockReturnValueOnce(
+        makeChain([
+          makeDocRow({ status: "queued", attemptCount: 0, sourceReady }),
+        ])
+      );
+      const [row] = await listDocuments("session-1");
+      expect(row.status).toBe(sourceReady ? "idle" : "error");
+      expect(row.sourceReady).toBe(sourceReady);
+      if (!sourceReady)
+        expect(row.errorMessage).toContain("upload did not finish");
+    }
+  );
 
   const interactionTestSummary = {
     evidenceId: "synthetic-form-test",

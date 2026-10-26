@@ -370,6 +370,7 @@ export default function DocumentTable({
             ...selectedDocument,
             errors: result.findings,
             changes: result.changes,
+            savedOutputArtifactId: result.savedOutputArtifactId,
           });
           onReviewExport?.(selectedDocument.id, result);
         }}
