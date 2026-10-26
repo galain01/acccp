@@ -208,9 +208,24 @@ try {
   assert.equal(JSON.parse(session.text), null);
   checks.push("auth session: signed out");
 
+  const oversizedAuth = await request(base, "/api/auth/sign-in/email-otp", {
+    method: "POST",
+    headers: { Origin: base, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      email: "synthetic@osu.edu",
+      padding: "x".repeat(32 * 1024),
+    }),
+  });
+  assert.equal(oversizedAuth.response.status, 413);
+  assert.deepEqual(JSON.parse(oversizedAuth.text), {
+    error: "Request body is too large.",
+  });
+  checks.push("auth body limit: 413 before service access");
+
   for (const path of [
     "/api/convert",
     "/api/document-upload",
+    "/api/document-submission",
     "/api/powerpoint-review",
     "/api/admin/model-info",
   ]) {
@@ -223,6 +238,14 @@ try {
     assert.deepEqual(JSON.parse(text), { error: "Unauthorized" });
     checks.push(`${path}: 401`);
   }
+  const cancellation = await request(base, "/api/document-submission", {
+    method: "DELETE",
+    headers: { Origin: base, "Content-Type": "application/json" },
+    body: "{}",
+  });
+  assert.equal(cancellation.response.status, 401);
+  assert.deepEqual(JSON.parse(cancellation.text), { error: "Unauthorized" });
+  checks.push("/api/document-submission DELETE: 401");
   const action = await request(base, "/dashboard", {
     method: "POST",
     headers: {
@@ -249,7 +272,15 @@ try {
     0,
     "Signed-out smoke reached a configured service"
   );
-  console.log(JSON.stringify({ next: version, checks, serviceContacts }));
+  console.log(
+    JSON.stringify({
+      next: version,
+      node: process.version,
+      bundledUndici: process.versions.undici ?? null,
+      checks,
+      serviceContacts,
+    })
+  );
 } finally {
   stop.abort();
   clearTimeout(deadline);

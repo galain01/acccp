@@ -1,6 +1,123 @@
 # Dependency security review — 2026-10-26
 
-**Release verdict: do not claim production readiness from this reliability patch.** The follow-up below fixes the confirmed Next.js/Sharp dependency blocker in source. Other application dependencies and development tools still require upgrades or verified exclusions, and no deployment was performed. This review makes no claim that an exploit succeeded against ACCCP.
+**Release verdict: the reviewed source fixes do not establish production readiness.** Next/Sharp and the application Zod 4 dependency are patched, and authentication POST bodies are now bounded before parsing. The remaining 19 audit entries have observed CLI/build/test paths, not 19 demonstrated application-runtime vulnerabilities. Candidate build evidence, hosted Node inventory and the explicit stop conditions below still apply. No deployment or exploit against ACCCP was performed.
+
+## Recovery follow-up: authentication and remaining dependency exposure
+
+Reviewed on **2026-10-26**, starting at
+`e2089405a5a7e5f9bf1b4440f604ce177011be6f`. Updated only the transitive
+`node_modules/zod` entry from **4.4.3 to 4.6.6**. Better Auth and its core
+package require `^4.3.6`, so the update stays inside their declared range.
+`package.json`, all other package entries and all optional-platform packages are
+unchanged; no override or new direct dependency was added. The application lock
+SHA-256 is `8a03ad26700ba18e5bff23357d346b2431b4204dec61b396bc763ec80db9581b`.
+
+The [Zod 4.6.6 release](https://github.com/colinhacks/zod/releases/tag/v4.6.6)
+and [maintainer fix](https://github.com/colinhacks/zod/pull/6652) address
+`GHSA-mrhx-c7xc-m3w5` by checking constrained collection sizes before walking
+their elements. Unbounded collections still need application limits. Reviewed
+the published tarball's manifest, entry points and collection-bound source
+before importing it in tests. It has no dependencies or installation lifecycle
+hooks; its SHA-512 matches registry integrity
+`4UmzQUF5fxvfcYHlbjBmejU+w+hbDnWFx4aS8kBx7nPBHcO2SqPbpAG8snbdg+Xse4pRefR98hgjFgIMCI/UhA==`.
+The release notes disclose reverted malicious Git commits that were never
+published to npm, and explain the rewritten provenance commit. Signature and
+attestation verification passed; this is provenance evidence, not a complete
+source-security audit. All installation lifecycle scripts remained disabled.
+
+The existing Next adapter passed the request directly to Better Auth;
+`better-call/dist/utils.mjs` reads JSON/forms without a byte limit on that path.
+The exposed `/sign-in/social` schema includes an unbounded `scopes` array and
+selects its configured provider after parsing. OTP-only configuration does not
+remove that parser. The auth POST wrapper now allows **32 KiB of actual bytes**
+and **10 seconds** to finish reading before delegation. It checks streamed
+bytes even with missing or understated Content-Length, cancels rejected input,
+and does not await an indefinitely pending cancellation. Safe 400/408/413
+responses contain no transport errors. GET and the auth response, including
+cookies, remain delegated unchanged. These are parser resource bounds, not a
+complete authentication or distributed-denial-of-service assessment.
+
+Synthetic regressions reproduce the former unbounded delegation and verify
+byte/timeout/cancellation limits, UTF-8 accounting, exact-limit input and
+response preservation. Tests use the real application Better Auth configuration
+with an in-memory UUID-generating adapter and mocked email/network to exercise
+OTP, the OSU domain gate, session lookup and sign-out. A separate regression
+checks that an oversized constrained Zod collection does not visit its elements.
+They do not verify hosted email delivery or a production database connection.
+
+Fresh local evidence is saved outside Git in `task/npm-audit-recovery.json`
+(SHA-256 `94b7bba641d3df0cfb40f67c7b4236fa8d4c77e9b76d62b8655708ba47a31595`)
+and `task/npm-signatures-recovery.log`: **19 entries, 3 critical / 8 high /
+8 moderate; 735 verified registry signatures and 200 verified attestations**.
+The audit's Zod finding now names **only**
+`node_modules/shadcn/node_modules/zod` (3.25.76), not the application Zod 4 copy.
+Thus a flat audit count does not show this application's dependency repair.
+
+### Exposure evidence and bounded deferrals
+
+The final local candidate build `kH2rJ76WzkyCwZ-PXBbMP` was also checked after
+the recovery implementation: **139 runtime source files, 18 NFT traces, 177 maps
+(171 server / 6 build), 69 indexed sections and 3,440 source entries**. The
+report has no read/parse errors or skipped symlinks/external map sections and
+retains the positive Zod server control. Only the patched application Zod 4
+appears among the audited packages in server maps; source-map-js remains in the
+build map only. No other named affected package appears in source imports,
+traces or mapped modules. Report SHA-256:
+`20cbecd20c3606b02f4bde117a7e8938b73454fa1ad70cdb7dafc6057bdd2a56`;
+trace/map inventory SHA-256:
+`6683e13157f4ea14c8fb5bb98b373b7e9f521f6141797361b4642b7b8824b721`.
+This is a local source/build snapshot; the reporter explicitly does not infer
+that its recorded Git HEAD identifies all then-uncommitted build inputs.
+
+The initial exposure review used the prior local build
+`xSM7kFaBfngrTenPXLvCo`, not a deployed artifact. It scanned **17 NFT traces**,
+**168 source maps** (162 server and 6 build), **69 indexed-map sections** and
+**3,327 decoded source entries**. It also searched **134 tracked non-test
+runtime source files** for imports/requires. Zod was present in three server
+chunk maps, providing a positive control. None of the other 18 advisory package
+entries appeared in the server traces or server source-module inventory.
+`source-map-js` appeared as 11 modules only in the build chunk map
+`node_modules_20v-8wlfss9m1._.js.map` (SHA-256
+`7b9c773ef6b899276370a305913a37146bbe30fcbb4f28b8b088de4ba39a6c07`).
+Better Auth's compiled plugin inventory contained email OTP, not its
+`test-utils` entry that imports Vitest. Framework-name/UA strings mentioning
+Express, Hono, jsdom or Vite were not treated as imports.
+
+| Remaining audit entries | Observed owner and disposition |
+|---|---|
+| shadcn 4.11.0; Zod 3.25.76 | Component-generation CLI; no runtime import/trace found. Keep Zod 3 with its consumer until a separately reviewed CLI update. Do not force Zod 4 into its `^3.24.1` dependency. |
+| MCP SDK 1.29.0; proxy-addr 2.0.7; body-parser 2.3.0; fast-uri 3.1.7; hono 4.13.7; ip-address 10.7.0 | shadcn's MCP/Express/Ajv/rate-limiter graph. No app server use found. Do not expose this CLI's server/OAuth features; remediate before using them. Compatible candidate floors include MCP 1.32.0, proxy-addr 2.0.8, body-parser 2.4.0, fast-uri 3.1.9 and hono 4.13.11; ip-address must exceed 10.7.3. Candidates still need package/source review. |
+| brace-expansion 1.1.18 / 5.0.9 | ESLint and shadcn/ts-morph glob processing. No uploaded-document input to patterns found. Candidate compatible patches 1.1.21 / 5.0.12 remain separate tooling work. |
+| source-map-js 1.2.1 | PostCSS build code constructs SourceMapConsumer; no request-path map consumer found. Candidate 1.2.2 is deferred. Do not feed attacker-supplied indexed source maps to this build tool. |
+| npm Undici 7.29.1 | jsdom test dispatcher; no app import/trace found. Candidate 7.30.1 is deferred. Updating it would not patch Node's independently bundled fetch implementation. |
+| Vitest 3.2.7; tinypool 1.1.1; @vitest/mocker 3.2.7; Vite 7.3.6 | Test runners/workers. Keep test servers off public networks. Vite 7.3.7 is a compatible candidate; Tinypool 2.1.2 exceeds Vitest 3's `^1.1.1` range and the mocker fix needs a coordinated Vitest upgrade. No arbitrary major override is introduced. |
+| drizzle-kit 0.31.10; @esbuild-kit/esm-loader 2.6.5; @esbuild-kit/core-utils 3.3.2; nested esbuild 0.18.20 | Database CLI and isolated schema-fixture tests. No esbuild dev server is started. Its fixed esbuild 0.25 line exceeds the loader's `~0.18.20` range; the audit's proposed Drizzle downgrade is not accepted. |
+
+These are explicit scoped deferrals, reviewed **2026-10-26**, not a blanket
+declaration that the packages are safe. Installation/dev/optional flags alone
+are not exposure evidence. Source maps and traces can omit dynamically loaded
+or unrepresented paths; static client bundles have no source maps. Named-package
+matching is not a complete inventory of separately vendored framework copies. Refresh the
+report against the final candidate build using
+`node scripts/report-dependency-exposure.mjs`, and investigate any new server
+inclusion before release. The earlier baseline tables below retain their
+historical installed versions; this section supersedes their current Zod and
+exposure conclusions.
+
+**Release stop conditions:**
+
+- Confirm the final candidate build and actual deployed artifact/runtime match
+  reviewed versions and exposures. A local trace is not deployment proof.
+- Inventory hosted Node and vendor backports. Local **Node 24.14.1 / bundled
+  Undici 7.24.4** is within the advisory range, independently of the npm copy.
+  Application global `fetch` calls make this an unresolved runtime question.
+- Stop and reassess any newly reachable affected package, public development
+  server, adversarial build input or failed auth/native regression. Tooling
+  upgrades remain due before exposing the affected tooling features.
+- This review does not cover Python/container/native-library advisories,
+  hosted configuration, real Office/Acrobat behavior or accessibility
+  conformance. Keep those separate release gates and the existing production
+  authorization limits.
 
 ## Follow-up: targeted framework update
 

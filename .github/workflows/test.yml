@@ -30,7 +30,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
       # Exact production dependency versions, wheels only; no package build scripts.
       - name: Install native PDF test dependencies
@@ -63,11 +63,14 @@ jobs:
         timeout-minutes: 3
         run: npm ci --prefix .github/test-runtime --ignore-scripts
 
-      - name: Verify immutable artifact publication
+      - name: Verify submission recovery and immutable publication
         timeout-minutes: 3
         env:
           PGLITE_RUNTIME_DIR: ${{ github.workspace }}/.github/test-runtime
-        run: node node_modules/vitest/vitest.mjs run --config test/conversion-publication-postgres.config.mjs
+        run: |
+          node node_modules/vitest/vitest.mjs run --config test/conversion-publication-postgres.config.mjs
+          node node_modules/vitest/vitest.mjs run --config test/document-submission-postgres.config.mjs
+          node node_modules/vitest/vitest.mjs run --config test/powerpoint-review-publication-postgres.config.mjs
 
       # Synthetic build/runtime checks: no production credentials or services.
       - name: Build and verify traced PDF rendering
@@ -78,7 +81,7 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: build-placeholder-not-a-credential
           BETTER_AUTH_SECRET: build-only-placeholder-not-a-real-secret-20261026
           BETTER_AUTH_URL: http://localhost:3000
-          NEXT_TELEMETRY_DISABLED: '1'
+          NEXT_TELEMETRY_DISABLED: "1"
         run: npm run build
 
       - name: Verify signed-out framework runtime
