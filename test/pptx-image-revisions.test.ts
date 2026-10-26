@@ -313,6 +313,7 @@ describe("added description-slide revision replay", () => {
       selected.inspection.slides[1].objects
         .map((object) => object.text)
         .join(" ")
+        .replace(/\s+/g, " ")
     ).toContain("Second enrollment chart");
   });
 
