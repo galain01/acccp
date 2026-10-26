@@ -130,9 +130,13 @@ def verify_generated_id_tree(before, after):
     # name-tree entry. Compare structural/catalog semantics after removing the sole
     # permitted addition from a private clone, never from either saved reader.
     # The worker's ordinary preservation check independently verifies pages.
+    # PdfWriter flattens hierarchical /Pages nodes when cloning a reader.
+    # Normalize both private operands identically; the raw saved-reader states
+    # above still bind all IDs, owners, parent relationships and tree entries.
+    baseline = PdfWriter(clone_from=before)
     stripped = PdfWriter(clone_from=after)
     del stripped.root_object['/StructTreeRoot'][NameObject('/IDTree')]
-    if (Canonicalizer(list(before.pages)).hash(before.trailer['/Root'])
+    if (Canonicalizer(list(baseline.pages)).hash(baseline.root_object)
             != Canonicalizer(list(stripped.pages)).hash(stripped.root_object)):
         raise NoteIdError('generated_id_tree_preservation')
 

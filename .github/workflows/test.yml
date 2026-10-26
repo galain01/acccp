@@ -56,6 +56,9 @@ jobs:
         run: |
           python -m pip check
           python -m unittest discover -s services/native-pdf -p "test_*.py"
+          python -m unittest discover -s research/native-pdf -p "test_native_pdf_validation.py"
+          python -m unittest discover -s research/native-pdf -p "test_navigation*.py"
+          python -m unittest discover -s research/native-pdf -p "test_link_grouping_repairs.py"
 
       - uses: actions/setup-node@v4
         with:

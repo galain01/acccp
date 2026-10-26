@@ -437,8 +437,8 @@ class NativePdfWorkerTests(unittest.TestCase):
             with self.subTest(plan=plan), self.assertRaisesRegex(worker.WorkerError, "invalid_plan"):
                 worker.apply_plan(self.reader, self.reader, plan, self.output)
 
-    def test_existing_alt_cannot_be_replaced_even_when_its_words_look_generic(self):
-        for description in ("Authored important information", "image 1", ""):
+    def test_useful_existing_alt_cannot_be_replaced(self):
+        for description in ("Authored important information", "Image 1: an important measured result."):
             original = worker.open_pdf(pdf_bytes(tagged=True, alt=description))
             tag = worker.enrich_inventory(original, original)["tags"][1]
             self.assertFalse(tag["editable"]["alt"])

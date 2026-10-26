@@ -7,11 +7,20 @@ import bounded_semantic_structure as semantic
 import bounded_table_structure as tables
 import bounded_reading_order as reading
 import bounded_chart_structure as charts
+import bounded_grid_table_structure as grids
+import bounded_artifact_reading as artifacts
+import bounded_excluded_figures as excluded_figures
+import bounded_interrupted_text as interrupted
+import bounded_false_list as false_lists
 
 
-MODULES = (tables, reading, charts)
+MODULES = (tables, grids, reading, charts, excluded_figures, interrupted, false_lists, artifacts)
 KINDS = {'rebuild_table': tables, 'move_callout': reading,
-         'move_page_continuation': reading, 'describe_chart': charts}
+         'move_page_continuation': reading, 'describe_chart': charts,
+         'rebuild_grid_table': grids, 'restore_artifact_text': artifacts,
+         'restore_excluded_figure': excluded_figures,
+         'join_interrupted_text': interrupted,
+         'restore_decimal_paragraphs': false_lists}
 
 
 def _inspection_for(reader, inspection):
@@ -84,7 +93,7 @@ def apply_operations(source_reader, writer, operations, *, _inspection=None):
         kwargs = {'_inspection': inspection}
         if module is not semantic:
             kwargs.update(_source_nodes=source_nodes, _target_nodes=target_nodes)
-        if module is reading:
+        if module in (reading, artifacts):
             kwargs['_prior_verifications'] = tuple(proofs)
         result = module.apply_operations(source_reader, writer, grouped[module], **kwargs)
         changes.extend(result['changes'])

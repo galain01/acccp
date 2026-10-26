@@ -447,14 +447,71 @@ export function parseNativePdfPlan(
     if (
       op.type === "repair_structure" &&
       Object.keys(op).every((key) =>
-        ["type", "tagId", "candidateId", "role", "alt"].includes(key)
+        [
+          "type",
+          "tagId",
+          "candidateId",
+          "role",
+          "alt",
+          "selections",
+          "anchorRole",
+        ].includes(key)
       )
     ) {
       const candidate = state.inventory.structureCandidates?.find(
         (c) => c.tagId === tag.id && c.candidateId === op.candidateId
       );
       if (!candidate) return invalid();
-      if (candidate.kind === "describe_chart") {
+      if (candidate.kind === "restore_artifact_text") {
+        if (
+          op.role !== undefined ||
+          op.alt !== undefined ||
+          !Array.isArray(op.selections) ||
+          !op.selections.length ||
+          op.selections.length > 100
+        )
+          return invalid();
+        if (
+          op.anchorRole !== undefined &&
+          (op.anchorRole !== "P" || !tag.editable.role)
+        )
+          return invalid();
+        const seenScopes = new Set<string>();
+        const selections = op.selections.map((selection) => {
+          if (
+            !objectRecord(selection) ||
+            Object.keys(selection).some(
+              (key) => !["scopeId", "role"].includes(key)
+            ) ||
+            typeof selection.scopeId !== "string" ||
+            seenScopes.has(selection.scopeId) ||
+            !candidate.textScopes?.some(
+              (scope) => scope.scopeId === selection.scopeId
+            ) ||
+            !["P", "H2", "H3", "H4", "H5", "H6"].includes(
+              String(selection.role)
+            )
+          )
+            return invalid();
+          seenScopes.add(selection.scopeId);
+          return {
+            scopeId: selection.scopeId,
+            role: selection.role as "P" | "H2" | "H3" | "H4" | "H5" | "H6",
+          };
+        });
+        return {
+          ...common,
+          type: "repair_structure",
+          candidateId: candidate.candidateId,
+          selections,
+          ...(op.anchorRole === "P" ? { anchorRole: "P" as const } : {}),
+        };
+      }
+      if (op.selections !== undefined || op.anchorRole !== undefined)
+        return invalid();
+      if (
+        ["describe_chart", "restore_excluded_figure"].includes(candidate.kind)
+      ) {
         if (op.role !== undefined || !text(op.alt, 8000)) return invalid();
         return {
           ...common,
@@ -540,6 +597,10 @@ export function coalesceNativePdfOperations(
           candidate.tagId === operation.tagId &&
           [
             "rebuild_table",
+            "rebuild_grid_table",
+            "restore_excluded_figure",
+            "join_interrupted_text",
+            "restore_decimal_paragraphs",
             "move_callout",
             "move_page_continuation",
             "describe_chart",

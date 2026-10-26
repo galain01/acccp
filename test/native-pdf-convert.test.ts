@@ -761,6 +761,10 @@ describe("native PDF model contracts", () => {
     "mark_note_reference",
     "convert_list",
     "rebuild_table",
+    "rebuild_grid_table",
+    "join_interrupted_text",
+    "restore_decimal_paragraphs",
+    "restore_excluded_figure",
     "move_callout",
     "describe_chart",
   ] as const)(
@@ -785,7 +789,7 @@ describe("native PDF model contracts", () => {
         tagId: "tag-1",
         candidateId,
         ...(kind === "split_heading" ? { role: "H3" } : {}),
-        ...(kind === "describe_chart"
+        ...(["describe_chart", "restore_excluded_figure"].includes(kind)
           ? {
               alt: "The chart compares the observed results for the two groups.",
             }
@@ -806,7 +810,11 @@ describe("native PDF model contracts", () => {
         { text: "Invented replacement" },
         { offset: 7 },
         { role: kind === "split_heading" ? "H1" : "H3" },
-        { alt: kind === "describe_chart" ? "" : "An unsupported description" },
+        {
+          alt: ["describe_chart", "restore_excluded_figure"].includes(kind)
+            ? ""
+            : "An unsupported description",
+        },
         { alt: "x".repeat(8001) },
       ])
         expect(() =>
@@ -1779,7 +1787,12 @@ describe("native PDF orchestration", () => {
     ]);
   });
 
-  it.each(["rebuild_table", "move_callout", "describe_chart"] as const)(
+  it.each([
+    "rebuild_table",
+    "rebuild_grid_table",
+    "move_callout",
+    "describe_chart",
+  ] as const)(
     "%s owns participant roles across model batches without dropping unrelated repairs",
     async (kind) => {
       const state = await makeState();
@@ -2479,5 +2492,90 @@ describe("native PDF orchestration", () => {
     expect(result.nativePdfChecks.auditComplete).toBe(true);
     expect(excerptCounts).toHaveLength(45);
     expect(excerptCounts.every((count) => count === 4)).toBe(true);
+  });
+});
+
+describe("source-bound excluded-text repair plans", () => {
+  it("restores only the selected source scopes with verified roles", async () => {
+    const state = await makeState();
+    const candidateId = "a".repeat(64);
+    const first = "b".repeat(64);
+    const second = "c".repeat(64);
+    state.inventory.structureCandidates = [
+      {
+        candidateId,
+        kind: "restore_artifact_text",
+        tagId: "tag-1",
+        pageNumber: 1,
+        text: "Existing footer",
+        preview: "Heading and instructions before footer",
+        relatedTagIds: [],
+        textScopes: [
+          { scopeId: first, text: "Appendix" },
+          { scopeId: second, text: "Do NOT discard 19 items." },
+        ],
+      },
+    ];
+    const batch = nativePdfBatches(state)[0];
+    const selections = [
+      { scopeId: first, role: "H2" },
+      { scopeId: second, role: "P" },
+    ];
+    const plan = {
+      reviewedPages: [1],
+      reviewedTagIds: ["tag-1"],
+      operations: [
+        { type: "repair_structure", tagId: "tag-1", candidateId, selections },
+      ],
+      findings: [],
+    };
+    expect(parseNativePdfPlan(plan, batch, state).operations).toEqual([
+      { ...plan.operations[0], expected: state.inventory.tags[0].snapshot },
+    ]);
+    state.inventory.tags[0].editable.role = true;
+    const withFooter = {
+      ...plan,
+      operations: [{ ...plan.operations[0], anchorRole: "P" }],
+    };
+    expect(
+      parseNativePdfPlan(withFooter, batch, state).operations[0]
+    ).toMatchObject({ anchorRole: "P" });
+    state.inventory.tags[0].editable.role = false;
+    expect(() => parseNativePdfPlan(withFooter, batch, state)).toThrow();
+    expect(() =>
+      parseNativePdfPlan(
+        { ...plan, operations: [{ ...plan.operations[0], anchorRole: "H2" }] },
+        batch,
+        state
+      )
+    ).toThrow();
+    for (const invalid of [
+      [],
+      [{ scopeId: "d".repeat(64), role: "P" }],
+      [selections[0], selections[0]],
+      [{ scopeId: first, role: "Script" }],
+      [{ scopeId: first, role: "P", text: "Invented words" }],
+    ]) {
+      expect(() =>
+        parseNativePdfPlan(
+          {
+            ...plan,
+            operations: [{ ...plan.operations[0], selections: invalid }],
+          },
+          batch,
+          state
+        )
+      ).toThrow();
+    }
+    expect(() =>
+      parseNativePdfPlan(
+        {
+          ...plan,
+          operations: [{ ...plan.operations[0], alt: "Replacement" }],
+        },
+        batch,
+        state
+      )
+    ).toThrow();
   });
 });

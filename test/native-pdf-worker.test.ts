@@ -745,3 +745,36 @@ describe("native PDF service client", () => {
     );
   });
 });
+
+describe("excluded-text candidate protocol", () => {
+  it("accepts bounded source scopes and rejects duplicate or unbounded scope evidence", () => {
+    const raw = response();
+    const candidate = {
+      candidateId: "a".repeat(64),
+      kind: "restore_artifact_text",
+      tagId: "tag-1",
+      pageNumber: 1,
+      text: "Appendix",
+      preview: "Restore before footer",
+      relatedTagIds: [],
+      textScopes: [
+        { scopeId: "b".repeat(64), text: "Do NOT discard 19 items." },
+      ],
+    };
+    const inventory = raw.inventory as Record<string, unknown>;
+    inventory.structureCandidates = [candidate];
+    expect(
+      parseNativePdfState(raw, source).inventory.structureCandidates?.[0]
+    ).toMatchObject(candidate);
+    for (const scopes of [
+      [],
+      [candidate.textScopes[0], candidate.textScopes[0]],
+      [{ scopeId: "invalid", text: "Words" }],
+      [{ scopeId: "c".repeat(64), text: "x".repeat(8001) }],
+      [{ scopeId: "c".repeat(64), text: "   " }],
+    ]) {
+      inventory.structureCandidates = [{ ...candidate, textScopes: scopes }];
+      expect(() => parseNativePdfState(raw, source)).toThrow();
+    }
+  });
+});

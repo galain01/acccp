@@ -19,6 +19,12 @@ COPY services/native-pdf/form_interaction_fingerprint.py /app/services/native-pd
 COPY services/native-pdf/native_structure_repairs.py /app/services/native-pdf/
 COPY services/native-pdf/bounded_semantic_structure.py /app/services/native-pdf/
 COPY services/native-pdf/native_structure_pipeline.py services/native-pdf/bounded_table_structure.py services/native-pdf/bounded_reading_order.py services/native-pdf/bounded_chart_structure.py /app/services/native-pdf/
+COPY services/native-pdf/bounded_grid_table_structure.py services/native-pdf/bounded_artifact_reading.py services/native-pdf/native_image_alternatives.py /app/services/native-pdf/
+COPY services/native-pdf/bounded_excluded_figures.py /app/services/native-pdf/
+COPY services/native-pdf/bounded_interrupted_text.py /app/services/native-pdf/
+COPY services/native-pdf/bounded_false_list.py /app/services/native-pdf/
+COPY services/native-pdf/native_generated_references.py /app/services/native-pdf/
+COPY services/native-pdf/native_generated_link_labels.py /app/services/native-pdf/
 COPY --chmod=0555 services/native-pdf/start-worker.sh /usr/local/bin/start-native-pdf.sh
 RUN useradd --create-home --uid 10001 pdfworker \
     && chmod -R a-w /app /opt/native-pdf

@@ -442,26 +442,28 @@ class SavedStructureEvidence(unittest.TestCase):
                     self.assertEqual(objr["destinationPageNumber"], 1)
                     self.assertEqual(objr["destinationView"], "Fit")
 
-    def test_missing_named_destination_blocks_completion_even_when_objr_resolves(self):
+    def test_missing_named_destination_warns_while_objr_inspection_completes(self):
         for legacy in (False, True):
             with self.subTest(legacy=legacy):
                 info = v.structure_inventory(named_link_reader(legacy=legacy, missing=True))
                 objr = next(tag for tag in info["tags"] if tag["role"] == "Link")["contentSequence"][0]
                 self.assertTrue(objr["resolved"])
                 self.assertFalse(objr["destinationResolved"])
-                self.assertFalse(info["checks_complete"])
-                self.assertFalse(info["machine_checks_passed"])
+                self.assertTrue(info["checks_complete"])
+                self.assertTrue(info["machine_checks_passed"])
                 self.assertEqual(info["unresolved_local_destinations"], 1)
+                self.assertTrue(info["navigation_checks_complete"])
+                self.assertEqual(info["navigation_findings"][0]["severity"], "warning")
                 self.assertIn("local_link_destination_unresolved", [finding["code"] for finding in info["findings"]])
 
     def test_ambiguous_named_destination_is_not_guessed(self):
         info = v.structure_inventory(named_link_reader(duplicate=True))
-        self.assertFalse(info["checks_complete"])
+        self.assertTrue(info["checks_complete"])
         self.assertEqual(next(f for f in info["findings"] if f["code"] == "local_link_destination_unresolved")["reason"], "ambiguous_named_destination")
 
     def test_named_destination_must_point_to_a_real_document_page(self):
         info = v.structure_inventory(named_link_reader(broken_page=True))
-        self.assertFalse(info["checks_complete"])
+        self.assertTrue(info["checks_complete"])
         self.assertEqual(next(f for f in info["findings"] if f["code"] == "local_link_destination_unresolved")["reason"], "destination_page_missing")
 
     def test_wrong_objr_parent_owner_remains_unresolved(self):
