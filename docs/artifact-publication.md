@@ -57,6 +57,49 @@ The existing recent-processing guard now covers Canvas as well as native
 targets. Failure accounting also checks the current processing state, preventing
 a delayed failure from downgrading a completed attempt.
 
+## Selected PowerPoint exports
+
+The recovery increment based on
+`e2089405a5a7e5f9bf1b4440f604ce177011be6f` applies the same publication
+invariants to `lib/powerpoint-review-storage.ts`, while preserving its separate
+selection protocol. The existing original-source hash, exact selected change
+IDs, description edits, saved-review hash, conversion attempt and five-minute
+export lease remain authoritative. Rendering and independent checks still run
+outside the document lock; completed model calls are recorded once before any
+output publication, including calls from failed checks.
+
+1. Commit the export lease and two expired, non-downloadable artifact receipts
+   for unique `review-{export UUID}.pptx` and `.json` keys. The review receipt
+   uses the existing `conversion-publication.json` marker and one-hour upload
+   settlement barrier. Neither receipt is an available download.
+2. Replay only the instructor's exact selection from the immutable original,
+   then run the existing checks. Recheck the current attempt, source-review
+   hash and lease; commit the expected output/review checksums and sizes to the
+   exact reserved rows. If that commit acknowledgement is lost, stop before
+   uploading. Keep the receipts and recorded usage.
+3. Recheck the same attempt, review and lease under the document lock. Upload
+   both objects with overwrite disabled and one shared 30-second cancellation
+   signal. Promote only matching receipt IDs, job, types, keys, checksums and
+   sizes. Retire the prior pair and publish the selected findings and finished
+   export event atomically. Rename the private review receipt to `review.json`.
+4. Before preparing the download, verify the entire exact available pair, the
+   completed original attempt and the matching finished export event in a fresh
+   retained transaction. This verification also reconciles a lost publication
+   acknowledgement; it never repeats replay, rendering, model calls or usage
+   recording. A newer attempt or selected output cannot satisfy the proof.
+5. Sign only that proven output, with the existing 60-second maximum and
+   original-expiry checks. Return `savedOutputArtifactId` with the corresponding
+   findings, changes and review token so client download bindings can advance
+   together. A signing failure after proven publication reports that the
+   selection was saved but its download could not be prepared. If the saved
+   status cannot be verified, report uncertainty and preserve all receipts and
+   events instead of asserting that the prior output was unchanged.
+
+The PostgreSQL [row-lock behavior](https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-ROWS)
+and Drizzle's [update returning](https://orm.drizzle.team/docs/update#returning)
+support the existing document serialization and exact receipt-match checks.
+This does not add a worker, migration or new storage destination.
+
 ## Verification
 
 The two new route regressions reproduced reused Canvas object keys and model
@@ -81,10 +124,22 @@ variables:
 npm ci --prefix .github/test-runtime --ignore-scripts
 $env:PGLITE_RUNTIME_DIR = (Resolve-Path .github/test-runtime).Path
 node node_modules/vitest/vitest.mjs run --config test/conversion-publication-postgres.config.mjs
+node node_modules/vitest/vitest.mjs run --config test/powerpoint-review-publication-postgres.config.mjs
 ```
 
 The runtime is installed separately with lifecycle scripts disabled; it does not
 change application dependencies or connect to any database service.
+
+The selected-PowerPoint suite adds 12 isolated PostgreSQL cases: private
+committed receipts, exact selected output/review identity, failure on either
+upload, metadata rollback after both uploads, lost publication acknowledgement,
+lost checksum-stage acknowledgement, unavailable reconciliation, superseding
+attempts, signing failure, overlapping selection leases and late-write purge
+settlement. Before the implementation, regressions reproduced non-private
+receipts, premature purge and an unrecovered successful commit. The existing
+20 storage and eight route tests also pass. Storage, native rendering and model
+services are synthetic boundaries; these tests do not certify their hosted
+network or accessibility behavior.
 
 ## Remaining boundaries
 
@@ -97,9 +152,9 @@ change application dependencies or connect to any database service.
   repeated attempts temporarily consume additional space in the existing bucket.
   No new storage service, paid plan or retention extension is introduced. A
   separate bounded retired-version cleanup policy can reduce that footprint.
-- Selected PowerPoint exports have their own immutable-pair protocol. Their
-  pending marker and ambiguous-commit response behavior are not unified here.
-  Editing the previous PowerPoint review after a failed reconversion remains a
+- Selected PowerPoint exports retain their own lease and selection protocol,
+  with the publication safeguards described above. Editing the previous
+  PowerPoint review after a failed reconversion remains a
   separate workflow; the saved output can still be retrieved by its pointer.
 - Hard process termination, durable queued execution and recovery after losing
   the first response before learning a new document's identity remain separate
