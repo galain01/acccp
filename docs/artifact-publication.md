@@ -92,8 +92,11 @@ change application dependencies or connect to any database service.
   changing an available pointer does not revoke them. Legacy keys are preserved
   as discovery rows until normal retention cleanup.
 - The one-hour upload settlement allowance is conservative, not a provider
-  guarantee for arbitrarily stalled remote writes. Failed candidates remain
-  stored until document cleanup, so repeated failures temporarily consume space.
+  guarantee for arbitrarily stalled remote writes. Failed candidates and retired
+  successful versions remain stored until the original document's cleanup;
+  repeated attempts temporarily consume additional space in the existing bucket.
+  No new storage service, paid plan or retention extension is introduced. A
+  separate bounded retired-version cleanup policy can reduce that footprint.
 - Selected PowerPoint exports have their own immutable-pair protocol. Their
   pending marker and ambiguous-commit response behavior are not unified here.
   Editing the previous PowerPoint review after a failed reconversion remains a

@@ -13,7 +13,7 @@ SVG optimization RCE (`GHSA-2464-fhr4-w9xw`) advisories. The current
 includes subsequent correctness fixes without a declared configuration migration.
 Node 24 and React/DOM 19.2.4 remain within the published peer/runtime ranges.
 
-The lockfile changes **39 package entries**, all within the Next family (12)
+The application lockfile changes **39 package entries**, all within the Next family (12)
 and Sharp/native-image family (27). Sharp advances to **0.35.5** and its
 libvips packages to **1.3.4**. No package names were added or removed, no
 unrelated versions changed, and none of the updated entries declares an

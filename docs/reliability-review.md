@@ -6,6 +6,12 @@ fixture plan, not a production certification. Line references below describe
 that base; the bounded implementation is specified in
 [reliability-refactor.md](reliability-refactor.md).
 
+The subsequent [reliability follow-up](reliability-follow-up.md) addresses the
+framework dependency blocker, immutable initial-conversion publication, Canvas
+overlap prevention, and full synthetic native PDF CI coverage. The findings
+below retain their original source-review context; current publication behavior
+and remaining boundaries are documented in [artifact-publication.md](artifact-publication.md).
+
 ## Verified architecture
 
 The application already has separate native engines. Preserving and strengthening
