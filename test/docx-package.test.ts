@@ -807,6 +807,127 @@ describe("native Word package repair", () => {
 
 describe("Word package and plan safety", () => {
   it.each([
+    ["Override", "<!DOCTYPE x [<!ENTITY unsafe 'value'>]><x/>", "docx_invalid"],
+    ["Default", "<broken>", "docx_invalid"],
+    [
+      "Override",
+      `<w:document xmlns:w="${W}"><w:body><w:p><w:fldSimple w:instr="INCLUDETEXT &quot;file:///private/source&quot;"/></w:p></w:body></w:document>`,
+      "docx_unsupported",
+    ],
+  ])(
+    "validates XML declared by %s when its filename has a non-XML extension",
+    async (declaration, payload, code) => {
+      const parts = entries();
+      parts["customXml/item1.data"] = payload;
+      parts["[Content_Types].xml"] = String(
+        parts["[Content_Types].xml"]
+      ).replace(
+        "</Types>",
+        declaration === "Override"
+          ? '<Override PartName="/customXml/item1.data" ContentType="application/xml"/></Types>'
+          : '<Default Extension="DATA" ContentType="application/xml"/></Types>'
+      );
+      await expect(inspectDocx(await zip(parts))).rejects.toHaveProperty(
+        "code",
+        code
+      );
+    }
+  );
+  it.each(["", " ", "; charset=utf-8"])(
+    "checks protected settings and rejects malformed content-type suffix %j",
+    async (suffix) => {
+      const parts = entries();
+      parts["word/settings.data"] =
+        `<w:settings xmlns:w="${W}"><w:documentProtection w:edit="readOnly" w:enforcement="1"/></w:settings>`;
+      parts["[Content_Types].xml"] = String(
+        parts["[Content_Types].xml"]
+      ).replace(
+        "</Types>",
+        `<Override PartName="/word/settings.data" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml${suffix}"/></Types>`
+      );
+      parts["word/_rels/document.xml.rels"] = String(
+        parts["word/_rels/document.xml.rels"]
+      ).replace(
+        "</Relationships>",
+        `<Relationship Id="rSettings" Type="${R}/settings" Target="settings.data"/></Relationships>`
+      );
+      await expect(inspectDocx(await zip(parts))).rejects.toHaveProperty(
+        "code",
+        suffix ? "docx_invalid" : "docx_unsupported"
+      );
+    }
+  );
+  it("includes valid content-type-declared headers in the inventory and preserves their bytes", async () => {
+    const parts = entries();
+    parts["word/header.data"] =
+      `<w:hdr xmlns:w="${W}">${paragraph("Course header")}</w:hdr>`;
+    parts["[Content_Types].xml"] = String(parts["[Content_Types].xml"]).replace(
+      "</Types>",
+      '<Override PartName="/word/header.data" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/></Types>'
+    );
+    parts["word/_rels/document.xml.rels"] = String(
+      parts["word/_rels/document.xml.rels"]
+    ).replace(
+      "</Relationships>",
+      `<Relationship Id="rHeader" Type="${R}/header" Target="header.data"/></Relationships>`
+    );
+    const source = await zip(parts);
+    expect((await inspectDocx(source)).paragraphs).toContainEqual(
+      expect.objectContaining({
+        id: "word/header.data:p:1",
+        text: "Course header",
+        editable: false,
+      })
+    );
+    expect((await repair(source, [])).buffer).toBe(source);
+    const repaired = await repair(source, [
+      {
+        type: "setHeading",
+        id: p1,
+        level: 1,
+        sourceText: "Course outline",
+      },
+    ]);
+    expect(repaired.inspection.paragraphs).toContainEqual(
+      expect.objectContaining({
+        id: "word/header.data:p:1",
+        text: "Course header",
+        editable: false,
+      })
+    );
+    const output = await unzip(repaired.buffer);
+    for (const [name, bytes] of await unzip(source))
+      if (name !== "word/document.xml") expect(output.get(name)).toEqual(bytes);
+  });
+  it.each([
+    '<Override PartName="/word/document.xml" ContentType="application/xml"/>',
+    '<Default Extension="XML" ContentType="application/octet-stream"/>',
+  ])("rejects ambiguous content type declarations: %s", async (declaration) => {
+    const parts = entries();
+    parts["[Content_Types].xml"] = String(parts["[Content_Types].xml"]).replace(
+      "</Types>",
+      `${declaration}</Types>`
+    );
+    await expect(inspectDocx(await zip(parts))).rejects.toHaveProperty(
+      "code",
+      "docx_invalid"
+    );
+  });
+  it("counts declared XML with non-XML extensions toward the aggregate XML limit", async () => {
+    const parts = entries();
+    parts["[Content_Types].xml"] = String(parts["[Content_Types].xml"]).replace(
+      "</Types>",
+      '<Default Extension="data" ContentType="application/xml"/></Types>'
+    );
+    for (let index = 0; index < 7; index++)
+      parts[`customXml/item${index}.data`] =
+        `<x>${"a".repeat(3 * 1024 * 1024)}</x>`;
+    await expect(inspectDocx(await zip(parts))).rejects.toHaveProperty(
+      "code",
+      "docx_complexity_limit"
+    );
+  });
+  it.each([
     "INCLUDEPICTURE",
     "INCLUDETEXT",
     "DDE",
