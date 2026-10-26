@@ -44,11 +44,12 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Exact production dependency versions, wheels only; no package build scripts.
+      # Production versions plus NumPy for the research verification tests only.
+      # Wheels only; NumPy is not added to the production worker image.
       - name: Install native PDF test dependencies
         timeout-minutes: 5
         run: |
-          python -m pip install --disable-pip-version-check --only-binary=:all: -r services/native-pdf/requirements.txt
+          python -m pip install --disable-pip-version-check --only-binary=:all: -r services/native-pdf/requirements.txt numpy==2.3.5
 
       # Synthetic fixtures and loopback HTTP only. Java tools and remote calls are mocked.
       - name: Check native PDF engine and supervisor
