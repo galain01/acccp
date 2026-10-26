@@ -34,7 +34,8 @@ from hybrid_form_verification import HybridVerificationError, verify_hybrid_prep
 from native_form_inventory import NativeFormInventoryError, native_form_inventory
 from form_interaction_fingerprint import form_interaction_fingerprint
 from native_structure_repairs import (NoteIdError, note_id_snapshot, repair_note_ids,
-    verify_note_ids, verify_authored_ids, authored_id_bindings, verify_authored_id_bindings)
+    verify_note_ids, verify_authored_ids, authored_id_bindings, verify_authored_id_bindings,
+    initialize_generated_id_tree, verify_generated_id_tree)
 from bounded_semantic_structure import SemanticStructureError, _DiscoveryInspection
 from native_structure_pipeline import discover_candidates, apply_operations, verify_saved as verify_saved_structure
 
@@ -1234,6 +1235,17 @@ def process(mode, request_path, directory, toolchain):
             if code != 0 or not tagged.is_file() or tagged.stat().st_size > MAX_PDF:
                 fail("native_pdf_worker_failed")
             candidate = open_pdf(tagged.read_bytes())
+            try:
+                indexed = PdfWriter(clone_from=candidate)
+                indexed_count = initialize_generated_id_tree(original, indexed)
+                if indexed_count:
+                    reopened_index = write_pdf(indexed, directory / 'indexed-tags.pdf')
+                    verify_generated_id_tree(candidate, reopened_index)
+                    candidate = reopened_index
+                    changes.append({'code': 'generated_identifier_index_added',
+                        'message': f'Indexed {indexed_count} generated structure identifiers without changing their values or owners.'})
+            except (NoteIdError, verify_pdf.InspectionError):
+                fail('native_pdf_preservation')
             changes.append({"code": "native_tags_added", "message": "Added native reading-order and content tags while preserving the original pages."})
         else:
             candidate = original

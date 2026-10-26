@@ -5,6 +5,12 @@ review plan, not a record that the remaining checks passed. Bind every run to
 the exact candidate commit and delivered file hashes. Do not reuse an older
 Office, W-9, Java-image, or hosted result as evidence for this candidate.
 
+Current PDF evaluation evidence is in [the ten-document corpus review](native-pdf-corpus-validation.md).
+Subsequent user authorization covered the task-local Java/tagger/validator setup
+and bounded use of the existing model integration with public/synthetic inputs.
+That setup completed, but the actual completion endpoint returned401; further
+inference stopped. This checklist itself grants no access or spending authority.
+
 Use the [fixture matrix](reliability-review.md#representative-fixture-matrix)
 for coverage, the current [publication contract](artifact-publication.md) for
 storage behavior, and the [worker protocol](../services/native-pdf/protocol.md)
@@ -18,7 +24,7 @@ precedence. Never silently substitute HTML for native DOCX, PPTX, or PDF output.
 - [ ] Record candidate commit, clean checkout status, lockfile hashes, CI run
   links, operator, UTC date, OS build and browser version. Record the exact
   versions of every tool actually used; an installed tool is not a passed test.
-- [ ] Keep a manifest outside Git: case ID, synthetic source filename/SHA-256,
+- [ ] Keep a manifest outside Git: case ID, public/synthetic source provenance and filename/SHA-256,
   expected source wording/data and permitted changes, output SHA-256, job/attempt
   and artifact IDs where applicable, tool versions, PASS/FAIL/BLOCKED/NOT RUN,
   observations, evidence paths and unresolved issue. Write the expected-content
@@ -38,10 +44,12 @@ precedence. Never silently substitute HTML for native DOCX, PPTX, or PDF output.
   Acrobat, screen-reader and OS builds plus relevant settings. Windows/NVDA
   results cover only that combination; add other supported environments
   separately. Missing tools/accounts are blockers, not presumed passes.
-- [ ] Stop at access denial. The prior Vercel diagnostics request returned
-  HTTP 403; do not retry it, use another endpoint/account to bypass it, or treat
-  a GitHub CI pass as a hosted preview pass. Obtain new explicit authorization
-  and resolved access through the parent before any affected hosted check.
+- [ ] Stop at access denial; do not use another endpoint/account/key to bypass
+  it. Supported Vercel team consent subsequently restored read-only diagnostics:
+  the preview failure is missing build-time `DATABASE_URL`. The current model
+  completion401 is a separate unresolved gateway-access blocker. Obtain resolved
+  access and applicable authorization before retrying a denied operation. A
+  GitHub CI pass is not a hosted preview or authenticated application pass.
 
 ## 2. Attach automated evidence already covered by CI
 
@@ -55,6 +63,7 @@ Windows skip, or prior commit's green run is insufficient.
 | --- | --- | --- |
 | Frozen dependencies and app checks | [CI workflow](../.github/workflows/test.yml): `npm ci --ignore-scripts`, `npm run format:check`, `npm run typecheck`, `npm test` | Successful run and exact lockfile; current dependency review with unresolved findings explicitly adjudicated. No lifecycle scripts. |
 | Full synthetic PDF engine | Python 3.12; wheel-only install of [pinned requirements](../services/native-pdf/requirements.txt), then `python -m unittest discover -s services/native-pdf -p "test_*.py"` | Linux run includes the real descendant-process test without skipping. Real local PDFium/structure preservation is covered; Java execution and model calls are not. |
+| Installed native tools and Linux worker | The `native-pdf-tools` CI job builds `Dockerfile.native-pdf.vercel`, which executes `build-smoke.py --require-linux` as the unprivileged worker user. | Actual pinned OpenDataLoader/veraPDF tools, authenticated loopback requests, saved-file preservation and strict validator completion. Build only; no image publication, deployment, model calls or application credentials. |
 | Recovery and publication transactions | The existing CI job runs `node node_modules/vitest/vitest.mjs run --config` separately for `test/conversion-publication-postgres.config.mjs`, `test/document-submission-postgres.config.mjs` and `test/powerpoint-review-publication-postgres.config.mjs`, after the separately locked test-runtime install, with `PGLITE_RUNTIME_DIR` set to its absolute directory. | Actual PGlite transactions with synthetic blob storage. This does not prove hosted multi-client locks, pooler behavior or network write outcomes. |
 | Build and framework runtime | `npm run build`; `node scripts/check-framework-runtime.mjs` with the workflow's synthetic environment | Traced renderer smoke (baseline 21 pages/411 assets), all 12 candidate runtime checks and zero configured-service contacts. These are not authenticated conversion or real Java-worker tests. |
 

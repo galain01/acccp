@@ -7,6 +7,18 @@ on:
     branches: [main, dev]
 
 jobs:
+  native-pdf-tools:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build only: the image is never pushed or deployed. Its existing build
+      # smoke runs the pinned Java tools on synthetic PDFs as the unprivileged
+      # production user, without application credentials or model calls.
+      - name: Verify native PDF tools and Linux worker boundary
+        timeout-minutes: 10
+        run: docker build --progress=plain --file Dockerfile.native-pdf.vercel --tag acccp-native-pdf-test:${{ github.sha }} .
+
   format:
     runs-on: ubuntu-latest
     steps:

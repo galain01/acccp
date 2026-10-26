@@ -24,7 +24,7 @@ RUN useradd --create-home --uid 10001 pdfworker \
     && chmod -R a-w /app /opt/native-pdf
 USER pdfworker
 # Exercise installed Java/PDFium binaries and production child-process limits
-# before an image can be published. The test uses one ephemeral synthetic PDF.
+# before an image can be published. The test uses ephemeral synthetic PDFs.
 RUN /usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/home/pdfworker \
     LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC PYTHONDONTWRITEBYTECODE=1 \
     /usr/local/bin/python /app/services/native-pdf/build-smoke.py --require-linux
