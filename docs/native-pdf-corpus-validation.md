@@ -1,5 +1,12 @@
 # Native PDF corpus validation and generated structure IDs
 
+**Follow-up:** [Sol6.1 local application validation](sol61-local-validation.md)
+records the subsequent successful model access and seven complete browser
+upload/repair/audit/download journeys. The earlier401 and zero-completion counts
+below describe the previous configuration. The two navigation refusals, unsupported
+W-4 and remaining accessibility findings persist. The hosted preview was skipped;
+nothing has been merged or deployed.
+
 This bounded follow-up starts at `d42b2f199e18d173866bd97b64ba4b2784c4bb78`
 after the authentication correction in draft PR36. The three preceding draft
 branches remain unchanged. The work preserves the existing native engine and
