@@ -1,6 +1,43 @@
 # Dependency security review — 2026-10-26
 
-**Release verdict: do not claim production readiness from this reliability patch.** The existing dependency graph has a confirmed match to the prerequisites of a Next.js Server Actions denial-of-service advisory. Other application dependencies and development tools also require upgrades or verified exclusions. This review makes no claim that an exploit succeeded against ACCCP.
+**Release verdict: do not claim production readiness from this reliability patch.** The follow-up below fixes the confirmed Next.js/Sharp dependency blocker in source. Other application dependencies and development tools still require upgrades or verified exclusions, and no deployment was performed. This review makes no claim that an exploit succeeded against ACCCP.
+
+## Follow-up: targeted framework update
+
+On 2026-10-26, updated `next` and `eslint-config-next` from 16.3.4 to
+**16.4.3**, preserving major 16. The [maintainer security notice](https://nextjs.org/blog/nextjs-security-update-october-14-2026)
+sets 16.4.1 as the patched floor for the Server Actions denial-of-service
+(`GHSA-p3m5-59mp-jv5r`), typed-array cache RCE (`GHSA-673q-mjm6-r5xr`) and
+SVG optimization RCE (`GHSA-2464-fhr4-w9xw`) advisories. The current
+[16.4.3 patch release](https://github.com/vercel/next.js/releases/tag/v16.4.3)
+includes subsequent correctness fixes without a declared configuration migration.
+Node 24 and React/DOM 19.2.4 remain within the published peer/runtime ranges.
+
+The lockfile changes **39 package entries**, all within the Next family (12)
+and Sharp/native-image family (27). Sharp advances to **0.35.5** and its
+libvips packages to **1.3.4**. No package names were added or removed, no
+unrelated versions changed, and none of the updated entries declares an
+installation lifecycle script. React, Better Auth, database and document-engine
+package versions are unchanged. Reviewed lock SHA-256:
+`58336a9ea995da17543e44f34e6807875226661bd916b47b6cf72a9729282ca2`.
+
+Resolved the update with npm **11.11.0** in a clean task-local directory with
+scripts disabled, then verified `npm ci --ignore-scripts` both there and in the
+isolated checkout. `.npmrc` preserves this dependency-script policy by default;
+explicit reviewed `npm run` commands still execute. CI uses the frozen lockfile
+with scripts disabled. `npm audit signatures` verified **735 registry signatures
+and 200 attestations** in the installed platform graph; this is not an assertion
+that every optional binary on every platform was installed or executed.
+
+The fresh audit has no Next or Sharp entry and reports **19 affected package
+entries: 3 critical, 8 high, 8 moderate**. Audit snapshot SHA-256:
+`339da8a23c38482c78287c1909cc2048c3cf1124f7e65c34d5f47448019c7ac9`.
+Remaining entries and reachability caveats below still apply, including
+Zod/Better Auth, development tooling, and the deployed Node/Undici inventory.
+Those deferrals remain due before release. The tables below preserve the
+original baseline review; their Next/Sharp installed-version rows are superseded
+by this section. Regression/build evidence is recorded in
+[the follow-up report](reliability-follow-up.md).
 
 ## Evidence and scope
 
