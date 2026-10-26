@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useId, useRef, useState } from "react";
-import { deleteDocument } from "@/lib/actions/documents";
+import { deleteDocument, listDocuments } from "@/lib/actions/documents";
 import {
   isPptxFilename,
   isSupportedDocumentFilename,
@@ -199,8 +199,12 @@ export default function DocumentWorkspace({
       let reservationId: string | undefined;
       let uploadComplete = false;
       let uploading = !documentId && isPptxFilename(doc.name);
+      const hadAvailableOutput =
+        doc.hasAvailableOutput ?? doc.status === "success";
       updateDocument(doc.id, {
         status: "processing",
+        hasAvailableOutput: hadAvailableOutput,
+        savedResultUnverified: undefined,
         processingPhase: uploading ? "uploading" : undefined,
         html: undefined,
         errorMessage: undefined,
@@ -208,6 +212,71 @@ export default function DocumentWorkspace({
         changes: undefined,
         interactionTestSummary: undefined,
       });
+
+      const recordFailedRequest = async (errorMessage: string) => {
+        // A lost response may follow a committed output. Never pair cached
+        // findings with a freshly resolved download from another attempt.
+        updateDocument(doc.id, {
+          status: "error",
+          processingPhase: undefined,
+          ...(documentId ? { documentId } : {}),
+          html: undefined,
+          errors: undefined,
+          changes: undefined,
+          interactionTestSummary: undefined,
+          errorMessage,
+          savedResultUnverified: true,
+        });
+        if (!documentId || controller.signal.aborted) return;
+        let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const rows = await Promise.race([
+            listDocuments(sessionId),
+            new Promise<never>((_resolve, reject) => {
+              refreshTimer = setTimeout(
+                () => reject(new Error("Refresh timed out")),
+                10_000
+              );
+            }),
+          ]);
+          if (controller.signal.aborted) return;
+          const saved = rows.find((row) => row.documentId === documentId);
+          if (!saved) {
+            updateDocument(doc.id, {
+              hasAvailableOutput: false,
+              savedOutputArtifactId: undefined,
+              savedResultUnverified: false,
+            });
+            return;
+          }
+          if (saved.outputTarget !== target) return;
+          const settled =
+            saved.status === "success" || saved.status === "error";
+          updateDocument(doc.id, {
+            // Preserve the local row key, lock and picked source file.
+            jobId: saved.jobId,
+            hasAvailableOutput:
+              saved.hasAvailableOutput ?? saved.status === "success",
+            savedOutputArtifactId: saved.savedOutputArtifactId,
+            status: settled ? saved.status : "error",
+            errorMessage:
+              saved.status === "success"
+                ? undefined
+                : (saved.errorMessage ?? errorMessage),
+            errors: settled ? saved.errors : undefined,
+            changes: settled ? saved.changes : undefined,
+            interactionTestSummary:
+              saved.status === "success"
+                ? saved.interactionTestSummary
+                : undefined,
+            savedResultUnverified: !settled,
+          });
+        } catch {
+          // Retain only the availability hint; review evidence stays cleared.
+        } finally {
+          clearTimeout(refreshTimer);
+        }
+      };
 
       try {
         if (uploading) {
@@ -264,25 +333,21 @@ export default function DocumentWorkspace({
         }
 
         if (!response.ok) {
-          updateDocument(doc.id, {
-            status: "error",
-            processingPhase: undefined,
-            // A failed model call may already have saved the source. Retrying
-            // must reuse that document instead of uploading a duplicate.
-            ...(documentId ? { documentId } : {}),
-            html: undefined,
-            errorMessage:
-              typeof data.detail === "string" && data.detail.trim()
-                ? data.detail
-                : typeof data.error === "string"
-                  ? data.error
-                  : "Conversion failed.",
-          });
+          await recordFailedRequest(
+            typeof data.detail === "string" && data.detail.trim()
+              ? data.detail
+              : typeof data.error === "string"
+                ? data.error
+                : "Conversion failed."
+          );
           return;
         }
 
         updateDocument(doc.id, {
           status: "success",
+          hasAvailableOutput: true,
+          savedOutputArtifactId: undefined,
+          savedResultUnverified: undefined,
           processingPhase: undefined,
           documentId,
           jobId: data.jobId,
@@ -303,17 +368,13 @@ export default function DocumentWorkspace({
         }
         // An abort means the user navigated away or removed the row.
         if (controller.signal.aborted) return;
-        updateDocument(doc.id, {
-          status: "error",
-          processingPhase: undefined,
-          html: undefined,
-          errorMessage:
-            error instanceof DocumentUploadError
-              ? error.message
-              : uploading
-                ? "The PowerPoint upload did not finish. Please try again."
-                : "Conversion failed. Please try again.",
-        });
+        await recordFailedRequest(
+          error instanceof DocumentUploadError
+            ? error.message
+            : uploading
+              ? "The PowerPoint upload did not finish. Please try again."
+              : "Conversion failed. Please try again."
+        );
       } finally {
         abortControllersRef.current.delete(doc.id);
       }

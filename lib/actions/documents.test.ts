@@ -17,13 +17,21 @@ vi.mock("@/lib/auth", () => ({
   verifyRoleOrRedirect: vi.fn().mockResolvedValue({ user: { id: "user-1" } }),
 }));
 
-vi.mock("@/lib/db", () => ({
-  db: {
+vi.mock("@/lib/db", () => {
+  const db = {
     select: vi.fn(),
     update: vi.fn(),
     delete: vi.fn(),
-  },
-}));
+  };
+  return {
+    db: {
+      ...db,
+      transaction: vi.fn((action: (tx: typeof db) => Promise<unknown>) =>
+        action(db)
+      ),
+    },
+  };
+});
 
 vi.mock("@/lib/storage", () => ({
   downloadObject: vi.fn(),

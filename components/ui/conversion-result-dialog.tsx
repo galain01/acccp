@@ -97,18 +97,37 @@ export default function ConversionResultDialog({
   const [isDownloading, setIsDownloading] = useState(false);
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const [reviewOpen, setReviewOpen] = useState(false);
-  const [reviewedResult, setReviewedResult] =
-    useState<PowerPointReviewExport | null>(null);
+  const [reviewedSnapshot, setReviewedSnapshot] = useState<{
+    documentId: string;
+    artifactId?: string;
+    result: PowerPointReviewExport;
+  } | null>(null);
   const downloadPending = useRef(false);
   // undefined = not fetched yet, null = unavailable. Written only from the
   // async callbacks below, so the effect never sets state synchronously.
-  const [fetchedHtml, setFetchedHtml] = useState<string | null | undefined>(
-    undefined
-  );
+  const [fetchedHtmlSnapshot, setFetchedHtmlSnapshot] = useState<{
+    documentId: string;
+    artifactId?: string;
+    html: string | null;
+  }>();
 
   // Documents restored from the database carry no html — it lives in storage
   // and is only worth fetching once someone actually opens the result.
   const documentId = document?.documentId;
+  const savedOutputArtifactId = document?.savedOutputArtifactId;
+  const fetchedHtml =
+    fetchedHtmlSnapshot?.documentId === documentId &&
+    fetchedHtmlSnapshot?.artifactId === savedOutputArtifactId
+      ? fetchedHtmlSnapshot?.html
+      : undefined;
+  const reviewedResult =
+    reviewedSnapshot?.documentId === documentId &&
+    reviewedSnapshot?.artifactId === savedOutputArtifactId
+      ? reviewedSnapshot?.result
+      : undefined;
+  // Listed artifacts always fetch their exact immutable bytes. Inline HTML is
+  // only supplied by the initial conversion response, which has no artifact ID.
+  const inlineHtml = savedOutputArtifactId ? undefined : document?.html;
   const isPowerPoint = document?.outputTarget === "accessible_pptx";
   const isNativeWord = document?.outputTarget === "accessible_docx";
   const isNativePdf = document?.outputTarget === "accessible_pdf";
@@ -118,40 +137,61 @@ export default function ConversionResultDialog({
     : isNativePdf
       ? "PDF"
       : "PowerPoint";
-  const needsHtml =
-    open && document?.status === "success" && !isNative && !document.html;
+  const hasSavedResult =
+    document?.status === "success" ||
+    (document?.status === "error" && document.hasAvailableOutput === true);
+  const needsHtml = open && hasSavedResult && !isNative && !inlineHtml;
   const isLoadingHtml = Boolean(needsHtml) && fetchedHtml === undefined;
 
   useEffect(() => {
     if (!needsHtml || !documentId) return;
 
     let cancelled = false;
-    getDocumentHtml(documentId)
+    const request = savedOutputArtifactId
+      ? getDocumentHtml(documentId, savedOutputArtifactId)
+      : getDocumentHtml(documentId);
+    request
       .then((html) => {
-        if (!cancelled) setFetchedHtml(html);
+        if (!cancelled)
+          setFetchedHtmlSnapshot({
+            documentId,
+            artifactId: savedOutputArtifactId,
+            html,
+          });
       })
       .catch(() => {
-        if (!cancelled) setFetchedHtml(null);
+        if (!cancelled)
+          setFetchedHtmlSnapshot({
+            documentId,
+            artifactId: savedOutputArtifactId,
+            html: null,
+          });
       });
 
     return () => {
       cancelled = true;
     };
-  }, [needsHtml, documentId]);
+  }, [needsHtml, documentId, savedOutputArtifactId]);
 
   if (!document) return null;
 
-  const html = document.html ?? fetchedHtml ?? undefined;
+  const html = inlineHtml ?? fetchedHtml ?? undefined;
   const isSuccess = document.status === "success";
   const isError = document.status === "error";
+  const isPreviousResult = isError && hasSavedResult;
+  const resultLabel = document.savedResultUnverified ? "saved" : "previous";
   const interactionTestSummary =
-    isSuccess && isNativePdf
+    isSuccess && isNativePdf && !document.savedResultUnverified
       ? readPdfInteractionTestSummary(document.interactionTestSummary)
       : undefined;
-  const issues = (reviewedResult?.findings ?? document.errors ?? []).map(
-    presentFinding
-  );
-  const changeSummaries = reviewedResult?.changes ?? document.changes;
+  const issues = (
+    document.savedResultUnverified
+      ? []
+      : (reviewedResult?.findings ?? document.errors ?? [])
+  ).map(presentFinding);
+  const changeSummaries = document.savedResultUnverified
+    ? undefined
+    : (reviewedResult?.changes ?? document.changes);
   const errorCount = issues.filter(
     (issue) => issue.severity === "error"
   ).length;
@@ -185,17 +225,23 @@ export default function ConversionResultDialog({
     try {
       // Request a fresh signed URL on every click so it cannot expire while the
       // instructor is reading the findings. Ownership and expiry are server-checked.
-      const download = await getDocumentOutputDownload(
-        documentId,
-        isNativeWord
-          ? "accessible_docx"
-          : isNativePdf
-            ? "accessible_pdf"
-            : "accessible_pptx"
-      );
+      const target = isNativeWord
+        ? "accessible_docx"
+        : isNativePdf
+          ? "accessible_pdf"
+          : "accessible_pptx";
+      const download = savedOutputArtifactId
+        ? await getDocumentOutputDownload(
+            documentId,
+            target,
+            savedOutputArtifactId
+          )
+        : await getDocumentOutputDownload(documentId, target);
       if (!download) {
         setDownloadError(
-          `This online ${nativeLabel} copy is unavailable. Online documents expire after 14 days. Re-upload the original to process it again; files on your computer are unaffected.`
+          savedOutputArtifactId
+            ? `This saved ${nativeLabel} result changed or is no longer available. Refresh the page to load the current result and its review. Online documents expire after 14 days; files on your computer are unaffected.`
+            : `This online ${nativeLabel} copy is unavailable. Online documents expire after 14 days. Re-upload the original to process it again; files on your computer are unaffected.`
         );
         return;
       }
@@ -292,7 +338,15 @@ export default function ConversionResultDialog({
           <p className="text-sm text-destructive">{document.errorMessage}</p>
         )}
 
-        {isSuccess && isNative && errorCount > 0 && (
+        {isPreviousResult && (
+          <p role="status" className="text-sm">
+            {document.savedResultUnverified
+              ? "A saved result may still be available. Refresh the page to load its current status and review findings."
+              : "The previous saved result is still available. Its changes and review findings below belong to that earlier result."}
+          </p>
+        )}
+
+        {hasSavedResult && isNative && errorCount > 0 && (
           <p role="status" className="text-sm text-destructive">
             This file still has accessibility problems that need a fix. Download
             it and address the items marked “Needs a fix” in{" "}
@@ -305,28 +359,40 @@ export default function ConversionResultDialog({
           </p>
         )}
 
-        {isSuccess && !isNative && !html && (
+        {hasSavedResult && !isNative && !html && (
           <p className="text-sm text-muted-foreground">
             {isLoadingHtml
               ? "Loading converted HTML…"
-              : "This online HTML copy is unavailable. Online documents expire after 14 days; re-upload the original to convert it again. Files downloaded to your computer are unaffected. If the online copy has not expired or been deleted, try again."}
+              : savedOutputArtifactId
+                ? "This saved HTML result changed or is no longer available. Refresh the page to load the current result and its review. Online documents expire after 14 days; files downloaded to your computer are unaffected."
+                : "This online HTML copy is unavailable. Online documents expire after 14 days; re-upload the original to convert it again. Files downloaded to your computer are unaffected. If the online copy has not expired or been deleted, try again."}
           </p>
         )}
 
-        {isSuccess && !isNative && html && (
+        {hasSavedResult && !isNative && html && (
           <div className="flex flex-col gap-4">
             <div className="flex flex-wrap gap-2">
               <Button onClick={handleCopy}>
-                {copied ? "Copied!" : "Copy HTML"}
+                {copied
+                  ? "Copied!"
+                  : isPreviousResult
+                    ? `Copy ${resultLabel} HTML`
+                    : "Copy HTML"}
               </Button>
               <Button variant="outline" onClick={handleDownload}>
-                Download HTML
+                {isPreviousResult
+                  ? `Download ${resultLabel} HTML`
+                  : "Download HTML"}
               </Button>
             </div>
 
             <Accordion>
               <AccordionItem value="html-output">
-                <AccordionTrigger>View HTML output</AccordionTrigger>
+                <AccordionTrigger>
+                  {isPreviousResult
+                    ? `View ${resultLabel} HTML output`
+                    : "View HTML output"}
+                </AccordionTrigger>
                 <AccordionContent>
                   <pre className="max-h-64 overflow-auto rounded-xl bg-muted p-3 text-xs whitespace-pre-wrap">
                     {html}
@@ -337,7 +403,7 @@ export default function ConversionResultDialog({
           </div>
         )}
 
-        {isSuccess && isNative && (
+        {hasSavedResult && isNative && (
           <div className="flex flex-col gap-4">
             <div className="flex flex-wrap gap-2">
               {!reviewOpen && (
@@ -347,14 +413,16 @@ export default function ConversionResultDialog({
                 >
                   {isDownloading
                     ? "Preparing download…"
-                    : isNativeWord
-                      ? "Download Word document"
-                      : isNativePdf
-                        ? "Download repaired PDF"
-                        : "Download PowerPoint"}
+                    : isPreviousResult
+                      ? `Download ${resultLabel} ${isNativeWord ? "Word document" : isNativePdf ? "repaired PDF" : "PowerPoint"}`
+                      : isNativeWord
+                        ? "Download Word document"
+                        : isNativePdf
+                          ? "Download repaired PDF"
+                          : "Download PowerPoint"}
                 </Button>
               )}
-              {isPowerPoint && documentId && document.jobId && (
+              {isSuccess && isPowerPoint && documentId && document.jobId && (
                 <Button
                   variant="outline"
                   onClick={() => setReviewOpen((value) => !value)}
@@ -368,23 +436,32 @@ export default function ConversionResultDialog({
                 </p>
               )}
             </div>
-            {isPowerPoint &&
+            {isSuccess &&
+            isPowerPoint &&
             reviewOpen &&
             open &&
             documentId &&
             document.jobId ? (
               <PowerPointChangeReview
-                key={`${documentId}:${document.jobId}`}
+                key={`${documentId}:${document.jobId}:${savedOutputArtifactId ?? ""}`}
                 documentId={documentId}
                 jobId={document.jobId}
                 onExportComplete={(result) => {
-                  setReviewedResult(result);
+                  setReviewedSnapshot({
+                    documentId,
+                    artifactId: savedOutputArtifactId,
+                    result,
+                  });
                   onReviewExport?.(result);
                 }}
               />
-            ) : (
+            ) : !document.savedResultUnverified ? (
               <section aria-label="Changes made">
-                <h2 className="mb-2 font-medium">Changes made</h2>
+                <h2 className="mb-2 font-medium">
+                  {isPreviousResult
+                    ? "Changes in the previous result"
+                    : "Changes made"}
+                </h2>
                 {changeSummaries?.length ? (
                   <ul className="list-disc space-y-1 pl-5 text-sm">
                     {changeSummaries.map((change, index) => (
@@ -398,7 +475,7 @@ export default function ConversionResultDialog({
                   </p>
                 )}
               </section>
-            )}
+            ) : null}
           </div>
         )}
 
@@ -425,10 +502,13 @@ export default function ConversionResultDialog({
           </section>
         )}
 
-        {isSuccess && issues.length > 0 && (
+        {hasSavedResult && issues.length > 0 && (
           <section aria-label="Items to review">
             <h2 className="mb-3 font-medium">
-              Items to review ({issues.length})
+              {isPreviousResult
+                ? "Items to review in the previous result"
+                : "Items to review"}{" "}
+              ({issues.length})
             </h2>
             <ul className="flex flex-col gap-3">
               {issues.map((issue, index) => (

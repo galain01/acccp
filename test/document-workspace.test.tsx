@@ -8,6 +8,9 @@ import type { UploadedDocument } from "@/lib/types/document";
 
 vi.mock("@/lib/actions/documents", () => ({
   deleteDocument: vi.fn().mockResolvedValue(undefined),
+  listDocuments: vi
+    .fn()
+    .mockRejectedValue(new Error("Saved state unavailable")),
   getDocumentHtml: vi.fn().mockResolvedValue("<h2>Saved result</h2>"),
   getDocumentOutputDownload: vi.fn().mockResolvedValue({
     url: "https://storage.example.test/result.pptx",
@@ -51,6 +54,7 @@ import DocumentWorkspace from "@/components/ui/document-workspace";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import {
   deleteDocument,
+  listDocuments,
   getDocumentHtml,
   getDocumentOutputDownload,
 } from "@/lib/actions/documents";
@@ -221,6 +225,9 @@ function requests(): FormData[] {
 
 beforeEach(() => {
   vi.mocked(deleteDocument).mockResolvedValue(undefined);
+  vi.mocked(listDocuments)
+    .mockReset()
+    .mockRejectedValue(new Error("Saved state unavailable"));
   vi.mocked(uploadPowerPointDocument)
     .mockReset()
     .mockImplementation(async ({ file, onReserved }) => {
@@ -257,6 +264,151 @@ afterEach(async () => {
 });
 
 describe("DocumentWorkspace conversion selection", () => {
+  it.each(["http", "network"])(
+    "reloads the earlier result after a confirmed %s retry failure",
+    async (failure) => {
+      await mount([
+        savedDocument("earlier", "success", {
+          outputTarget: "canvas_html",
+          html: "<h2>Earlier saved HTML</h2>",
+          errors: [
+            {
+              type: "other",
+              severity: "warning",
+              message: "Earlier table needs review.",
+              title: "Review the earlier saved table",
+              suggestion: "Review the earlier table.",
+            },
+          ],
+        }),
+      ]);
+      vi.mocked(listDocuments).mockResolvedValueOnce([
+        savedDocument("earlier", "error", {
+          outputTarget: "canvas_html",
+          hasAvailableOutput: true,
+          savedOutputArtifactId: "11111111-1111-4111-8111-111111111111",
+          errorMessage: "The latest save failed.",
+          errors: [
+            {
+              type: "other",
+              severity: "warning",
+              message: "Earlier table needs review.",
+              title: "Review the earlier saved table",
+              suggestion: "Review the earlier table.",
+            },
+          ],
+        }),
+      ]);
+      if (failure === "http")
+        fetchMock.mockResolvedValueOnce({
+          ok: false,
+          json: async () => ({ error: "The latest save failed." }),
+        } as Response);
+      else fetchMock.mockRejectedValueOnce(new Error("Network lost"));
+      await click(button("Re-convert", row("earlier.pdf")));
+      expect(row("earlier.pdf").textContent).toContain("Error");
+      expect(row("earlier.pdf").textContent).toContain(
+        "Previous result available"
+      );
+      await click(button("earlier.pdf", row("earlier.pdf")));
+      const dialog = document.querySelector('[role="dialog"]')!;
+      expect(dialog.textContent).toContain(
+        "The previous saved result is still available"
+      );
+      expect(dialog.textContent).toContain("Download previous HTML");
+      expect(dialog.textContent).toContain("Earlier table needs review.");
+      expect(getDocumentHtml).toHaveBeenCalledExactlyOnceWith(
+        "earlier",
+        "11111111-1111-4111-8111-111111111111"
+      );
+      expect(listDocuments).toHaveBeenCalledExactlyOnceWith(SESSION_ID);
+      expect(requests()[0].get("documentId")).toBe("earlier");
+    }
+  );
+
+  it("recovers the committed result after a lost response without repeating conversion", async () => {
+    await mount([
+      savedDocument("earlier", "success", {
+        outputTarget: "accessible_pdf",
+        jobId: "same-job",
+        changes: ["Stale change."],
+        errors: [
+          {
+            type: "other",
+            severity: "warning",
+            message: "Stale warning.",
+            suggestion: "Stale suggestion.",
+          },
+        ],
+      }),
+      savedDocument("untouched", "idle"),
+    ]);
+    fetchMock.mockRejectedValueOnce(new Error("Response lost"));
+    vi.mocked(listDocuments).mockResolvedValueOnce([
+      savedDocument("earlier", "success", {
+        outputTarget: "accessible_pdf",
+        jobId: "same-job",
+        hasAvailableOutput: true,
+        changes: ["New saved headings."],
+        errors: [],
+      }),
+    ]);
+    await click(button("Re-convert", row("earlier.pdf")));
+    expect(row("earlier.pdf").textContent).toContain("Ready to review");
+    expect(row("untouched.pdf").textContent).toContain("Ready");
+    await click(button("earlier.pdf", row("earlier.pdf")));
+    const text = document.querySelector('[role="dialog"]')!.textContent;
+    expect(text).toContain("New saved headings.");
+    expect(text).not.toContain("Stale");
+    expect(text).not.toContain("previous");
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a saved download hint but clears cached review evidence when reconciliation fails", async () => {
+    await mount([
+      savedDocument("earlier", "success", {
+        outputTarget: "accessible_pdf",
+        jobId: "same-job",
+        changes: ["Stale change."],
+        errors: [
+          {
+            type: "other",
+            severity: "warning",
+            message: "Stale warning.",
+            suggestion: "Stale suggestion.",
+          },
+        ],
+      }),
+    ]);
+    fetchMock.mockRejectedValueOnce(new Error("Response lost"));
+    await click(button("Re-convert", row("earlier.pdf")));
+    expect(row("earlier.pdf").textContent).toContain("Error");
+    expect(row("earlier.pdf").textContent).toContain(
+      "Saved result may be available"
+    );
+    await click(button("earlier.pdf", row("earlier.pdf")));
+    const text = document.querySelector('[role="dialog"]')!.textContent;
+    expect(text).toContain("Download saved repaired PDF");
+    expect(text).toContain("Refresh the page");
+    expect(text).not.toContain("Stale");
+    expect(text).not.toContain("Changes made");
+    expect(text).not.toContain("Items to review");
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("withdraws the saved-output hint if the owned refresh no longer returns the document", async () => {
+    await mount([
+      savedDocument("expired", "success", { outputTarget: "accessible_pdf" }),
+    ]);
+    fetchMock.mockRejectedValueOnce(new Error("Response lost"));
+    vi.mocked(listDocuments).mockResolvedValueOnce([]);
+    await click(button("Re-convert", row("expired.pdf")));
+    await click(button("expired.pdf", row("expired.pdf")));
+    expect(
+      document.querySelector('[role="dialog"]')!.textContent
+    ).not.toContain("Download");
+  });
+
   it("shows a returned PDF test summary, then clears it through a failed reprocess and an unmatched retry", async () => {
     const summary = {
       evidenceId: "synthetic-form-test",

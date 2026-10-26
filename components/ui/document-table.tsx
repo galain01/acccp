@@ -294,6 +294,13 @@ export default function DocumentTable({
                         )
                       )}
                       {issueBadges(doc)}
+                      {doc.status === "error" && doc.hasAvailableOutput && (
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          {doc.savedResultUnverified
+                            ? "Saved result may be available"
+                            : "Previous result available"}
+                        </p>
+                      )}
                     </TableCell>
                     <TableCell>{formatBytes(doc.size)}</TableCell>
                     <TableCell>{formatUploadTime(doc.uploadedAt)}</TableCell>

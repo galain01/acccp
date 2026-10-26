@@ -111,6 +111,148 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
+describe("previous results after a failed retry", () => {
+  it.each([
+    ["accessible_pdf", "PDF", "Download previous repaired PDF"],
+    ["accessible_docx", "Word", "Download previous Word document"],
+    ["accessible_pptx", "PowerPoint", "Download previous PowerPoint"],
+  ] as const)(
+    "keeps the previous %s download and its findings separate from the failure",
+    async (outputTarget, _label, buttonLabel) => {
+      const clicked = vi
+        .spyOn(HTMLAnchorElement.prototype, "click")
+        .mockImplementation(() => {});
+      await mount({
+        status: "error",
+        hasAvailableOutput: true,
+        savedOutputArtifactId: "11111111-1111-4111-8111-111111111111",
+        outputTarget,
+        jobId: "job-1",
+        html: undefined,
+        errorMessage: "The latest repair could not be saved.",
+        changes: ["Earlier result: identified section headings."],
+      });
+      const dialog = resultDialog();
+      expect(dialog.textContent).toContain(
+        "The latest repair could not be saved."
+      );
+      expect(dialog.textContent).toContain(
+        "The previous saved result is still available"
+      );
+      expect(dialog.textContent).toContain(
+        "Earlier result: identified section headings."
+      );
+      expect(dialog.textContent).toContain(
+        "Items to review in the previous result"
+      );
+      expect(dialog.textContent).toContain(
+        "Identify the labels at the top of this table"
+      );
+      const buttons = Array.from(dialog.querySelectorAll("button"));
+      expect(
+        buttons.some((button) => button.textContent === "Review changes")
+      ).toBe(false);
+      const download = buttons.find(
+        (button) => button.textContent === buttonLabel
+      );
+      expect(download).toBeDefined();
+      await act(async () => download!.click());
+      expect(getDocumentOutputDownload).toHaveBeenCalledExactlyOnceWith(
+        "doc-1",
+        outputTarget,
+        "11111111-1111-4111-8111-111111111111"
+      );
+      expect(clicked).toHaveBeenCalledOnce();
+      expect(getDocumentHtml).not.toHaveBeenCalled();
+    }
+  );
+
+  it("loads and labels previous HTML while retaining the latest failure", async () => {
+    await mount({
+      status: "error",
+      hasAvailableOutput: true,
+      savedOutputArtifactId: "11111111-1111-4111-8111-111111111111",
+      outputTarget: "canvas_html",
+      html: undefined,
+      errorMessage: "The latest conversion failed.",
+    });
+    expect(getDocumentHtml).toHaveBeenCalledExactlyOnceWith(
+      "doc-1",
+      "11111111-1111-4111-8111-111111111111"
+    );
+    const text = resultDialog().textContent;
+    expect(text).toContain("The latest conversion failed.");
+    expect(text).toContain("Copy previous HTML");
+    expect(text).toContain("Download previous HTML");
+    expect(text).toContain("Items to review in the previous result");
+  });
+
+  it("does not invent an earlier download when the first attempt failed", async () => {
+    await mount({
+      status: "error",
+      hasAvailableOutput: false,
+      html: undefined,
+    });
+    expect(resultDialog().textContent).not.toContain("previous saved result");
+    expect(resultDialog().textContent).not.toContain("Download");
+    expect(getDocumentHtml).not.toHaveBeenCalled();
+    expect(getDocumentOutputDownload).not.toHaveBeenCalled();
+  });
+
+  it("requests a refresh when another publication replaced the reviewed artifact", async () => {
+    vi.mocked(getDocumentOutputDownload).mockResolvedValueOnce(null);
+    const clicked = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => {});
+    await mount({
+      outputTarget: "accessible_pdf",
+      hasAvailableOutput: true,
+      savedOutputArtifactId: "11111111-1111-4111-8111-111111111111",
+      html: undefined,
+    });
+    const button = Array.from(resultDialog().querySelectorAll("button")).find(
+      (item) => item.textContent === "Download repaired PDF"
+    )!;
+    await act(async () => button.click());
+    expect(
+      resultDialog().querySelector('[role="alert"]')?.textContent
+    ).toContain("Refresh the page");
+    expect(clicked).not.toHaveBeenCalled();
+    expect(getDocumentOutputDownload).toHaveBeenCalledExactlyOnceWith(
+      "doc-1",
+      "accessible_pdf",
+      "11111111-1111-4111-8111-111111111111"
+    );
+  });
+});
+
+describe("saved HTML identity", () => {
+  it("does not reuse fetched HTML when the same document points to a new artifact", async () => {
+    const first = "11111111-1111-4111-8111-111111111111";
+    const second = "22222222-2222-4222-8222-222222222222";
+    let finishFetch!: (value: string) => void;
+    vi.mocked(getDocumentHtml)
+      .mockResolvedValueOnce("<h2>Old immutable HTML</h2>")
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishFetch = resolve;
+          })
+      );
+    await mount({ savedOutputArtifactId: first, html: undefined });
+    const openHtml = Array.from(resultDialog().querySelectorAll("button")).find(
+      (item) => item.textContent === "View HTML output"
+    )!;
+    await act(async () => openHtml.click());
+    expect(resultDialog().textContent).toContain("Old immutable HTML");
+    await mount({ savedOutputArtifactId: second, html: undefined });
+    expect(resultDialog().textContent).not.toContain("Old immutable HTML");
+    await act(async () => finishFetch("<h2>New immutable HTML</h2>"));
+    expect(getDocumentHtml).toHaveBeenLastCalledWith("doc-1", second);
+    expect(resultDialog().textContent).not.toContain("Old immutable HTML");
+  });
+});
+
 describe("native PDF results", () => {
   const interactionTestSummary = {
     evidenceId: "synthetic-form-test",

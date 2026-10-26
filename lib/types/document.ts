@@ -24,6 +24,12 @@ export interface UploadedDocument {
   size: number;
   uploadedAt: Date;
   status: ConversionStatus;
+  /** An owned, retained output exists independently of the latest attempt's status. */
+  hasAvailableOutput?: boolean;
+  /** Immutable artifact identity for the listed output and its review snapshot. */
+  savedOutputArtifactId?: string;
+  /** Browser-only: a failed request could not be reconciled with the saved result. */
+  savedResultUnverified?: boolean;
   /** Temporary browser-only phase; the saved job keeps the existing statuses. */
   processingPhase?: "uploading";
   locked: boolean;
