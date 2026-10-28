@@ -214,3 +214,47 @@ outside Git in `local-validation/w4-hosted-budget-e2e-20261028/` and
 `w4-hosted-budget-independent/`. The new saved-output SHA-256 is
 `40b8619fd7b3fd4596621be4ced309ba83cacd18309ad43e66e981483e52929f`.
 Hosted retry results must be recorded separately from this local evidence.
+
+## Repeated-inspection follow-up on 2026-10-28
+
+PR #38 deployed successfully. The hosted W-4 retry got past the previous CPU
+guard but its repair worker reached the 120-second request deadline before
+returning an output. The existing five-minute hosting route still needs room
+for the independent audit and publication; the follow-up therefore reduces
+processing work instead of increasing limits again.
+
+A private, linear index now examines simple text blocks once per page or leaf
+Form. Before the first selected text block, its disposable decoder view omits
+only proven-empty positioning instructions, while retaining every font choice
+and every operation outside those blocks. It retains the entire suffix because
+later empty text blocks can affect trailing whitespace. Unsupported, malformed,
+unpositioned or ambiguous cases use the existing complete decoder view. Every
+original extraction-work charge, original content stream and resource stays
+unchanged. The index belongs only to its exact in-memory operation list.
+
+Link-description checks also avoid hashing all annotation graphs merely to
+establish that no description property was added. Actual additions keep their
+independent source-label proof, and complete saved-annotation and document
+preservation comparisons still run. Ineligible links do not trigger the full
+annotation hashing step.
+
+An offline replay of the same public blank W-4 and already completed 40-operation
+model plan produced **byte-identical output and the identical complete response**.
+The one-time index reduced worker CPU time from **33.781 to 25.547 seconds** and
+wall time from **36.781 to 28.125 seconds** on this computer. The rejected
+per-extraction prototype was slower; it is not part of the implementation.
+These are local measurements, with no additional model calls or production data
+access. They do not predict hosted latency or certify PDF accessibility.
+
+Eight independent decoder regressions cover inherited fonts, Unicode, outside
+state saves/transforms, suffix whitespace, unsupported operators, malformed or
+unpositioned blocks, unchanged extraction limits, one index per page/Form and
+foreign-index refusal. Three annotation regressions preserve authored/empty
+descriptions and reject invented additions. All **501 native-worker tests**
+(one existing Windows platform skip) and **119 research/navigation tests** pass.
+The existing complete repair/audit run remains applicable to the exact unchanged
+worker response; a hosted retry remains a separate release check.
+
+Evidence is outside Git under `local-validation/w4-prefix-index-full-worker-20261028/`,
+`w4-link-work-baseline-20261028/` and their logs. Source SHA-256 remains
+`92444d8856ce55d9e25dca8b6d1420634fc68b11e1ab1f760916ea29ddd312b2`.

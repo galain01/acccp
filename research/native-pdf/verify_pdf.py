@@ -13,6 +13,7 @@ import json
 import logging
 import math
 import re
+from bisect import bisect_left
 from collections import Counter
 from pathlib import Path
 import sys
@@ -1111,6 +1112,76 @@ def scoped_text_operations(ops: list[tuple[Any, bytes]], owners: list[int | None
             if operation[1] not in ignored]
 
 
+class _TextPrefixIndex:
+    __slots__ = ('source', 'keep', 'starts')
+
+    def __init__(self, source, keep, starts):
+        self.source, self.keep, self.starts = source, keep, starts
+
+
+def _text_scope_index(scoped):
+    """Prove simple BT blocks once per page/Form, with only linear metadata.
+
+    Empty prefix blocks may omit their positioning, but every Tf and outside
+    operation remains. A selected block must reset position before its first
+    show; its complete suffix remains because later state can append whitespace.
+    Unsupported/malformed blocks retain the original per-scope decoder view.
+    """
+    simple = {b'BT', b'ET', b'Tf', b'Tm', b'Td', b'Tj', b'TJ'}
+    shows = {b'Tj', b'TJ', b"'", b'"'}
+    keep, starts, start, positioned = [], {}, None, False
+    for index, ((args, operator), owner, artifact) in enumerate(scoped):
+        if operator == b'BT':
+            if start is not None:
+                return None
+            start, positioned = index, False
+        if start is not None:
+            if operator not in simple or (operator in (b'BT', b'ET') and args):
+                return None
+            if operator in (b'Tf', b'Tm', b'Td'):
+                count = 6 if operator == b'Tm' else 2
+                if len(args) != count or (operator == b'Tf' and not isinstance(args[0], NameObject)):
+                    return None
+                numbers = args[1:] if operator == b'Tf' else args
+                try:
+                    if not all(isinstance(value, (int, float)) and math.isfinite(float(value)) for value in numbers):
+                        return None
+                except (TypeError, ValueError, OverflowError):
+                    return None
+                positioned |= operator in (b'Tm', b'Td')
+            if operator in shows and (artifact or owner is not None):
+                starts.setdefault(None if artifact else owner, start if positioned else None)
+            if operator == b'Tf':
+                keep.append(index)
+        else:
+            if operator in shows:
+                return None
+            keep.append(index)
+        if operator == b'ET':
+            if start is None:
+                return None
+            start = None
+    return None if start is not None else _TextPrefixIndex(scoped, keep, starts)
+
+
+def _select_text_operations(scoped, target, *, _prefix=None):
+    """Select exact owned text while reusing one private, source-bound index."""
+    start = None
+    if type(_prefix) is _TextPrefixIndex and _prefix.source is scoped:
+        start = _prefix.starts.get(target)
+    selected = []
+    if start:
+        for offset in range(bisect_left(_prefix.keep, start)):
+            selected.append(scoped[_prefix.keep[offset]][0])
+    else:
+        start = 0
+    for index in range(start, len(scoped)):
+        (args, operator), owner, artifact = scoped[index]
+        if operator not in (b'Tj', b'TJ', b"'", b'"') or (artifact if target is None else owner == target and not artifact):
+            selected.append((args, operator))
+    return selected
+
+
 def structure_inventory(reader: PdfReader) -> dict[str, Any]:
     """Read actual saved tags; do not infer associations from visual proximity."""
     pages = list(reader.pages)
@@ -1239,6 +1310,7 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
         artifact_text = ""
         artifact_complete = not form_content_uninspected
         extraction_ops = scoped_text_operations(ops, current_owners, current_artifacts)
+        prefix_index = _text_scope_index(extraction_ops)
         if artifacts:
             extraction_work += len(extraction_ops)
             if extraction_work > MAX_TEXT_EXTRACTION_OPERATORS:
@@ -1246,7 +1318,7 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
             else:
                 # Keep text state while removing every other text-show operation.
                 # Do is omitted because a Form can contain unrelated/internal text.
-                selected = [(operands, operator) for (operands, operator), _, artifact in extraction_ops if operator not in (b"Tj", b"TJ", b"'", b'"') or artifact]
+                selected = _select_text_operations(extraction_ops, None, _prefix=prefix_index)
                 page_copy = copy.copy(page)
                 page_copy[NameObject("/Contents")] = extraction_stream(selected, reader, page.get('/Resources', {}))
                 artifact_text = page_copy.extract_text() or ""
@@ -1264,7 +1336,7 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
             if extraction_work > MAX_TEXT_EXTRACTION_OPERATORS:
                 content_text[(page_number, mcid)] = None
                 continue
-            selected = [(operands, operator) for (operands, operator), owner, artifact in extraction_ops if operator not in (b"Tj", b"TJ", b"'", b'"') or (owner == mcid and not artifact)]
+            selected = _select_text_operations(extraction_ops, mcid, _prefix=prefix_index)
             page_copy = copy.copy(page)
             page_copy[NameObject("/Contents")] = extraction_stream(selected, reader, page.get('/Resources', {}))
             text = page_copy.extract_text() or ""
@@ -1345,6 +1417,7 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
             gaps.add("form_text_without_native_mcid")
         scope = {"id": f"form-{len(info['form_content']) + 1}", "pageNumber": pn, "mcids": sorted(mcids), "ownership_required_mcids": sorted(ownership_required_mcids(ops, props)), "stream": form, "text": {}, "gaps": gaps}
         extraction_ops = scoped_text_operations(ops, owners, artifacts)
+        prefix_index = _text_scope_index(extraction_ops)
         text_targets = {None if artifact else owner
                         for (_, operator), owner, artifact in extraction_ops
                         if operator in (b"Tj", b"TJ", b"'", b'"') and (artifact or owner is not None)}
@@ -1357,7 +1430,7 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
             if extraction_work > MAX_TEXT_EXTRACTION_OPERATORS:
                 gaps.add("form_text_extraction_limit")
                 continue
-            selected = [(args, operator) for (args, operator), owner, artifact in extraction_ops if operator not in (b"Tj", b"TJ", b"'", b'"') or (artifact if selected_mcid is None else owner == selected_mcid and not artifact)]
+            selected = _select_text_operations(extraction_ops, selected_mcid, _prefix=prefix_index)
             page_copy = copy.copy(page)
             page_copy[NameObject("/Contents")] = extraction_stream(selected, reader, resources)
             page_copy[NameObject("/Resources")] = resources

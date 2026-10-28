@@ -612,7 +612,7 @@ def native_link_descriptions(reader, *, targets=None, include_existing=False, _i
         for item in tag.get("contentSequence", []):
             if item.get("kind") == "objectReference":
                 owners.setdefault(item.get("annotationId"), []).append(tag["id"])
-    states, result, page_operations, paint_attempts, scanned_operations = annotation_states(reader), {}, {}, 0, 0
+    states, result, page_operations, paint_attempts, scanned_operations = None, {}, {}, 0, 0
     for tag in tags.values():
         if tag["role"] != "Link" or tag["sourceRole"] != "Link" or tag.get("textIncomplete") or tag.get("attributeGaps"):
             continue
@@ -679,6 +679,8 @@ def native_link_descriptions(reader, *, targets=None, include_existing=False, _i
             break
         if not simple_link_paint(page, {item["mcid"] for item in marks}, rectangle, page_operations[page_number]):
             continue
+        if states is None:
+            states = annotation_states(reader)
         result[key] = {"label": label, "tagId": tag["id"],
                        "sequence": [{name: value for name, value in item.items() if name != "description"} for item in sequence],
                        "state": {name: value for name, value in states[key].items() if name != "/Contents"}}
@@ -697,8 +699,21 @@ def verify_added_link_descriptions(original, candidate):
     # This increment does not infer link labels for OpenDataLoader's new tags.
     if original.trailer["/Root"].get("/StructTreeRoot") is None:
         return
-    before, after = annotation_states(original), annotation_states(candidate)
-    additions = [key for key in before if "/Contents" not in before[key] and "/Contents" in after.get(key, {})]
+    def description_presence(reader):
+        # Establish exactly the old guard's property-membership condition
+        # without hashing every field parent, appearance and form resource.
+        # Full annotation preservation still runs in verify_saved_annotations
+        # and compare_pdfs; actual additions keep the complete source proof.
+        result = {}
+        for page_number, page in enumerate(reader.pages, 1):
+            for index, reference in enumerate(resolved(page.get('/Annots', ArrayObject())), 1):
+                annotation = resolved(reference)
+                if not isinstance(annotation, DictionaryObject):
+                    fail('native_pdf_preservation')
+                result[(page_number, index)] = '/Contents' in annotation
+        return result
+    before, after = description_presence(original), description_presence(candidate)
+    additions = [key for key in before if not before[key] and after.get(key) is True]
     if not additions:
         return
     source_links = native_link_descriptions(original)
