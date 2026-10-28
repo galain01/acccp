@@ -368,7 +368,53 @@ describe("native PDF model contracts", () => {
       ).toBe(true);
     }
   });
-  it("splits a detailed four-page inventory below 200 tags by serialized size", async () => {
+  it("packs dense pages into fewer bounded requests without omitting any audit tag", async () => {
+    const state = await makeState();
+    state.inventory.tags = Array.from({ length: 600 }, (_, index) =>
+      tag(1, index + 1)
+    );
+    const batches = nativePdfBatches(state);
+    expect(batches).toHaveLength(2);
+    expect(
+      batches.every(
+        (batch) =>
+          batch.tags.length <= 300 &&
+          JSON.stringify(batch.tags).length <= 350_000
+      )
+    ).toBe(true);
+    expect(batches.flatMap((batch) => batch.tags.map((t) => t.id))).toEqual(
+      state.inventory.tags.map((t) => t.id)
+    );
+    expect(batches.flatMap((batch) => batch.pageReviewPages)).toEqual([1]);
+    useState(state);
+    const result = await repairNativePdf(state.pdf, "dense-page.pdf");
+    if ("error" in result) throw Error(result.error);
+    expect(result.nativePdfChecks.auditComplete).toBe(true);
+    expect(mocks.call).toHaveBeenCalledTimes(4);
+  });
+  it("uses the available byte budget rather than halving every oversized fixed chunk", async () => {
+    const state = await makeState();
+    state.inventory.tags = Array.from({ length: 400 }, (_, index) => {
+      const item = tag(1, index + 1);
+      item.text = "Existing course paragraph. ".repeat(40);
+      item.snapshot.text = item.text;
+      return item;
+    });
+    const batches = nativePdfBatches(state);
+    expect(batches).toHaveLength(3);
+    expect(
+      batches.every(
+        (batch) =>
+          batch.tags.length <= 300 &&
+          JSON.stringify(batch.tags).length <= 350_000
+      )
+    ).toBe(true);
+    expect(batches.flatMap((batch) => batch.tags.map((t) => t.id))).toEqual(
+      state.inventory.tags.map((t) => t.id)
+    );
+    expect(batches.flatMap((batch) => batch.pageReviewPages)).toEqual([1]);
+  });
+  it("splits a detailed four-page inventory below 300 tags by serialized size", async () => {
     const state = await makeState(4);
     state.inventory.tags = Array.from({ length: 186 }, (_, index) => {
       const item = tag(Math.floor(index / 47) + 1, index + 1);
@@ -387,7 +433,7 @@ describe("native PDF model contracts", () => {
     expect(
       batches.every(
         (batch) =>
-          batch.tags.length <= 200 &&
+          batch.tags.length <= 300 &&
           batch.pages.length <= 4 &&
           batch.visualPages.length <= 12
       )
@@ -453,26 +499,26 @@ describe("native PDF model contracts", () => {
   it("includes a continuation's previous-page visual context without assigning its read-only anchor twice", async () => {
     const state = await makeState(2);
     state.inventory.tags = [
-      ...Array.from({ length: 201 }, (_, index) => tag(1, index + 1)),
-      tag(2, 202),
+      ...Array.from({ length: 301 }, (_, index) => tag(1, index + 1)),
+      tag(2, 302),
     ];
     state.inventory.structureCandidates = [
       {
         candidateId: "f".repeat(64),
         kind: "move_page_continuation",
-        tagId: "tag-202",
+        tagId: "tag-302",
         pageNumber: 2,
         text: "continues the previous sentence.",
         preview: "The previous page ends mid-sentence.",
-        relatedTagIds: ["tag-201"],
-        readonlyTagIds: ["tag-201"],
+        relatedTagIds: ["tag-301"],
+        readonlyTagIds: ["tag-301"],
       },
     ];
     const batches = nativePdfBatches(state);
     const continuation = batches.find((batch) => batch.pages.includes(2))!;
     expect(continuation.pages).toEqual([2]);
     expect(continuation.visualPages).toEqual([1, 2]);
-    expect(continuation.tags.map((item) => item.id)).toEqual(["tag-202"]);
+    expect(continuation.tags.map((item) => item.id)).toEqual(["tag-302"]);
     expect(batches.flatMap((batch) => batch.pageReviewPages)).toEqual([1, 2]);
     expect(
       batches.flatMap((batch) => batch.tags.map((item) => item.id))
@@ -481,8 +527,8 @@ describe("native PDF model contracts", () => {
       parseNativePdfPlan(
         {
           reviewedPages: continuation.pages,
-          reviewedTagIds: ["tag-202"],
-          operations: [{ type: "set_role", tagId: "tag-201", role: "P" }],
+          reviewedTagIds: ["tag-302"],
+          operations: [{ type: "set_role", tagId: "tag-301", role: "P" }],
           findings: [],
         },
         continuation,
@@ -721,7 +767,7 @@ describe("native PDF model contracts", () => {
 
   it("gives a dense page one owner for page-wide findings while every chunk reviews its tags", async () => {
     const state = await makeState();
-    state.inventory.tags = Array.from({ length: 201 }, (_, i) => tag(1, i + 1));
+    state.inventory.tags = Array.from({ length: 301 }, (_, i) => tag(1, i + 1));
     const [owner, secondary] = nativePdfBatches(state);
     expect(owner.pageReviewPages).toEqual([1]);
     expect(secondary.pageReviewPages).toEqual([]);
@@ -736,7 +782,7 @@ describe("native PDF model contracts", () => {
     expect(parseNativePdfFindings([finding], owner)).toHaveLength(1);
     expect(() => parseNativePdfFindings([finding], secondary)).toThrow();
     expect(
-      parseNativePdfFindings([{ ...finding, tagId: "tag-201" }], secondary)
+      parseNativePdfFindings([{ ...finding, tagId: "tag-301" }], secondary)
     ).toHaveLength(1);
     expect(() =>
       parseNativePdfFindings([{ ...finding, code: "heading-structure" }], owner)
@@ -745,7 +791,7 @@ describe("native PDF model contracts", () => {
       parseNativePdfAudit(
         {
           reviewedPages: [1],
-          reviewedTagIds: ["tag-201"],
+          reviewedTagIds: ["tag-301"],
           artifactReviews: [],
           textReviews: [],
           findings: [],
@@ -1431,7 +1477,7 @@ describe("current excluded-text review reconciliation", () => {
     "requires every dense-page batch to finish without a content-loss conflict: %s",
     async (mode) => {
       const state = await makeState();
-      state.inventory.tags = Array.from({ length: 201 }, (_, index) =>
+      state.inventory.tags = Array.from({ length: 301 }, (_, index) =>
         tag(1, index + 1)
       );
       state.findings = [reminder()];
@@ -1517,21 +1563,21 @@ describe("native PDF orchestration", () => {
 
   it("supplies parallel existing and run-in heading context across tag batches without granting edit ownership", async () => {
     const state = await makeState(2);
-    state.inventory.tags = Array.from({ length: 201 }, (_, index) =>
+    state.inventory.tags = Array.from({ length: 301 }, (_, index) =>
       tag(1, index + 1)
     );
-    state.inventory.tags.push(tag(2, 202));
-    const preceding = state.inventory.tags[197];
+    state.inventory.tags.push(tag(2, 302));
+    const preceding = state.inventory.tags[297];
     preceding.role = preceding.snapshot.role = "H3";
     preceding.text = preceding.snapshot.text = "Student eligibility";
-    const following = state.inventory.tags[200];
+    const following = state.inventory.tags[300];
     following.role = following.snapshot.role = "H3";
     following.text = following.snapshot.text = "Staff eligibility";
     state.inventory.structureCandidates = [
       {
         candidateId: "e".repeat(64),
         kind: "split_heading",
-        tagId: "tag-200",
+        tagId: "tag-300",
         pageNumber: 1,
         text: "Visitor eligibility. Visitors qualify under these conditions.",
         preview:
@@ -1541,7 +1587,7 @@ describe("native PDF orchestration", () => {
       {
         candidateId: "f".repeat(64),
         kind: "split_heading",
-        tagId: "tag-202",
+        tagId: "tag-302",
         pageNumber: 2,
         text: "Volunteer eligibility. Volunteers qualify under these conditions.",
         preview:
@@ -1557,13 +1603,13 @@ describe("native PDF orchestration", () => {
       (part: LiteLLMContentPart) => part.type === "text"
     ).text;
     const current = JSON.parse(evidence.split("\n")[1]);
-    expect(current.assignedTagIds).toContain("tag-200");
-    expect(current.assignedTagIds).not.toContain("tag-201");
+    expect(current.assignedTagIds).toContain("tag-300");
+    expect(current.assignedTagIds).not.toContain("tag-301");
     expect(current.structureCandidates).toHaveLength(1);
     expect(current.structureCandidates[0].headingContext.preceding).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          tagId: "tag-198",
+          tagId: "tag-298",
           currentRole: "H3",
           kind: "saved-heading",
           excerpt: "Student eligibility",
@@ -1572,12 +1618,12 @@ describe("native PDF orchestration", () => {
     );
     expect(current.structureCandidates[0].headingContext.following).toEqual([
       expect.objectContaining({
-        tagId: "tag-201",
+        tagId: "tag-301",
         currentRole: "H3",
         kind: "saved-heading",
       }),
       expect.objectContaining({
-        tagId: "tag-202",
+        tagId: "tag-302",
         kind: "possible-run-in-heading",
       }),
     ]);
@@ -1759,7 +1805,7 @@ describe("native PDF orchestration", () => {
     "reassesses table-header findings only after a verified repair and explicit current audit: %s",
     async (mode) => {
       const prepared = await makeState();
-      prepared.inventory.tags = Array.from({ length: 208 }, (_, i) =>
+      prepared.inventory.tags = Array.from({ length: 308 }, (_, i) =>
         tag(1, i + 1)
       );
       const table = prepared.inventory.tags[0],
@@ -1776,8 +1822,8 @@ describe("native PDF orchestration", () => {
       cell.children = [leaf.id];
       leaf.parentId = cell.id;
       for (const [index, childIndex, scope] of [
-        [204, 206, "Row"],
-        [205, 207, "Column"],
+        [304, 306, "Row"],
+        [305, 307, "Column"],
       ] as const) {
         const header = prepared.inventory.tags[index];
         header.role = header.snapshot.role = "TH";
@@ -1806,7 +1852,7 @@ describe("native PDF orchestration", () => {
           headersEffective: true,
           headersResolved: true,
           headersAcyclic: true,
-          headerTagIds: ["tag-205", "tag-206"],
+          headerTagIds: ["tag-305", "tag-306"],
         },
       ];
       repaired.inventory.sourceTagLineage = Object.fromEntries(
@@ -1900,10 +1946,10 @@ describe("native PDF orchestration", () => {
         ).relatedTagContext;
         expect(related.map((t) => t.id)).toEqual(
           expect.arrayContaining([
-            "tag-1205",
-            "tag-1206",
-            "tag-1207",
-            "tag-1208",
+            "tag-1305",
+            "tag-1306",
+            "tag-1307",
+            "tag-1308",
           ])
         );
         return response({

@@ -91,7 +91,7 @@ request. The worker permits only the configured HTTPS origin, the private
 redirects, encoded paths, extra query options and arbitrary URLs. Its separate
 download process uses verified TLS, ignores proxies, checks actual byte count
 and SHA256, and is terminated after 15 seconds. The download and PDF processing
-share the overall 90-second deadline. The signed URL never reaches PDF tools.
+share the overall 120-second deadline. The signed URL never reaches PDF tools.
 
 ## Container
 
@@ -125,7 +125,7 @@ inherited runtime injection options. JVM scratch paths and working directories
 are pinned to the request directory. Cleanup follows successful, failed and
 timed-out jobs. Responses never contain native stderr or filesystem paths.
 
-The same 90-second work budget covers authenticated body intake, any signed-object
+The same 120-second work budget covers authenticated body intake, any signed-object
 download, and PDF processing. Intake checks elapsed time between bounded socket
 reads; incoming trickled bytes do not restart that budget. Exhausted requests
 do not start another processor. On the production Linux service, every terminal

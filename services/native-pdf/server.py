@@ -21,7 +21,7 @@ import stored_transport
 MAX_PDF = 4 * 1024 * 1024
 MAX_BODY = 12 * 1024 * 1024
 MAX_RESULT = 16 * 1024 * 1024
-DEADLINE = 90
+DEADLINE = 120
 POSIX_PROCESS_GROUPS = os.name == "posix"
 PROCESSOR = Path(__file__).with_name("worker.py")
 TRANSPORT = Path(__file__).with_name("stored_transport.py")

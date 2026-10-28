@@ -17,6 +17,13 @@ import server
 
 
 class RequestDeadlineTests(unittest.TestCase):
+    def setUp(self):
+        # Keep the fake clock's absolute-deadline scenarios independent of the
+        # production budget while preserving their exact expiration boundaries.
+        deadline = patch.object(server, 'DEADLINE', 90)
+        deadline.start()
+        self.addCleanup(deadline.stop)
+
     def request(self, path, *, chunks=(b"body",), seconds_per_read=30, fetch_seconds=0, length=None):
         clock = [100.0]
         pending = list(chunks)

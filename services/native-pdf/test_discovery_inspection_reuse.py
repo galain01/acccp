@@ -29,10 +29,12 @@ class DiscoveryInspectionReuseTests(unittest.TestCase):
                           wraps=worker.verify_pdf.structure_inventory) as scan:
             enriched = worker.enrich_inventory(reader, reader)
         self.assertEqual(enriched['structureCandidates'], expected)
-        # One current-PDF scan plus the existing independent original-PDF scan.
-        # Candidate discovery must not perform a third whole-PDF extraction.
-        self.assertEqual(scan.call_count, 2)
-        self.assertTrue(all(call.args == (reader,) for call in scan.call_args_list))
+        # The bounded native walk proves this source has no authored Alt or
+        # ActualText. Only the current version needs a full text extraction;
+        # enrichment and candidate discovery share that exact saved evidence.
+        self.assertTrue(all('/Alt' not in node and '/ActualText' not in node
+                            for node in worker.native_nodes(reader)))
+        scan.assert_called_once_with(reader)
         self.assertTrue(all('editable' in tag for tag in enriched['tags']))
         self.assertTrue(all('editable' not in tag for tag in raw['tags']))
 
@@ -62,7 +64,9 @@ class DiscoveryInspectionReuseTests(unittest.TestCase):
         with patch.object(worker.verify_pdf, 'structure_inventory',
                           wraps=worker.verify_pdf.structure_inventory) as scan:
             current = worker.enrich_inventory(reopened, original)
-        self.assertEqual([call.args[0] for call in scan.call_args_list], [reopened, original])
+        # Reopened bytes still require a fresh scan; the original's proven
+        # absence of authored descriptions does not require a second one.
+        scan.assert_called_once_with(reopened)
         self.assertEqual(current['structureCandidates'], structure.discover_candidates(reopened))
         self.assertFalse(any(item['kind'] == 'split_heading' for item in current['structureCandidates']))
         self.assertEqual(next(tag for tag in current['tags'] if tag['id'] == heading['tagId'])['role'], 'H3')
