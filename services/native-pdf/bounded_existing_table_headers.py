@@ -366,12 +366,17 @@ def apply_operations(source_reader, writer, operations, *, _inspection=None, _so
             proof.pages[page_number] = (
                 v.drawing_fingerprint(v.operations(source_page), v.Canonicalizer(source_pages)),
                 v.Canonicalizer(source_pages).hash(source_page['/Resources']))
-        require(proof.pages[page_number] == (
-            v.drawing_fingerprint(v.operations(page), v.Canonicalizer(pages)),
-            v.Canonicalizer(pages).hash(page['/Resources'])))
         changes.append({'code': 'repair_table_headers', 'tagId': identifier, 'pageNumber': page_number,
             'candidateId': public['candidateId'], 'relatedTagIds': public['relatedTagIds'],
             'message': 'Connected every table amount to its row range, column range and existing axis labels without changing the pages or form fields.'})
+    # These edits touch native structure only. Compare each final clone page
+    # once with its exact source version after *all* chosen tables are changed.
+    # The saved-file verifier independently repeats this proof after reopening.
+    for page_number, expected in proof.pages.items():
+        page = pages[page_number - 1]
+        require(expected == (
+            v.drawing_fingerprint(v.operations(page), v.Canonicalizer(pages)),
+            v.Canonicalizer(pages).hash(page['/Resources'])))
     if chosen:
         root[N('/IDTree')] = writer._add_object(DictionaryObject({N('/Names'): ArrayObject([
             value for identifier, node in sorted(entries.items())

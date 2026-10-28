@@ -374,8 +374,19 @@ def enrich_inventory(reader, original, *, _inspection=None, _original_inspection
         fail("pdf_complexity_limit")
     by_id = {tag["id"]: tag for tag in tags}
     try:
-        original_inventory = (_original_inspection.copy_for(original) if _original_inspection is not None
-                              else verify_pdf.structure_inventory(original))
+        if _original_inspection is not None:
+            original_inventory = _original_inspection.copy_for(original)
+        else:
+            root = resolved(original.trailer['/Root'].get('/StructTreeRoot'))
+            # This source scan is used only to protect authored native Alt and
+            # ActualText. A complete bounded native walk can prove their absence
+            # without re-extracting every text scope. Even an empty property, or
+            # one on an ancestor, retains the conservative full source scan.
+            original_nodes = native_nodes(original) if root is not None else []
+            if len(original_nodes) > MAX_TAGS:
+                fail('pdf_complexity_limit')
+            has_alternatives = any('/Alt' in node or '/ActualText' in node for node in original_nodes)
+            original_inventory = verify_pdf.structure_inventory(original) if has_alternatives else {'tags': []}
     except SemanticStructureError:
         fail("native_pdf_preservation")
     # New heading/reference children can shift preorder IDs. Bind authored
@@ -1416,7 +1427,7 @@ def main():
     if os.name == "posix":
         import resource
         resource.setrlimit(resource.RLIMIT_AS, (3 * 1024 ** 3, 3 * 1024 ** 3))
-        resource.setrlimit(resource.RLIMIT_CPU, (85, 90))
+        resource.setrlimit(resource.RLIMIT_CPU, (110, 115))
         resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 ** 2, 64 * 1024 ** 2))
         resource.setrlimit(resource.RLIMIT_NOFILE, (128, 128))
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))

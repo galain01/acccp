@@ -40,7 +40,7 @@ async function denseState(): Promise<NativePdfState> {
   const document = await PDFDocument.create();
   document.addPage([100, 100]);
   const pdf = Buffer.from(await document.save());
-  const tags: NativePdfTag[] = Array.from({ length: 300 }, (_, index) => {
+  const tags: NativePdfTag[] = Array.from({ length: 302 }, (_, index) => {
     const id = `tag-${index + 1}`;
     const role = index === 0 ? "Document" : index === 1 ? "H1" : "P";
     const text = index === 0 ? "" : `Synthetic source paragraph ${index + 1}`;
@@ -49,7 +49,7 @@ async function denseState(): Promise<NativePdfState> {
       parentId: index === 0 ? null : "tag-1",
       children:
         index === 0
-          ? Array.from({ length: 299 }, (_, i) => `tag-${i + 2}`)
+          ? Array.from({ length: 301 }, (_, i) => `tag-${i + 2}`)
           : [],
       role,
       pageNumber: 1,
@@ -123,7 +123,7 @@ async function denseState(): Promise<NativePdfState> {
           pageNumber: 1,
           text: "Synthetic source paragraph 2",
           preview: "Source-proven adjacent fragments",
-          relatedTagIds: ["tag-3", "tag-299", "tag-300"],
+          relatedTagIds: ["tag-3", "tag-301", "tag-302"],
         },
       ],
     },

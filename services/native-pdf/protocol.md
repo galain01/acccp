@@ -303,7 +303,7 @@ underscores and hyphens, beginning with a letter or digit, at most 100 character
 
 Bounds: 4 MiB PDF input and candidate, 60 pages, 5,000 tags, 500,000 text
 characters, 12 MiB repair JSON, 16 KiB stored-reference HTTP body, 16 MiB
-response, one active job per process, a 90-second work budget per request including
+response, one active job per process, a 120-second work budget per request including
 body intake and the signed-object download. Each phase receives only the
 remaining budget, and body reads check an absolute deadline so trickling input
 cannot extend it. Busy jobs fail immediately with HTTP 503.

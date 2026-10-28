@@ -168,3 +168,49 @@ acceptance manifest hash; no completed taxpayer form was used. This remains a
 local engine/function test, with no new browser upload/download claim. The
 temporary worker stopped and its random key was never saved. No production data,
 merge or deployment was changed.
+
+## Hosted CPU follow-up on 2026-10-28
+
+The first production test after PR #37 reached the worker's 85-second CPU
+guard (`SIGXCPU`, exit -24). The guard protects the service from unusually
+expensive or malformed input. It remains bounded: soft/hard CPU limits are now
+110/115 seconds, and the shared request deadline is 120 seconds. The native-PDF
+workflow allows 275 seconds, including its internal reserve; the hosting route
+still has a 300-second maximum. No hosting plan or account settings changed.
+
+The implementation also removes repeated work. Metadata-only table repair
+checks each affected source and final clone page once, with a separate saved
+output verification. A complete bounded native structure walk can establish
+that the original has no Alt or ActualText; only that case skips an otherwise
+redundant original text extraction. Any authored property, including an empty
+one or one on an ancestor, retains the full original inspection and protection.
+
+Dense-page batches now pack up to 300 tags into the existing 350,000-character
+raw-tag and 900,000-character full-evidence limits. Every tag and page-wide
+review still has one owner. Related source context, complete audit coverage,
+the 40-batch cap, 500-operation document cap, and all preservation checks remain.
+The W-4 uses eight repair and eight audit requests instead of eleven each.
+
+The complete local application flow finished in approximately 210 seconds,
+with a complete independent model audit. All 16 calls used
+`gpt-6.1-sol-2026-09-29`; 3,338,368 tokens and USD 9.6578978 of gateway-reported
+cost are retained. Independent saved-file checks again confirmed all three
+tables, 43 row headers, 516 amounts' four header relationships and 39 authored
+IDs. All five pages are pixel-identical at 1.5 scale; all 48 terminal fields,
+their values, flags, widget positions and states are preserved. XFA packet
+bytes remain unchanged apart from the 48 supported speech-setting changes.
+
+This run retains five errors and six warnings about missing image alternatives,
+fonts/Unicode, untagged content, decorative pencil images, a long checkbox label
+and unverified signing/dating interactions. It reports no table-header defect.
+It does not claim PDF/UA conformance or a new interactive screen-reader test.
+
+Validation passes 2,315 application tests, 498 native-worker tests (one existing
+Windows-only skip), 111 research/navigation tests, typechecking, scoped ESLint,
+formatting and a configured-secret scan. The new tests were first reproduced
+against the earlier implementation and cover repeated page checks, authored
+description protection, bounded packing and full audit ownership. Evidence is
+outside Git in `local-validation/w4-hosted-budget-e2e-20261028/` and
+`w4-hosted-budget-independent/`. The new saved-output SHA-256 is
+`40b8619fd7b3fd4596621be4ced309ba83cacd18309ad43e66e981483e52929f`.
+Hosted retry results must be recorded separately from this local evidence.

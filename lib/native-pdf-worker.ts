@@ -645,7 +645,7 @@ export async function nativePdfRequest(
   if (typeof body === "string" && Buffer.byteLength(body) > 12 * 1024 * 1024)
     throw new NativePdfError("pdf_complexity_limit");
   const signal = AbortSignal.timeout(
-    Math.max(1, Math.floor(Math.min(timeoutMs, 90_000)))
+    Math.max(1, Math.floor(Math.min(timeoutMs, 120_000)))
   );
   const send = async (
     requestUrl: URL,

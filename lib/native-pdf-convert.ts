@@ -103,6 +103,7 @@ export interface NativePdfConversionResult {
 const invalid = (): never => {
   throw new NativePdfError("native_pdf_invalid_plan");
 };
+const MAX_TAGS_PER_BATCH = 300;
 const text = (value: unknown, max = 2000): value is string =>
   typeof value === "string" && value.trim().length > 0 && value.length <= max;
 const exact = (value: unknown, expected: (string | number)[]) =>
@@ -200,7 +201,7 @@ export function nativePdfBatches(
     // Two PDF excerpts plus PNGs still fit the gateway image allowance.
     if (
       batch.pages.length > 4 ||
-      batch.tags.length > 200 ||
+      batch.tags.length > MAX_TAGS_PER_BATCH ||
       batch.visualPages.length > 12 ||
       JSON.stringify(batch.tags).length > 350_000
     )
@@ -239,26 +240,34 @@ export function nativePdfBatches(
       continue;
     }
     let pageReviewAssigned = false;
-    const splitPage = (assigned: NativePdfTag[]): void => {
-      const batch = makeBatch(
-        [page],
-        assigned,
-        pageReviewAssigned ? [] : [page]
-      );
-      if (fits(batch)) {
-        groups.push(batch);
-        pageReviewAssigned = true;
-        return;
-      }
-      if (assigned.length <= 1)
-        throw new NativePdfError("pdf_complexity_limit");
-      const middle = Math.ceil(assigned.length / 2);
-      splitPage(assigned.slice(0, middle));
-      splitPage(assigned.slice(middle));
-    };
     if (!tags.length) throw new NativePdfError("pdf_complexity_limit");
-    for (let offset = 0; offset < tags.length; offset += 200)
-      splitPage(tags.slice(offset, offset + 200));
+    for (let offset = 0; offset < tags.length; ) {
+      const candidate = (length: number) =>
+        makeBatch(
+          [page],
+          tags.slice(offset, offset + length),
+          pageReviewAssigned ? [] : [page]
+        );
+      const maximum = Math.min(MAX_TAGS_PER_BATCH, tags.length - offset);
+      let length = maximum;
+      if (!fits(candidate(length))) {
+        let low = 1,
+          high = maximum - 1,
+          best = 0;
+        while (low <= high) {
+          const middle = Math.floor((low + high) / 2);
+          if (fits(candidate(middle))) {
+            best = middle;
+            low = middle + 1;
+          } else high = middle - 1;
+        }
+        length = best;
+      }
+      if (!length) throw new NativePdfError("pdf_complexity_limit");
+      groups.push(candidate(length));
+      pageReviewAssigned = true;
+      offset += length;
+    }
   }
   flush();
   if (
@@ -387,7 +396,7 @@ export function parseNativePdfPlan(
       batch.tags.map((t) => t.id)
     ) ||
     !Array.isArray(raw.operations) ||
-    raw.operations.length > 200
+    raw.operations.length > MAX_TAGS_PER_BATCH
   )
     return invalid();
   if (
@@ -1178,7 +1187,7 @@ export async function repairNativePdf(
 ): Promise<NativePdfConversionResult | ConversionError> {
   const calls: ModelCallUsage[] = [];
   let stage: DiagnosticStage = "native_pdf_prepare";
-  const deadline = performance.now() + 260_000;
+  const deadline = performance.now() + 275_000;
   const remaining = () => Math.floor(deadline - performance.now() - 5000);
   const time = (minimum = 1000) => {
     if (remaining() < minimum) throw new NativePdfError("native_pdf_timeout");

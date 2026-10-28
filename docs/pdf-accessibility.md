@@ -211,10 +211,10 @@ issues and are asked to review the repaired PDF before sharing it.
 - Uploaded and generated PDFs: at most 4 MiB and 60 pages. Existing PDF rendering
   image, memory and page-preparation limits remain in effect.
 - Worker: at most 5,000 tags, 500,000 inventory text characters and 500 distinct
-  repair targets; 90 seconds per request and one active job per process. Busy
+  repair targets; 120 seconds per request and one active job per process. Busy
   requests fail with a controlled retry message. No durable queue is introduced.
 - Model requests: bounded page/tag batches and at most four simultaneous calls,
-  within the existing 260-second workflow deadline. Every completed conversion
+  within the 275-second native-PDF workflow deadline. Every completed conversion
   and audit call contributes to token and cost metrics, including failed attempts.
 - The private worker accepts only authenticated app requests. Large repair
   requests use one short-lived signed object in the existing private storage

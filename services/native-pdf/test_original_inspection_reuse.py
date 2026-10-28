@@ -135,7 +135,10 @@ class OriginalInspectionReuseTests(unittest.TestCase):
                 result = worker.process("prepare", request, prepare_folder, {})
             self.assertEqual(counts[reference_sha], 1, dict(counts))
             self.assertEqual(counts[result["candidateSha256"]], 1, dict(counts))
-            self.assertEqual(counts[worker.digest(source)], 1, dict(counts))
+            # The raw hybrid has no authored native Alt/ActualText. Its
+            # bounded absence proof avoids a redundant text extraction while
+            # the normalized source and delivered candidate stay independent.
+            self.assertEqual(counts[worker.digest(source)], 0, dict(counts))
             self.assertEqual(compared.call_count, 1)
             self.assertTrue(result["machineChecks"]["preservationPassed"])
 
