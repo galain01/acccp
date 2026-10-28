@@ -178,9 +178,12 @@ verified structure/painting boundaries. A planner may select
 `split_heading` candidate also accepts `role:"H2"` through `"H6"`. A
 `describe_chart` candidate requires `alt` (1–8000 characters) and forbids `role`.
 Other candidate kinds are `convert_list`, `join_list_continuation`,
-`mark_note_reference`, `rebuild_table`, `move_callout` and
-`move_page_continuation`; these accept neither `role` nor `alt`. Up to 200
-related tag IDs identify participants. Only `move_page_continuation` supplies
+`mark_note_reference`, `rebuild_table`, `rebuild_grid_table`, `repair_table_headers`,
+`move_callout` and `move_page_continuation`; these accept neither `role` nor `alt`.
+Up to 200 related tag IDs identify participants, or 4000 for an existing-table
+header repair's complete native subtree. The existing model evidence size limit
+still applies; participants and their text are never silently truncated.
+Only `move_page_continuation` supplies
 `readonlyTagIds`: exactly one related anchor, distinct from the primary tag,
 that provides context and is not modified by that operation. This permits a
 verified heading split on the anchor to compose with moving its continuation.
@@ -212,6 +215,31 @@ The private pipeline rederives selections from immutable source bytes, captures
 original node maps before edits, rejects overlapping operations, and verifies
 saved cell/header membership, graphic ownership and reading order after reopening.
 The independent audit checks semantic accuracy against the original pages.
+
+`repair_table_headers` supports an existing native rectangular table with a
+blank corner, authored first-row column-header IDs, and body cells explicitly
+linked only to their source column. It requires two adjacent source axis labels,
+unambiguous native/marked-content ownership on one page, and distinct row and
+column ranges. Discovery is bounded to eight tables, 60 data rows and 32 columns;
+spans, unresolved or conflicting attributes, protected text alternatives and
+ambiguous ownership are ineligible. The model confirms which axis describes the
+first-column row ranges and which describes the column ranges; it cannot supply
+text, geometry, IDs or replacement values. The writer retains all original nodes
+and authored ID ownership, places the original axes and header row under THead,
+places the original body rows under TBody, and gives each amount explicit links
+to both axes, its row header and its original column header. It independently
+verifies the saved hierarchy, scopes, complete acyclic header graph, source
+painting/resources and preserved form state. No page stream or field is edited.
+
+The model uses `table-header-relationships` with an exact assigned tag ID for an
+unresolved row/column association. After an executed and verified header repair,
+the independent audit receives a targeted reassessment and the current linked
+header text even across tag batches. An earlier concern is retired only after an
+explicit eligible `resolved` review of that saved tag and role; omitted,
+conflicting, invalid, unverified or uncertain reviews retain it. This cannot
+dismiss machine findings, form interaction requirements or unrelated table
+defects. The same current-state review channel continues to handle verified
+heading repairs.
 
 The table kernel may additionally wrap one source-proven constant pale axial
 shading in `/Artifact` marking. It requires a self-contained rectangular clip

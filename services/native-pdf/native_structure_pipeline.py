@@ -12,15 +12,17 @@ import bounded_artifact_reading as artifacts
 import bounded_excluded_figures as excluded_figures
 import bounded_interrupted_text as interrupted
 import bounded_false_list as false_lists
+import bounded_existing_table_headers as existing_headers
 
 
-MODULES = (tables, grids, reading, charts, excluded_figures, interrupted, false_lists, artifacts)
+MODULES = (tables, grids, existing_headers, reading, charts, excluded_figures, interrupted, false_lists, artifacts)
 KINDS = {'rebuild_table': tables, 'move_callout': reading,
          'move_page_continuation': reading, 'describe_chart': charts,
          'rebuild_grid_table': grids, 'restore_artifact_text': artifacts,
          'restore_excluded_figure': excluded_figures,
          'join_interrupted_text': interrupted,
-         'restore_decimal_paragraphs': false_lists}
+         'restore_decimal_paragraphs': false_lists,
+         'repair_table_headers': existing_headers}
 
 
 def _inspection_for(reader, inspection):

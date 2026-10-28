@@ -57,7 +57,7 @@ attached after plan validation. All model calls, including failed attempts, reta
 the existing usage/cost accounting. File, page, operator, native 90-second,
 four-request model-pool and application 260-second bounds are unchanged.
 
-## Local verification on 2026-10-28
+## Baseline support verification on 2026-10-28
 
 The final real `repairNativePdf` run, using `gpt-6.1-sol-2026-09-29` for both
 stages, completed in **229.342 seconds**. Preparation took about 27 seconds and
@@ -100,3 +100,71 @@ same repair/audit function as the application through its authenticated local
 worker; it does not establish a new browser upload/download test for this file.
 No production database, storage bucket, deployment or document was changed.
 The temporary worker stopped, and its random authentication key was never saved.
+
+## Automatic table-header follow-up on 2026-10-28
+
+The three existing native tables on page 5 now receive complete source-derived
+row, column and job-axis relationships. Every one of their **516 amounts** links
+to the appropriate higher-paying-job range, lower-paying-job range and both
+original axis labels. All **43 row ranges** are native row headers; the original
+column-header identifiers remain bound to their exact original content.
+
+The bounded writer selects a source-bound `repair_table_headers` candidate. It
+retains each original native cell, marked-content scope and authored identifier,
+moves the existing axis tags into a native THead group, and places the existing
+data rows under TBody. It adds header relationships without editing page streams
+or form fields. Saved verification checks the complete acyclic header/ID graph,
+node ownership, scopes, source painting/resources and unchanged form inventory.
+Ambiguous, stale, conflicting, protected or unsupported structures are refused.
+See the worker protocol for the supported shapes and existing resource limits.
+
+Earlier model findings can originate in a different tag batch from the table's
+atomic repair. Header findings now use an exact assigned tag ID and the code
+`table-header-relationships`. After the worker verifies the selected repair, the
+auditor receives that specific concern, its current tag/role, the repaired table
+ID and linked header text across batch boundaries. Only an explicit eligible
+current-state review can retire it. Omitted, invalid, conflicting or uncertain
+reviews retain the concern; machine failures, form interaction requirements and
+unrelated defects remain independent.
+
+The first real test exposed missing TBody groups and stale pre-repair warnings.
+Both were reproduced with failing regressions before correction. The final full
+`repairNativePdf` run used `gpt-6.1-sol-2026-09-29` for repair and audit and finished
+in **249.024 seconds**, within the existing 260-second deadline. All **22 calls**
+(11 repair, 11 audit), **3,913,318 tokens** and **USD 9.8184274** gateway-reported
+cost are recorded. Both real runs' usage is retained in the local reports.
+
+Independent reopening of the final saved output confirmed:
+
+- All three tables have correct native header/body groups, all 43 row headers
+  and all 516 amounts' four source-supported header links. All 39 original
+  authored IDs survive. The complete ID/header graph resolves without cycles.
+- veraPDF reports no remaining table requirement failures. All six earlier
+  table-header concerns received explicit, source-grounded `resolved` reviews,
+  and the complete audit reported no remaining table-header issue.
+- Every original page is pixel-identical at 1.5 scale, with unchanged page
+  geometry and extracted text. All 48 terminal fields retain their names,
+  types, values, flags, widget positions and checkbox states.
+- XFA datasets, scripts, embedded drawings and other packet bytes are retained;
+  the template has only the 48 previously supported speech-setting changes.
+
+The final file retains **4 errors and 5 warnings** about fonts/Unicode, untagged
+content, the decorative pencil image, one long field description and unverified
+form interaction. These remain visible. No new Acrobat/screen-reader test,
+interaction-evidence registry entry, PDF/UA declaration or conformance claim was
+added. The earlier desktop stop remains in force.
+
+Local validation passes **2,313 application tests**, **491 native tests** (one
+existing Windows skip), **111 research/navigation tests**, TypeScript,
+changed-code ESLint and formatting. The new regressions include object
+renumbering, hierarchical ID trees, original ID ownership, composition with
+heading repair, pre-mutated text/font refusal and saved-output tamper checks.
+
+Evidence remains outside Git under `local-validation/w4-headers-final-20261028/`
+and `w4-headers-final-independent/`. The delivered output SHA-256 is
+`cb7692d75acae6692495f9ef24d9ef3d56c01545ae435d254bd1f572bbc9d055`.
+The public blank IRS fixture has no populated terminal fields and matches the
+acceptance manifest hash; no completed taxpayer form was used. This remains a
+local engine/function test, with no new browser upload/download claim. The
+temporary worker stopped and its random key was never saved. No production data,
+merge or deployment was changed.

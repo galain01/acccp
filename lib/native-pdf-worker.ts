@@ -33,6 +33,7 @@ export interface NativePdfStructureCandidate {
     | "convert_list"
     | "rebuild_table"
     | "rebuild_grid_table"
+    | "repair_table_headers"
     | "restore_excluded_figure"
     | "join_interrupted_text"
     | "restore_decimal_paragraphs"
@@ -412,6 +413,7 @@ export function parseNativePdfState(
           "convert_list",
           "rebuild_table",
           "rebuild_grid_table",
+          "repair_table_headers",
           "restore_excluded_figure",
           "join_interrupted_text",
           "restore_decimal_paragraphs",
@@ -425,7 +427,8 @@ export function parseNativePdfState(
         !boundedText(candidate.text, 20_000) ||
         !boundedText(candidate.preview, 20_000) ||
         !Array.isArray(candidate.relatedTagIds) ||
-        candidate.relatedTagIds.length > 200 ||
+        candidate.relatedTagIds.length >
+          (candidate.kind === "repair_table_headers" ? 4000 : 200) ||
         candidate.relatedTagIds.some((id) => !ids.has(String(id))) ||
         new Set(candidate.relatedTagIds).size !== candidate.relatedTagIds.length
       )

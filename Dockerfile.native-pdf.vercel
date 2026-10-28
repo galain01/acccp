@@ -23,6 +23,7 @@ COPY services/native-pdf/bounded_grid_table_structure.py services/native-pdf/bou
 COPY services/native-pdf/bounded_excluded_figures.py /app/services/native-pdf/
 COPY services/native-pdf/bounded_interrupted_text.py /app/services/native-pdf/
 COPY services/native-pdf/bounded_false_list.py /app/services/native-pdf/
+COPY services/native-pdf/bounded_existing_table_headers.py /app/services/native-pdf/
 COPY services/native-pdf/native_generated_references.py /app/services/native-pdf/
 COPY services/native-pdf/native_generated_link_labels.py /app/services/native-pdf/
 COPY --chmod=0555 services/native-pdf/start-worker.sh /usr/local/bin/start-native-pdf.sh

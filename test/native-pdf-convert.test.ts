@@ -32,7 +32,7 @@ import {
   parseNativePdfFindings,
   parseNativePdfPlan,
   parseNativePdfAudit,
-  parseNativePdfHeadingReviews,
+  parseNativePdfRepairFindingReviews,
   coalesceNativePdfOperations,
   repairNativePdf,
 } from "../lib/native-pdf-convert";
@@ -117,7 +117,7 @@ function scope(parts: LiteLLMContentPart[]) {
     pageReviewPages: number[];
     assignedTagIds: string[];
     tags: NativePdfTag[];
-    repairFindingReviewTargets: import("../lib/native-pdf-convert").NativePdfHeadingReviewTarget[];
+    repairFindingReviewTargets: import("../lib/native-pdf-convert").NativePdfRepairReviewTarget[];
   };
 }
 function response(content: unknown) {
@@ -762,6 +762,7 @@ describe("native PDF model contracts", () => {
     "convert_list",
     "rebuild_table",
     "rebuild_grid_table",
+    "repair_table_headers",
     "join_interrupted_text",
     "restore_decimal_paragraphs",
     "restore_excluded_figure",
@@ -846,13 +847,13 @@ describe("native PDF model contracts", () => {
       explanation: "The saved H3 is a child of the current H2.",
       currentTag: { tagId: "tag-2", role: "H3" },
     };
-    expect(parseNativePdfHeadingReviews(undefined, [target])).toEqual([]);
-    expect(parseNativePdfHeadingReviews([], [target])).toEqual([]);
-    expect(parseNativePdfHeadingReviews([review], [target])).toEqual([
+    expect(parseNativePdfRepairFindingReviews(undefined, [target])).toEqual([]);
+    expect(parseNativePdfRepairFindingReviews([], [target])).toEqual([]);
+    expect(parseNativePdfRepairFindingReviews([review], [target])).toEqual([
       target.findingId,
     ]);
     expect(
-      parseNativePdfHeadingReviews(
+      parseNativePdfRepairFindingReviews(
         [{ ...review, decision: "uncertain" }],
         [target]
       )
@@ -865,13 +866,13 @@ describe("native PDF model contracts", () => {
       { operation: "set_role" },
     ])
       expect(() =>
-        parseNativePdfHeadingReviews([{ ...review, ...change }], [target])
+        parseNativePdfRepairFindingReviews([{ ...review, ...change }], [target])
       ).toThrow();
     expect(() =>
-      parseNativePdfHeadingReviews([review, review], [target])
+      parseNativePdfRepairFindingReviews([review, review], [target])
     ).toThrow();
     expect(() =>
-      parseNativePdfHeadingReviews(
+      parseNativePdfRepairFindingReviews(
         [review],
         [{ ...target, eligibleForResolution: false }]
       )
@@ -1747,6 +1748,211 @@ describe("native PDF orchestration", () => {
     }
   );
 
+  it.each([
+    "resolved",
+    "omitted",
+    "unselected",
+    "unverified",
+    "invalid",
+    "conflicting",
+  ] as const)(
+    "reassesses table-header findings only after a verified repair and explicit current audit: %s",
+    async (mode) => {
+      const prepared = await makeState();
+      prepared.inventory.tags = Array.from({ length: 208 }, (_, i) =>
+        tag(1, i + 1)
+      );
+      const table = prepared.inventory.tags[0],
+        row = prepared.inventory.tags[1],
+        cell = prepared.inventory.tags[2],
+        leaf = prepared.inventory.tags[3];
+      table.role = table.snapshot.role = "Table";
+      table.children = [row.id];
+      row.role = row.snapshot.role = "TR";
+      row.parentId = table.id;
+      row.children = [cell.id];
+      cell.role = cell.snapshot.role = "TD";
+      cell.parentId = row.id;
+      cell.children = [leaf.id];
+      leaf.parentId = cell.id;
+      for (const [index, childIndex, scope] of [
+        [204, 206, "Row"],
+        [205, 207, "Column"],
+      ] as const) {
+        const header = prepared.inventory.tags[index];
+        header.role = header.snapshot.role = "TH";
+        header.children = [prepared.inventory.tags[childIndex].id];
+        prepared.inventory.tags[childIndex].parentId = header.id;
+        header.attributes = [{ owner: "Table", scope }];
+      }
+      const candidateId = "f".repeat(64);
+      prepared.inventory.structureCandidates = [
+        {
+          candidateId,
+          kind: "repair_table_headers",
+          tagId: table.id,
+          pageNumber: 1,
+          text: "Salary axes",
+          preview: "Verified source row/column ranges",
+          relatedTagIds: [row.id, cell.id, leaf.id],
+        },
+      ];
+      const repaired = structuredClone(prepared) as NativePdfState;
+      repaired.pdf = prepared.pdf;
+      repaired.inventory.structureCandidates = [];
+      repaired.inventory.tags[2].attributes = [
+        {
+          owner: "Table",
+          headersEffective: true,
+          headersResolved: true,
+          headersAcyclic: true,
+          headerTagIds: ["tag-205", "tag-206"],
+        },
+      ];
+      repaired.inventory.sourceTagLineage = Object.fromEntries(
+        repaired.inventory.tags.map((t) => [
+          t.id,
+          `tag-${Number(t.id.slice(4)) + 1000}`,
+        ])
+      );
+      for (const current of repaired.inventory.tags) {
+        current.sourceTagId = current.id;
+        current.id = repaired.inventory.sourceTagLineage[current.id];
+        current.parentId = current.parentId
+          ? repaired.inventory.sourceTagLineage[current.parentId]
+          : null;
+        current.children = current.children.map(
+          (id) => repaired.inventory.sourceTagLineage![id]
+        );
+        if (Array.isArray(current.attributes))
+          for (const a of current.attributes) {
+            if (Array.isArray(a.headerTagIds))
+              a.headerTagIds = a.headerTagIds.map(
+                (id: string) => repaired.inventory.sourceTagLineage![id]
+              );
+          }
+      }
+      repaired.changes =
+        mode === "unverified"
+          ? []
+          : [
+              {
+                code: "repair_table_headers",
+                tagId: "tag-1001",
+                pageNumber: 1,
+                message: "Verified row/column header repair",
+              },
+            ];
+      const machineMessage = "Independent machine failure remains.";
+      repaired.findings = [
+        { code: "table-machine", severity: "error", message: machineMessage },
+      ];
+      useState(prepared);
+      mocks.worker
+        .mockResolvedValueOnce(prepared)
+        .mockResolvedValueOnce(repaired);
+      const tableMessage = "This amount has only its column label.";
+      const unrelatedMessage =
+        "An unsupported form action still needs testing.";
+      mocks.call.mockImplementation((prompt, parts) => {
+        const content = validContent(prompt, parts),
+          evidence = scope(parts);
+        if (prompt !== NATIVE_PDF_AUDIT_PROMPT)
+          return response({
+            ...content,
+            operations:
+              evidence.assignedTagIds.includes("tag-1") && mode !== "unselected"
+                ? [{ type: "repair_structure", tagId: table.id, candidateId }]
+                : [],
+            findings: evidence.assignedTagIds.includes(leaf.id)
+              ? [
+                  {
+                    code: "table-header-relationships",
+                    severity: "error",
+                    pageNumber: 1,
+                    tagId: leaf.id,
+                    location: "An amount in the first table",
+                    message: tableMessage,
+                    suggestion: "Connect its row and column.",
+                  },
+                  {
+                    code: "form-interaction",
+                    severity: "warning",
+                    pageNumber: 1,
+                    tagId: leaf.id,
+                    location: "Form control",
+                    message: unrelatedMessage,
+                    suggestion: "Test in Acrobat.",
+                  },
+                ]
+              : [],
+          });
+        if (!evidence.assignedTagIds.includes("tag-1004"))
+          return response(content);
+        const [target] = evidence.repairFindingReviewTargets;
+        expect(target).toMatchObject({
+          tagId: "tag-1004",
+          currentRole: "P",
+          eligibleForResolution: !["unselected", "unverified"].includes(mode),
+        });
+        const related = (
+          evidence as unknown as { relatedTagContext: NativePdfTag[] }
+        ).relatedTagContext;
+        expect(related.map((t) => t.id)).toEqual(
+          expect.arrayContaining([
+            "tag-1205",
+            "tag-1206",
+            "tag-1207",
+            "tag-1208",
+          ])
+        );
+        return response({
+          ...content,
+          ...(mode === "omitted"
+            ? {}
+            : {
+                repairFindingReviews: [
+                  {
+                    findingId: target.findingId,
+                    decision: "resolved",
+                    explanation:
+                      "The saved amount resolves to the correct row and column labels.",
+                    currentTag: {
+                      tagId: target.tagId,
+                      role: mode === "invalid" ? "TH" : target.currentRole,
+                    },
+                  },
+                ],
+              }),
+          findings:
+            mode === "conflicting"
+              ? [
+                  {
+                    code: "table-header-relationships",
+                    severity: "error",
+                    pageNumber: 1,
+                    tagId: target.tagId,
+                    location: "Same amount",
+                    message: "The row link remains incorrect.",
+                    suggestion: "Review the saved relationship.",
+                  },
+                ]
+              : [],
+        });
+      });
+      const result = await repairNativePdf(prepared.pdf, "synthetic-table.pdf");
+      if ("error" in result) throw Error(result.error);
+      expect(result.errors.map((e) => e.message)).toContain(machineMessage);
+      expect(result.errors.map((e) => e.message)).toContain(unrelatedMessage);
+      expect(result.errors.some((e) => e.message === tableMessage)).toBe(
+        mode !== "resolved"
+      );
+      expect(result.nativePdfChecks.auditComplete).toBe(
+        ["resolved", "omitted"].includes(mode)
+      );
+    }
+  );
+
   it("coalesces only an exact Note role already applied by a selected reference candidate", async () => {
     const state = await makeState();
     const candidateId = "d".repeat(64);
@@ -1790,6 +1996,7 @@ describe("native PDF orchestration", () => {
   it.each([
     "rebuild_table",
     "rebuild_grid_table",
+    "repair_table_headers",
     "move_callout",
     "describe_chart",
   ] as const)(
