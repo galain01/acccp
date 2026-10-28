@@ -766,6 +766,7 @@ class LocalDestinations:
         self.catalog = catalog
         self.page_lookup = page_lookup
         self.cache: dict[str, tuple[dict[bytes, Any], str | None]] = {}
+        self.ambiguous: dict[str, set[bytes]] = {}
 
     @staticmethod
     def string_key(value: Any) -> bytes:
@@ -780,6 +781,9 @@ class LocalDestinations:
         if kind in self.cache:
             return self.cache[kind]
         entries: dict[bytes, Any] = {}
+        ambiguous: set[bytes] = set()
+        self.ambiguous[kind] = ambiguous
+        count = 0
         try:
             if kind == "legacy":
                 table = resolved(self.catalog.get("/Dests", {}))
@@ -797,6 +801,7 @@ class LocalDestinations:
                 visited: set[int] = set()
 
                 def walk(node: Any, depth: int = 0) -> None:
+                    nonlocal count
                     node = resolved(node)
                     if not isinstance(node, dict) or id(node) in visited or depth > MAX_DEPTH or len(visited) >= 5000:
                         raise InspectionError("invalid_destination_name_tree")
@@ -815,9 +820,14 @@ class LocalDestinations:
                             raise InspectionError("invalid_destination_name_tree")
                         for offset in range(0, len(values), 2):
                             key = self.string_key(values[offset])
-                            if key in entries or len(entries) >= 5000:
-                                raise InspectionError("ambiguous_named_destination")
-                            entries[key] = values[offset + 1]
+                            count += 1
+                            if count > 5000:
+                                raise InspectionError("invalid_destination_name_tree")
+                            if key in entries or key in ambiguous:
+                                ambiguous.add(key)
+                                entries.pop(key, None)
+                            else:
+                                entries[key] = values[offset + 1]
 
                 if tree is not None:
                     walk(tree)
@@ -842,7 +852,8 @@ class LocalDestinations:
             result["destinationNameSha256"] = digest(key)
             entries, error = self.index(kind)
             if error is not None or key not in entries:
-                result["destinationUnresolvedReason"] = error or "named_destination_missing"
+                result["destinationUnresolvedReason"] = error or (
+                    "ambiguous_named_destination" if key in self.ambiguous[kind] else "named_destination_missing")
                 return result
             destination = resolved(entries[key])
         else:
@@ -867,6 +878,187 @@ class LocalDestinations:
         result.update({"destinationResolved": True, "destinationPageNumber": page, "destinationView": str(destination[1]).lstrip("/")})
         return result
 
+
+
+class _NavigationCanonicalizer(Canonicalizer):
+    """Bind native name/string types and all navigation keys after renumbering."""
+
+    def value(self, item: Any, active=None, depth: int = 0) -> Any:
+        value = resolved(item)
+        if self.owned_reference(item) in self.page_refs or id(value) in self.pages:
+            return super().value(item, active, depth)
+        if isinstance(value, NameObject):
+            if len(value) > MAX_TEXT_CHARS:
+                raise InspectionError('text_size_limit')
+            return {'pdf_name': str(value)}
+        elif isinstance(value, (TextStringObject, ByteStringObject, bytes)):
+            data = value.original_bytes if isinstance(value, TextStringObject) else bytes(value)
+            if len(data) > MAX_TEXT_CHARS:
+                raise InspectionError('text_size_limit')
+            return {'pdf_string_sha256': digest(data), 'length': len(data)}
+        elif isinstance(value, StreamObject):
+            data = value.get_data()
+            self.stream_bytes += len(data)
+            if len(data) > MAX_STREAM_BYTES or self.stream_bytes > MAX_TOTAL_STREAM_BYTES:
+                raise InspectionError("stream_size_limit")
+            item = ("pdf_stream", [(str(key), value[key]) for key in sorted(value)
+                    if key not in ("/Length", "/Filter", "/DecodeParms")], digest(data))
+        elif isinstance(value, dict):
+            item = ("pdf_dictionary", [(str(key), value[key]) for key in sorted(value)])
+        return super().value(item, active, depth)
+
+
+def _bounded_navigation_data(value: Any, canonical: _NavigationCanonicalizer) -> None:
+    """Inspect finite destination data without accepting executable dictionaries."""
+    pending = [(value, 0)]
+    seen: set[int] = set()
+    count = 0
+    while pending:
+        item, depth = pending.pop()
+        count += 1
+        if count > MAX_NODES or depth > MAX_DEPTH:
+            raise InspectionError("navigation_complexity_limit")
+        if canonical.owned_reference(item) in canonical.page_refs:
+            continue
+        item = resolved(item)
+        if id(item) in canonical.pages:
+            continue
+        if isinstance(item, StreamObject):
+            raise InspectionError("unsupported_destination_data")
+        if not isinstance(item, (dict, list)) or id(item) in seen:
+            continue
+        seen.add(id(item))
+        if isinstance(item, dict):
+            if any(key in item for key in ("/S", "/A", "/AA", "/JS", "/JavaScript", "/Next",
+                                          "/OpenAction", "/EmbeddedFiles", "/EF", "/AF")):
+                raise InspectionError("unsupported_destination_data")
+            pending.extend((child, depth + 1) for child in item.values())
+        else:
+            pending.extend((child, depth + 1) for child in item)
+    canonical.hash(value)
+
+
+def navigation_inventory(reader: PdfReader) -> dict[str, Any]:
+    """Separate inspectable broken links from unsafe or incomplete inspection.
+
+    An unresolved local name is a document defect. Its exact original token and
+    destination dictionaries can still be preserved while other content changes.
+    No destination is guessed, fetched, repaired or treated as working here.
+    """
+    pages = list(reader.pages)
+    catalog = reader.trailer["/Root"]
+    lookup = {reference_key(page): index + 1 for index, page in enumerate(pages)}
+    resolver = LocalDestinations(catalog, lookup)
+    canonical = _NavigationCanonicalizer(pages)
+    result: dict[str, Any] = {"checks_complete": True, "findings": [], "annotations": [],
+                              "destinationTablesSha256": None}
+    names = resolved(catalog.get('/Names', {}))
+    destinations = {key: catalog[key] for key in ('/Dests',) if key in catalog}
+    if isinstance(names, dict) and '/Dests' in names:
+        destinations['nameTree'] = names['/Dests']
+    elif not isinstance(names, dict):
+        result['checks_complete'] = False
+    try:
+        _bounded_navigation_data(destinations, canonical)
+        result['destinationTablesSha256'] = canonical.hash(destinations)
+    except (InspectionError, UnicodeError, AttributeError, TypeError, ValueError):
+        result['checks_complete'] = False
+    for page_number, page in enumerate(pages, 1):
+        annotations = resolved(page.get('/Annots', []))
+        if not isinstance(annotations, list) or len(annotations) > 5000:
+            raise InspectionError('annotation_count_limit')
+        for index, reference in enumerate(annotations, 1):
+            annotation = resolved(reference)
+            if not isinstance(annotation, dict):
+                raise InspectionError('invalid_annotation')
+            if annotation.get('/Subtype') != '/Link':
+                continue
+            record: dict[str, Any] = {'annotationId': f'p{page_number}-a{index}',
+                                      'page': page_number, 'annotationIndex': index}
+            reason = None
+            try:
+                state = {key: value for key, value in annotation.items()
+                         if key not in ('/StructParent', '/StructParents')}
+                record['stateSha256'] = canonical.hash(state)
+                if '/AA' in annotation or '/Dest' in annotation and '/A' in annotation:
+                    raise InspectionError('unsupported_link_action')
+                action = resolved(annotation.get('/A'))
+                local = '/Dest' in annotation
+                if '/A' in annotation:
+                    if (not isinstance(action, dict) or not isinstance(action.get('/S'), NameObject)
+                            or '/Type' in action and (not isinstance(action['/Type'], NameObject) or action['/Type'] != '/Action')):
+                        raise InspectionError('unsupported_link_action')
+                    if action.get('/S') == '/GoTo':
+                        if set(action) - {'/Type', '/S', '/D'} or '/D' not in action:
+                            raise InspectionError('unsupported_link_action')
+                        local = True
+                    elif action.get('/S') == '/URI':
+                        uri = resolved(action.get('/URI'))
+                        if (set(action) - {'/Type', '/S', '/URI', '/IsMap'}
+                                or not isinstance(uri, (TextStringObject, ByteStringObject))
+                                or len(uri) > 8000 or not re.match(r'^(?:https?://|mailto:|tel:)', str(uri), re.I)
+                                or '/IsMap' in action and type(resolved(action['/IsMap'])).__name__ != 'BooleanObject'):
+                            raise InspectionError('unsupported_link_action')
+                    else:
+                        raise InspectionError('unsupported_link_action')
+                elif not local:
+                    raise InspectionError('unsupported_link_action')
+                if local:
+                    destination = annotation.get('/Dest') if '/Dest' in annotation else action['/D']
+                    _bounded_navigation_data(destination, canonical)
+                    evidence = resolver.resolve(destination)
+                    record.update(evidence)
+                    reason = evidence.get('destinationUnresolvedReason')
+                    if reason in ('invalid_destination_name_tree', 'invalid_legacy_destinations', 'invalid_named_destination_key'):
+                        raise InspectionError(reason)
+                record['navigationInspected'] = True
+            except (InspectionError, UnicodeError, AttributeError, TypeError, ValueError) as error:
+                record['navigationInspected'] = False
+                result['checks_complete'] = False
+                reason = str(error) if isinstance(error, InspectionError) else 'unsupported_link_action'
+            if reason:
+                complete = record['navigationInspected'] and result['destinationTablesSha256'] is not None
+                finding = {'code': 'local_link_destination_unresolved' if complete else 'link_navigation_uninspected',
+                           'severity': 'warning' if complete else 'error', 'page': page_number,
+                           'annotationId': record['annotationId'], 'reason': reason,
+                           'message': (f'Page {page_number}, link {index}: ' + {
+                               'named_destination_missing': 'the link points to an internal destination that is missing from the original PDF.',
+                               'ambiguous_named_destination': 'the original PDF assigns the same internal name to several destinations, so the intended target is unclear.',
+                               'destination_page_missing': 'the link points to a page that is not part of the original PDF.'
+                           }.get(reason, 'the original PDF contains an internal link with an invalid destination.') +
+                           ' The link has been kept; the app has not guessed a replacement.'
+                           if complete else f'Page {page_number}, link {index}: the app could not safely inspect this link action.')}
+                result['findings'].append(finding)
+            result['annotations'].append(record)
+    return result
+
+
+def compare_annotations(source: PdfReader, output: PdfReader) -> dict[str, Any]:
+    """No waiver for changed, dropped or retargeted links, including broken ones."""
+    before, after = navigation_inventory(source), navigation_inventory(output)
+    result = {'passed': False, 'sourceFindings': before['findings'], 'outputFindings': after['findings'],
+              'sourceInspectionComplete': before['checks_complete'], 'outputInspectionComplete': after['checks_complete'],
+              'comparisons': [], 'destinationTablesIdentical': before['destinationTablesSha256'] == after['destinationTablesSha256']}
+    left, right = before['annotations'], after['annotations']
+    if len(source.pages) != len(output.pages) or len(left) != len(right):
+        return result
+    old_canonical = _NavigationCanonicalizer(list(source.pages))
+    new_canonical = _NavigationCanonicalizer(list(output.pages))
+    for original, current in zip(left, right):
+        same = original['annotationId'] == current['annotationId']
+        old = resolved(source.pages[original['page'] - 1]['/Annots'][original['annotationIndex'] - 1])
+        new = resolved(output.pages[current['page'] - 1]['/Annots'][current['annotationIndex'] - 1])
+        # Only a missing link description may be added. Authored descriptions,
+        # URI/action keys, native destination token types and identity stay bound.
+        before_state = {key: value for key, value in old.items() if key not in ('/StructParent', '/StructParents')}
+        after_state = {key: value for key, value in new.items() if key not in ('/StructParent', '/StructParents')
+                       and not (key == '/Contents' and '/Contents' not in old)}
+        same = same and old_canonical.hash(before_state) == new_canonical.hash(after_state)
+        result['comparisons'].append({'annotationId': original['annotationId'], 'pageNumber': original['page'],
+                                      'preserved': same, 'originalDestinationUnresolved': original.get('destinationResolved') is False})
+    result['passed'] = (before['checks_complete'] and after['checks_complete'] and result['destinationTablesIdentical']
+                        and all(row['preserved'] for row in result['comparisons']))
+    return result
 
 def ownership_required_mcids(ops: list[tuple[Any, bytes]], properties: Any = None) -> set[int]:
     """Separate real content from authored artifacts and literally empty scopes.
@@ -907,12 +1099,14 @@ def scoped_text_operations(ops: list[tuple[Any, bytes]], owners: list[int | None
 
     Marked-content wrappers have no effect on pypdf's native text decoder.
     Removing them once from this disposable extraction index avoids charging
-    every MCID for all the tagger's wrappers on the page. All painting/text
-    state remains in order, and the existing work limit still bounds each
-    repeated extraction. Form/image invocations were already excluded from
-    these page-local text views; their separate inspection is unchanged.
+    every MCID for all the tagger's wrappers on the page. Pure path, painting
+    and color operations have no effect on native text decoding either. Keep
+    every text/graphics-state save, transform, font and unknown operation in
+    order; the existing work limit still bounds each repeated extraction.
+    Complete original paint and Form/image inspection is unchanged.
     """
     ignored = {b"BMC", b"BDC", b"EMC", b"MP", b"DP", b"Do", b"INLINE IMAGE"}
+    ignored.update(b"w J j M d ri i m l c v y h re S s f F f* B B* b b* n W W* CS cs SC SCN sc scn G g RG rg K k sh".split())
     return [(operation, owner, artifact) for operation, owner, artifact in zip(ops, owners, artifacts)
             if operation[1] not in ignored]
 
@@ -924,7 +1118,11 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
     catalog = reader.trailer["/Root"]
     root = resolved(catalog.get("/StructTreeRoot"))
     info: dict[str, Any] = {"tagged": isinstance(root, dict), "marked": pdf_boolean(resolved(catalog.get("/MarkInfo", {})).get("/Marked")), "language": str(catalog.get("/Lang", ""))[:100], "title": str((reader.metadata or {}).get("/Title", ""))[:2000], "tags": [], "alt_count": 0, "unresolved_content_references": 0, "actual_text_count": 0, "page_content": [], "findings": [], "limitations": ["This is a bounded structure inspection, not PDF/UA validation or a semantic accessibility assessment.", "Authored alternative text retention compares exact strings and counts; it does not establish that each description remains attached to the same figure."]}
+    navigation = navigation_inventory(reader)
+    info['navigation_checks_complete'] = navigation['checks_complete']
+    info['navigation_findings'] = navigation['findings']
     if not isinstance(root, dict):
+        info['findings'].extend(navigation['findings'])
         info["findings"].append({"code": "missing_structure_tree", "severity": "error"})
         return info
     if not info["marked"]:
@@ -945,8 +1143,8 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
     annotation_locations: dict[tuple[str, Any], list[dict[str, Any]]] = {}
     annotation_objects: dict[str, Any] = {}
     annotation_destinations: dict[str, dict[str, Any]] = {}
-    local_destinations = LocalDestinations(catalog, lookup)
-    info["unresolved_local_destinations"] = 0
+    navigation_records = {record['annotationId']: record for record in navigation['annotations']}
+    info["unresolved_local_destinations"] = sum(record.get('destinationResolved') is False for record in navigation['annotations'])
     object_reference_owners: set[str] = set()
     attribute_gaps = 0
     info["resolved_object_references"] = 0
@@ -962,12 +1160,9 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
             annotation_objects[location["id"]] = obj
             action = resolved(obj.get("/A"))
             if "/Dest" in obj or isinstance(action, dict) and action.get("/S") == "/GoTo":
-                destination = obj.get("/Dest") if "/Dest" in obj else action.get("/D")
-                evidence = local_destinations.resolve(destination)
-                annotation_destinations[location["id"]] = evidence
-                if not evidence["destinationResolved"]:
-                    info["unresolved_local_destinations"] += 1
-                    info["findings"].append({"code": "local_link_destination_unresolved", "severity": "error", "page": page_number, "annotationId": location["id"], "reason": evidence["destinationUnresolvedReason"]})
+                evidence = navigation_records.get(location['id'], {})
+                annotation_destinations[location["id"]] = {key: value for key, value in evidence.items()
+                    if key.startswith('destination') or key == 'navigationInspected'}
             key = ("ref", reference_key(annotation)) if reference_key(annotation) is not None else ("object", id(obj))
             annotation_locations.setdefault(key, []).append(location)
     # Re-extract each MCID from a shallow page copy containing only its text-show
@@ -1060,6 +1255,11 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
                 artifact_text = artifact_text[:MAX_ARTIFACT_TEXT_CHARS] if decoded_text_chars <= MAX_TEXT_CHARS else ""
         info["page_content"].append({"pageNumber": page_number, "mcids": sorted(page_mcids), "ownership_required_mcids": sorted(ownership_required_mcids(ops, properties)), "text_show_operators": text_index, "untagged_text_operators": unowned, "artifact_text_operators": artifacts, "artifactText": artifact_text, "artifactTextComplete": artifact_complete, "occurrence_ids_by_mcid": occurrence_ids})
         for mcid in page_mcids:
+            if mcid not in occurrence_ids:
+                # The complete stream scan proved there is no owned text-show
+                # instruction here. Drawing-only scopes need no font decoding.
+                content_text[(page_number, mcid)] = ""
+                continue
             extraction_work += len(extraction_ops)
             if extraction_work > MAX_TEXT_EXTRACTION_OPERATORS:
                 content_text[(page_number, mcid)] = None
@@ -1145,7 +1345,14 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
             gaps.add("form_text_without_native_mcid")
         scope = {"id": f"form-{len(info['form_content']) + 1}", "pageNumber": pn, "mcids": sorted(mcids), "ownership_required_mcids": sorted(ownership_required_mcids(ops, props)), "stream": form, "text": {}, "gaps": gaps}
         extraction_ops = scoped_text_operations(ops, owners, artifacts)
+        text_targets = {None if artifact else owner
+                        for (_, operator), owner, artifact in extraction_ops
+                        if operator in (b"Tj", b"TJ", b"'", b'"') and (artifact or owner is not None)}
         for selected_mcid in [None, *sorted(mcids)]:
+            if selected_mcid not in text_targets:
+                if selected_mcid is not None:
+                    scope["text"][selected_mcid] = ""
+                continue
             extraction_work += len(extraction_ops)
             if extraction_work > MAX_TEXT_EXTRACTION_OPERATORS:
                 gaps.add("form_text_extraction_limit")
@@ -1469,13 +1676,14 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
     for scope in form_scopes.values():
         if any((scope["id"], mcid) not in content_seen for mcid in scope["ownership_required_mcids"]):
             info["findings"].append({"code": "unowned_form_marked_content", "severity": "error", "page": scope["pageNumber"]})
+    info["findings"].extend(navigation["findings"])
     info["findings"] = info["findings"][:MAX_FINDINGS]
     info["tag_count"] = len(info["tags"])
     info["mcid_count"] = sum(len(page["mcids"]) for page in info["page_content"]) + sum(len(scope["mcids"]) for scope in form_scopes.values())
     if not info["tag_count"]:
         info["findings"].append({"code": "empty_structure_tree", "severity": "error"})
     info["machine_checks_passed"] = not any(item["severity"] == "error" for item in info["findings"])
-    info["checks_complete"] = id_tree_complete and not info["unresolved_content_references"] and not info["unresolved_local_destinations"] and not attribute_gaps and not any(tag.get("textIncomplete") for tag in info["tags"]) and all(page["artifactTextComplete"] for page in info["page_content"])
+    info["checks_complete"] = id_tree_complete and not info["unresolved_content_references"] and info["navigation_checks_complete"] and not attribute_gaps and not any(tag.get("textIncomplete") for tag in info["tags"]) and all(page["artifactTextComplete"] for page in info["page_content"])
     return info
 
 
@@ -1774,7 +1982,20 @@ def figure_association_inventory(reader: PdfReader, *, include_actual_text: bool
     return result
 
 
-def compare_figure_associations(source: PdfReader, output: PdfReader) -> dict[str, Any]:
+def _verified_figure_alternative_replacements(proof, source, output):
+    if proof is None:
+        return {}
+    # This private proof never comes from a request or saved PDF. Revalidate it
+    # against the actual bytes and independently discovered paint owners.
+    from native_image_alternatives import AlternativeReplacementError, verify_replacements
+    try:
+        return verify_replacements(proof, source, output)
+    except AlternativeReplacementError:
+        raise InspectionError("approved_figure_description_invalid") from None
+
+
+def compare_figure_associations(source: PdfReader, output: PdfReader, *, _approved_figure_alternatives=None) -> dict[str, Any]:
+    approved = _verified_figure_alternative_replacements(_approved_figure_alternatives, source, output)
     before = figure_association_inventory(source)
     after = figure_association_inventory(output)
     comparisons = []
@@ -1791,7 +2012,14 @@ def compare_figure_associations(source: PdfReader, output: PdfReader) -> dict[st
                         'descriptionLanguageIdentical': not any(key in original for key in ('alt', 'actualText'))
                             or original.get('descriptionLanguage') is None
                             or candidate.get('descriptionLanguage') == original['descriptionLanguage']})
-            if not row["descriptionsIdentical"]:
+            replacement = approved.get(original["id"])
+            if replacement is not None:
+                row["descriptionReplacementVerified"] = (
+                    replacement["membershipHash"] == original["membershipHash"]
+                    and original.get("alt") == replacement["beforeAlt"]
+                    and candidate.get("alt") == replacement["afterAlt"]
+                    and "actualText" not in original and "actualText" not in candidate)
+            if not row["descriptionsIdentical"] and not row.get("descriptionReplacementVerified"):
                 row["failureCode"] = "authored_figure_description_changed"
             elif not row['descriptionLanguageIdentical']:
                 row['failureCode'] = 'authored_figure_description_language_changed'
@@ -1807,7 +2035,7 @@ def compare_figure_associations(source: PdfReader, output: PdfReader) -> dict[st
                     hidden = True
             row["failureCode"] = "source_figure_hidden_as_artifact" if hidden else "source_figure_membership_changed"
         comparisons.append(row)
-    return {"passed": all(row["membershipVerified"] and row["descriptionsIdentical"] and row.get('descriptionLanguageIdentical') for row in comparisons), "checksComplete": all(row["membershipVerified"] for row in comparisons), "sourceFigureCount": len(before["figures"]), "outputFigureCount": len(after["figures"]), "comparisons": comparisons, "scope": before["scope"]}
+    return {"passed": all(row["membershipVerified"] and (row["descriptionsIdentical"] or row.get("descriptionReplacementVerified")) and row.get('descriptionLanguageIdentical') for row in comparisons), "checksComplete": all(row["membershipVerified"] for row in comparisons), "sourceFigureCount": len(before["figures"]), "outputFigureCount": len(after["figures"]), "comparisons": comparisons, "scope": before["scope"]}
 
 
 def compare_actual_text_associations(source: PdfReader, output: PdfReader) -> dict[str, Any]:
@@ -1932,7 +2160,8 @@ class _PdfInspectionCapture:
 
 
 def compare_pdfs(source: Path, output: Path, strict_text_subset: bool = False, *,
-                 _capture=None, _source_inspection=None, _output_inspection=None) -> dict[str, Any]:
+                 _capture=None, _source_inspection=None, _output_inspection=None,
+                 _approved_figure_alternatives=None) -> dict[str, Any]:
     report: dict[str, Any] = {"schema_version": 1, "passed": False, "certification": False, "accessibility_ready": False, "semantic_review_required": True, "renderer": {"name": "PDFium", "scale": RENDER_SCALE}, "preservation": {"passed": False, "pages": []}, "structure": {"passed": False}, "findings": []}
 
     def finding(code: str, message: str, page: int | None = None) -> None:
@@ -1982,6 +2211,9 @@ def compare_pdfs(source: Path, output: Path, strict_text_subset: bool = False, *
         for key in ("fonts_identical", "images_identical", "form_fields_identical"):
             if not report["preservation"][key]:
                 finding(key.replace("_identical", "_changed"), "The repaired PDF changed original fonts, images, or interactive fields.")
+        report['navigation'] = compare_annotations(before, after)
+        if not report['navigation']['passed']:
+            finding('annotation_navigation_changed_or_uninspected', 'The repaired PDF changed a link or destination dictionary, or its navigation could not be safely inspected.')
         ignored_catalog = {"/Type", "/Pages", "/StructTreeRoot", "/MarkInfo", "/Lang", "/Metadata", "/ViewerPreferences"}
         catalog_values = [{key: value for key, value in reader.trailer["/Root"].items() if str(key) not in ignored_catalog} for reader in readers]
         if canonical[0].hash(catalog_values[0]) != canonical[1].hash(catalog_values[1]):
@@ -2042,8 +2274,15 @@ def compare_pdfs(source: Path, output: Path, strict_text_subset: bool = False, *
             finding("existing_figure_tags_lost", "The repaired PDF contains fewer figure tags than the original; image meaning may no longer be available to a screen reader.")
         source_alts = sorted(tag["alt"] for tag in report["source_structure"]["tags"] if "alt" in tag)
         output_alts = sorted(tag["alt"] for tag in report["structure"]["tags"] if "alt" in tag)
+        approved = _verified_figure_alternative_replacements(_approved_figure_alternatives, before, after)
+        required_alts = list(source_alts)
+        for replacement in approved.values():
+            # The original string remains in the immutable uploaded source.
+            # Exempt only this exact, paint-bound and independently verified
+            # generic label; all other authored alternatives remain required.
+            required_alts.remove(replacement["beforeAlt"])
         remaining = list(output_alts)
-        for alt in source_alts:
+        for alt in required_alts:
             if alt in remaining:
                 remaining.remove(alt)
             else:
@@ -2051,7 +2290,9 @@ def compare_pdfs(source: Path, output: Path, strict_text_subset: bool = False, *
                 report["preservation"]["passed"] = False
                 break
         report["structure"]["authored_alternative_strings_retained"] = not bool(Counter(source_alts) - Counter(output_alts))
-        report["figure_associations"] = compare_figure_associations(before, after)
+        if approved:
+            report["structure"]["approved_figure_alternative_replacements"] = approved
+        report["figure_associations"] = compare_figure_associations(before, after, _approved_figure_alternatives=_approved_figure_alternatives)
         report['actual_text_associations'] = compare_actual_text_associations(before, after)
         property_gaps=report['actual_text_associations']['unsupportedMarkedContentActualText']
         if property_gaps['sourcePages'] or property_gaps['outputPages']:

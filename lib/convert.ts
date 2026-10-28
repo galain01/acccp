@@ -16,7 +16,7 @@
  * Required env vars:
  *   LITELLM_BASE_URL   e.g. https://litellm.cloud.osu.edu
  *   LITELLM_API_KEY    a proxy key with access to the configured model
- *   LITELLM_MODEL      optional override; defaults to gpt-5.6-sol-2026-07-09
+ *   LITELLM_MODEL      optional override; defaults to gpt-6.1-sol-2026-09-29
  */
 
 import {

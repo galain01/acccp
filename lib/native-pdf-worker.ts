@@ -32,15 +32,22 @@ export interface NativePdfStructureCandidate {
     | "mark_note_reference"
     | "convert_list"
     | "rebuild_table"
+    | "rebuild_grid_table"
+    | "repair_table_headers"
+    | "restore_excluded_figure"
+    | "join_interrupted_text"
+    | "restore_decimal_paragraphs"
     | "move_callout"
     | "move_page_continuation"
-    | "describe_chart";
+    | "describe_chart"
+    | "restore_artifact_text";
   tagId: string;
   pageNumber: number;
   text: string;
   preview: string;
   relatedTagIds: string[];
   readonlyTagIds?: string[];
+  textScopes?: { scopeId: string; text: string; [key: string]: unknown }[];
 }
 export interface NativePdfFinding {
   code: string;
@@ -112,6 +119,11 @@ export type NativePdfOperation = {
       candidateId: string;
       role?: "H2" | "H3" | "H4" | "H5" | "H6";
       alt?: string;
+      selections?: {
+        scopeId: string;
+        role: "P" | "H2" | "H3" | "H4" | "H5" | "H6";
+      }[];
+      anchorRole?: "P";
     }
 );
 export interface NativePdfPlan {
@@ -400,20 +412,52 @@ export function parseNativePdfState(
           "mark_note_reference",
           "convert_list",
           "rebuild_table",
+          "rebuild_grid_table",
+          "repair_table_headers",
+          "restore_excluded_figure",
+          "join_interrupted_text",
+          "restore_decimal_paragraphs",
           "move_callout",
           "move_page_continuation",
           "describe_chart",
+          "restore_artifact_text",
         ].includes(String(candidate.kind)) ||
         !ids.has(String(candidate.tagId)) ||
         !pageNumber(candidate.pageNumber, pages) ||
         !boundedText(candidate.text, 20_000) ||
         !boundedText(candidate.preview, 20_000) ||
         !Array.isArray(candidate.relatedTagIds) ||
-        candidate.relatedTagIds.length > 200 ||
+        candidate.relatedTagIds.length >
+          (candidate.kind === "repair_table_headers" ? 4000 : 200) ||
         candidate.relatedTagIds.some((id) => !ids.has(String(id))) ||
         new Set(candidate.relatedTagIds).size !== candidate.relatedTagIds.length
       )
         return fail();
+      if (candidate.kind === "restore_artifact_text") {
+        if (
+          !Array.isArray(candidate.textScopes) ||
+          !candidate.textScopes.length ||
+          candidate.textScopes.length > 100
+        )
+          return fail();
+        const scopeIds = new Set<string>();
+        let characters = 0;
+        for (const scope of candidate.textScopes) {
+          if (
+            !objectRecord(scope) ||
+            typeof scope.scopeId !== "string" ||
+            !/^[a-f0-9]{64}$/.test(scope.scopeId) ||
+            scopeIds.has(scope.scopeId) ||
+            !boundedText(scope.text, 8000) ||
+            typeof scope.text !== "string" ||
+            !scope.text.trim()
+          )
+            return fail();
+          scopeIds.add(scope.scopeId);
+          characters += scope.text.length;
+        }
+        if (characters > 16000) return fail();
+      } else if (candidate.textScopes !== undefined) return fail();
       if (
         candidate.kind === "move_page_continuation"
           ? !Array.isArray(candidate.readonlyTagIds) ||

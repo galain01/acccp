@@ -378,3 +378,13 @@ Extractor-dependent word-spacing concerns were investigated against the original
 and repaired files and are no longer asserted as proven screen-reader failures.
 No new desktop screen-reader test or PDF/UA conformance claim was made. This
 verification is local; it does not activate a hosted release.
+
+## Static W-4 support verification, 2026-10-28
+
+The five-page 2026 W-4 now completes native repair and a complete independent
+model audit while preserving its original appearance and 48 form controls.
+The follow-up adds bounded form variants, reduces repeated native/model evidence
+work, and preserves numeric precision during structural content rewrites. See
+[the W-4 verification report](w4-native-support.md) for exact scope, costs,
+remaining worksheet-table and other findings, and the interrupted desktop check.
+These changes remain on the review branch; they are not a conformance claim.

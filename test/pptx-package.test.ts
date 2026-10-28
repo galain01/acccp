@@ -1504,4 +1504,35 @@ describe("PowerPoint package remediation", () => {
       "pptx_invalid"
     );
   });
+  it.each([" ", "; charset=utf-8"])(
+    "rejects malformed content-type suffix %j instead of skipping XML",
+    async (suffix) => {
+      const parts = entries();
+      parts[0][1] = String(parts[0][1]).replace(
+        "</Types>",
+        `<Default Extension="data" ContentType="application/xml${suffix}"/></Types>`
+      );
+      parts.push(["customXml/item1.data", "<broken>"]);
+      await expect(inspectPptx(await zip(parts))).rejects.toHaveProperty(
+        "code",
+        "pptx_invalid"
+      );
+    }
+  );
+  it("counts content-type-declared XML toward the aggregate XML byte limit", async () => {
+    const parts = entries();
+    parts[0][1] = String(parts[0][1]).replace(
+      "</Types>",
+      '<Default Extension="data" ContentType="application/xml"/></Types>'
+    );
+    for (let index = 0; index < 11; index++)
+      parts.push([
+        `customXml/item${index}.data`,
+        `<x>${"a".repeat(2 * 1024 * 1024 - 7)}</x>`,
+      ]);
+    await expect(inspectPptx(await zip(parts))).rejects.toHaveProperty(
+      "code",
+      "pptx_complexity_limit"
+    );
+  });
 });

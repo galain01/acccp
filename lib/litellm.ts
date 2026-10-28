@@ -5,7 +5,7 @@
  * Required env vars:
  *   LITELLM_BASE_URL   e.g. https://litellm.cloud.osu.edu
  *   LITELLM_API_KEY    a proxy key with access to the configured model
- *   LITELLM_MODEL      optional override; defaults to gpt-5.6-sol-2026-07-09
+ *   LITELLM_MODEL      optional override; defaults to gpt-6.1-sol-2026-09-29
  *   LITELLM_CONVERSION_MODEL optional conversion-stage model override
  *   LITELLM_AUDIT_MODEL      optional audit-stage model override
  */
@@ -24,7 +24,7 @@ export interface LiteLLMConfig {
   model: string;
 }
 
-export const DEFAULT_LITELLM_MODEL = "gpt-5.6-sol-2026-07-09";
+export const DEFAULT_LITELLM_MODEL = "gpt-6.1-sol-2026-09-29";
 
 /** Contains only diagnostics authored by this client, never a provider body. */
 export class LiteLLMError extends Error {

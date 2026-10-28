@@ -857,6 +857,13 @@ async function openPackage(
   const parts = await readParts(buffer, maxBytes);
   const xml = new Map<string, Document>();
   const budget = { nodes: 0, deadline: Date.now() + 15_000 };
+  let xmlBytes = 0;
+  const inspectXml = (name: string, bytes: Buffer) => {
+    if ((xmlBytes += bytes.length) > LIMITS.totalXml) complex();
+    const document = parseXml(bytes, budget);
+    checkFieldSafety(document);
+    xml.set(name, document);
+  };
   for (const [name, bytes] of parts) {
     if (/(?:^|\/)vba(?:project|data)\.|\.bin$/i.test(name) && /vba/i.test(name))
       throw new DocxPackageError(
@@ -868,11 +875,7 @@ async function openPackage(
         "docx_signed",
         "Digitally signed Word files cannot be changed without invalidating their signature."
       );
-    if (/\.(?:xml|rels|vml|svg)$/i.test(name)) {
-      const document = parseXml(bytes, budget);
-      checkFieldSafety(document);
-      xml.set(name, document);
-    }
+    if (/\.(?:xml|rels|vml|svg)$/i.test(name)) inspectXml(name, bytes);
   }
   const pkg: Package = {
     parts,
@@ -887,8 +890,18 @@ async function openPackage(
     types.documentElement.localName !== "Types"
   )
     fail();
+  const contentOverrides = new Map<string, string>();
+  const contentDefaults = new Map<string, string>();
   for (const element of children(types.documentElement)) {
+    if (
+      element.namespaceURI !== CT ||
+      !["Default", "Override"].includes(element.localName ?? "")
+    )
+      fail();
     const type = element.getAttribute("ContentType") ?? "";
+    // Accept a bare media type; ambiguous suffixes must not bypass XML inspection.
+    if (!/^[a-z0-9!#$%&'*+.^_`|~-]+\/[a-z0-9!#$%&'*+.^_`|~-]+$/i.test(type))
+      fail();
     if (/macroEnabled|vbaProject/i.test(type))
       throw new DocxPackageError(
         "docx_unsupported",
@@ -899,6 +912,32 @@ async function openPackage(
         "docx_signed",
         "Digitally signed Word files cannot be changed without invalidating their signature."
       );
+    if (element.localName === "Override") {
+      const partName = element.getAttribute("PartName") ?? "";
+      const name = partName.slice(1);
+      if (
+        !partName.startsWith("/") ||
+        !parts.has(name) ||
+        contentOverrides.has(name)
+      )
+        fail();
+      contentOverrides.set(name, type);
+    } else {
+      const extension = element.getAttribute("Extension")?.toLowerCase() ?? "";
+      if (!extension || contentDefaults.has(extension)) fail();
+      contentDefaults.set(extension, type);
+    }
+  }
+  // OPC content types, not filename extensions, determine which parts contain XML.
+  // https://learn.microsoft.com/en-us/office/open-xml/about-the-open-xml-sdk
+  // Use the same safety checks and budgets before reading settings or story parts.
+  for (const [name, bytes] of parts) {
+    const type =
+      contentOverrides.get(name) ??
+      contentDefaults.get(path.posix.extname(name).slice(1).toLowerCase()) ??
+      "";
+    if (/(?:\/xml|\+xml)$/i.test(type) && !xml.has(name))
+      inspectXml(name, bytes);
   }
   for (const name of xml.keys())
     if (name.endsWith(".rels")) {
@@ -961,13 +1000,7 @@ async function openPackage(
       "docx_unsupported",
       "This Word package uses a nonstandard document location. Save a new .docx copy in Word."
     );
-  const mainType = children(types.documentElement)
-    .find(
-      (element) =>
-        element.localName === "Override" &&
-        element.getAttribute("PartName") === `/${pkg.main}`
-    )
-    ?.getAttribute("ContentType");
+  const mainType = contentOverrides.get(pkg.main);
   if (mainType !== MAIN_TYPE) fail();
   const main = xml.get(pkg.main);
   if (
@@ -1508,7 +1541,7 @@ function boundedText(
 }
 const validId = (value: unknown) =>
   boundedText(value, 1, 360) &&
-  /^word\/[a-zA-Z0-9_.-]+\.xml:[pti]:[1-9]\d*$/.test(value);
+  /^word\/[a-zA-Z0-9_.-]+:[pti]:[1-9]\d*$/.test(value);
 export function validateDocxRepairPlan(value: unknown): DocxRepairPlan {
   if (!record(value)) integrity();
   keys(value, [

@@ -9,7 +9,7 @@ from pypdf import PdfWriter
 from pypdf.generic import (ArrayObject, ByteStringObject, DictionaryObject,
                           NameObject, TextStringObject)
 
-from verify_pdf import InspectionError, STANDARD_ROLES, resolved, structure_id_tree, structure_inventory
+from verify_pdf import Canonicalizer, InspectionError, STANDARD_ROLES, resolved, structure_id_tree, structure_inventory
 from bounded_semantic_structure import _DiscoveryInspection, SemanticStructureError
 
 MAX_TAGS = 5000
@@ -40,7 +40,7 @@ def _raw_id(value):
     return raw
 
 
-def _state(pdf, *, allow_index_extensions=False):
+def _state(pdf, *, allow_index_extensions=False, allow_missing_index=False):
     catalog = pdf.root_object if isinstance(pdf, PdfWriter) else pdf.trailer["/Root"]
     root = resolved(catalog.get("/StructTreeRoot"))
     if not isinstance(root, DictionaryObject):
@@ -63,7 +63,7 @@ def _state(pdf, *, allow_index_extensions=False):
                 walk(item, parent, parent_index, depth + 1)
         elif isinstance(value, DictionaryObject) and value.get("/Type") not in ("/MCR", "/OBJR"):
             if (resolved(value.get("/P")) is not parent or not isinstance(value.get("/S"), NameObject)
-                    or value.indirect_reference is None or len(nodes) >= MAX_TAGS):
+                    or getattr(value, 'indirect_reference', None) is None or len(nodes) >= MAX_TAGS):
                 raise NoteIdError("invalid_note_id_state")
             role, role_seen = str(value["/S"]), set()
             while role.lstrip("/") not in STANDARD_ROLES and role in roles and role not in role_seen:
@@ -89,9 +89,56 @@ def _state(pdf, *, allow_index_extensions=False):
         if not allow_index_extensions and set(item) - {"/Names", "/Kids", "/Limits"}:
             raise NoteIdError("invalid_note_id_state")
         pending.extend(resolved(child) for child in resolved(item.get("/Kids", [])))
-    if set(tree) != {identifier.hex() for identifier in existing} or any(tree[key.hex()] is not node for key, node in existing.items()):
+    missing_index = allow_missing_index and '/IDTree' not in root
+    if not missing_index and (set(tree) != {identifier.hex() for identifier in existing}
+            or any(tree[key.hex()] is not node for key, node in existing.items())):
         raise NoteIdError("invalid_note_id_state")
     return root, nodes, NoteIdSnapshot(tuple(entries), "/IDTree" in root)
+
+
+def initialize_generated_id_tree(original, writer):
+    """Index only new tagger IDs from an untagged source, without changing IDs.
+
+    PDF structure elements with IDs require an IDTree mapping those exact IDs
+    to their owners: https://pdfa.org/download-area/cheat-sheets/LogicalStructureObjects.pdf
+    This is not a repair path for an uploaded document's authored index.
+    """
+    if original.trailer['/Root'].get('/StructTreeRoot') is not None:
+        raise NoteIdError('generated_id_tree_requires_untagged_source')
+    root, nodes, snapshot = _state(writer, allow_missing_index=True)
+    if snapshot.tree_present:
+        return 0  # _state already verified the existing index; never replace it.
+    entries = {identifier: node.indirect_reference
+               for node, (_, _, identifier) in zip(nodes, snapshot.nodes) if identifier is not None}
+    if not entries:
+        return 0
+    names = ArrayObject()
+    for identifier, reference in sorted(entries.items()):
+        names.extend((ByteStringObject(identifier), reference))
+    root[NameObject('/IDTree')] = writer._add_object(DictionaryObject({NameObject('/Names'): names}))
+    return len(entries)
+
+
+def verify_generated_id_tree(before, after):
+    """Verify saved ID associations and structural/catalog equivalence."""
+    _, _, previous = _state(before, allow_missing_index=True)
+    _, _, current = _state(after)
+    if (previous.tree_present or not any(identifier is not None for _, _, identifier in previous.nodes)
+            or not current.tree_present or previous.nodes != current.nodes):
+        raise NoteIdError('generated_id_tree_preservation')
+    # The strict reopened _state above verifies every raw ID, unique owner and
+    # name-tree entry. Compare structural/catalog semantics after removing the sole
+    # permitted addition from a private clone, never from either saved reader.
+    # The worker's ordinary preservation check independently verifies pages.
+    # PdfWriter flattens hierarchical /Pages nodes when cloning a reader.
+    # Normalize both private operands identically; the raw saved-reader states
+    # above still bind all IDs, owners, parent relationships and tree entries.
+    baseline = PdfWriter(clone_from=before)
+    stripped = PdfWriter(clone_from=after)
+    del stripped.root_object['/StructTreeRoot'][NameObject('/IDTree')]
+    if (Canonicalizer(list(baseline.pages)).hash(baseline.root_object)
+            != Canonicalizer(list(stripped.pages)).hash(stripped.root_object)):
+        raise NoteIdError('generated_id_tree_preservation')
 
 
 def note_id_snapshot(pdf):
@@ -156,7 +203,7 @@ def verify_note_ids(before, after):
         raise NoteIdError("note_id_preservation")
 
 
-def verify_authored_ids(original, candidate, *, _candidate_inspection=None):
+def verify_authored_ids(original, candidate, *, _candidate_inspection=None, _original_inspection=None):
     """Keep each authored ID bound to the exact same ordered source content.
 
     Tag numbers may shift when a separately authorized structural edit adds a
@@ -164,9 +211,11 @@ def verify_authored_ids(original, candidate, *, _candidate_inspection=None):
     the ordinary preservation check independently protects their page programs.
     """
     try:
-        if _candidate_inspection is not None and type(_candidate_inspection) is not _DiscoveryInspection:
+        if any(item is not None and type(item) is not _DiscoveryInspection
+               for item in (_candidate_inspection, _original_inspection)):
             raise NoteIdError("authored_id_preservation")
-        inventories = [structure_inventory(original),
+        inventories = [_original_inspection.copy_for(original) if _original_inspection is not None
+                      else structure_inventory(original),
             _candidate_inspection.copy_for(candidate) if _candidate_inspection is not None
             else structure_inventory(candidate)]
         if any(item.get("tagged") and not item.get("native_id_tree", {}).get("verified") for item in inventories):

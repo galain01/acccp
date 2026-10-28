@@ -15,11 +15,11 @@ import re
 import pypdfium2 as pdfium
 import pypdfium2.raw as raw
 from pypdf import PdfReader
-from pypdf.generic import (ArrayObject, ByteStringObject, ContentStream, DictionaryObject,
+from pypdf.generic import (ArrayObject, ByteStringObject, DictionaryObject,
     NameObject, NullObject, NumberObject, TextStringObject)
 
 import verify_pdf as v
-from bounded_semantic_structure import _DiscoveryInspection, SemanticStructureError, SHOW, _freeze, nodes, source_digest
+from bounded_semantic_structure import _DiscoveryInspection, SemanticStructureError, SHOW, _freeze, nodes, source_digest, preserved_content_stream
 
 MAX_CANDIDATES = 40
 MAX_OBJECTS = 100_000
@@ -594,7 +594,7 @@ def apply_operations(source_reader, writer, operations, *, _inspection=None, _so
                 args, operator = edit['ops'][index]
                 changed.append(([_freeze(arg) for arg in args] if operator in SHOW else args, operator)); index += 1
         require(v.drawing_fingerprint(changed, v.Canonicalizer()) == v.drawing_fingerprint(edit['ops'], v.Canonicalizer()), 'native_pdf_preservation')
-        stream = ContentStream(None, writer); stream.operations = changed
+        stream = preserved_content_stream(writer, changed)
         writer.pages[pn-1][NameObject('/Contents')] = writer._add_object(stream)
     return {'changes': changes, 'lineage': lineage, 'verification': _ChartVerification(proofs)}
 

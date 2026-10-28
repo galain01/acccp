@@ -20,7 +20,9 @@ if (!supabaseUrl) throw new Error("Missing env var: SUPABASE_URL");
 if (!serviceRoleKey)
   throw new Error("Missing env var: SUPABASE_SERVICE_ROLE_KEY");
 
-export const DOCUMENTS_BUCKET = "documents";
+/** A separate private bucket allows isolated local validation in an existing project. */
+export const DOCUMENTS_BUCKET =
+  process.env.SUPABASE_DOCUMENTS_BUCKET?.trim() || "documents";
 
 export { DOCX_MIME_TYPE, PPTX_MIME_TYPE } from "./document-input";
 
@@ -83,7 +85,7 @@ export async function uploadObject(
   key: string,
   body: Buffer | string,
   contentType: string,
-  options?: { signal?: AbortSignal }
+  options?: { signal?: AbortSignal; upsert?: boolean }
 ): Promise<void> {
   const requestStorage = options?.signal
     ? createClient(supabaseUrl!, serviceRoleKey!, {
@@ -96,7 +98,7 @@ export async function uploadObject(
     : storage;
   const { error } = await requestStorage.upload(key, body, {
     contentType,
-    upsert: true, // Re-converting overwrites the previous output.
+    upsert: options?.upsert ?? true,
   });
   if (error)
     throw new Error(`Storage upload failed for ${key}: ${error.message}`);

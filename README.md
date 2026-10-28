@@ -227,6 +227,8 @@ DATABASE_SSL_CA=
 # Supabase (used for file storage)
 SUPABASE_URL=
 SUPABASE_SERVICE_ROLE_KEY=
+# Optional separate private bucket for an isolated test environment
+SUPABASE_DOCUMENTS_BUCKET=documents
 
 # Better Auth
 BETTER_AUTH_SECRET=
@@ -235,7 +237,7 @@ BETTER_AUTH_URL=http://localhost:3000
 # LiteLLM (AI model provider)
 LITELLM_BASE_URL=
 LITELLM_API_KEY=
-LITELLM_MODEL=gpt-5.6-sol-2026-07-09
+LITELLM_MODEL=gpt-6.1-sol-2026-09-29
 
 # Email (OTP sign-in codes)
 EMAIL_PROVIDER=console
@@ -265,7 +267,7 @@ Where to find each value:
   is running on (`http://localhost:3000` for local dev).
 - `LITELLM_BASE_URL` / `LITELLM_API_KEY` — from whoever administers the OSU
   LiteLLM instance for this project; `LITELLM_MODEL` defaults to
-  `gpt-5.6-sol-2026-07-09` if unset or blank. Set it explicitly in deployed
+  `gpt-6.1-sol-2026-09-29` if unset or blank. Set it explicitly in deployed
   environments so the selected model is visible in configuration. The model
   ID must match a model exposed by your LiteLLM proxy and allowed by your key.
 - `EMAIL_PROVIDER` — leave as `console` for local development; sign-in OTP
@@ -287,14 +289,20 @@ The full environment variable reference (which module reads each variable, and
 gotchas like the pooled-connection requirement) is in
 [AGENTS.md](AGENTS.md#required-environment-variables).
 
+Local validation can use a separate local PostgreSQL database and a dedicated
+private bucket in an existing Supabase project, without creating another project.
+Set `SUPABASE_DOCUMENTS_BUCKET` to that bucket in both the app and native PDF worker.
+The default remains `documents`. Keep test accounts and schema changes in the local
+database; do not point a test server or preview at the production database.
+
 ### Changing the model on Vercel
 
 The API key and model selection are separate settings. Updating
 `LITELLM_API_KEY` grants access through the proxy but does not change the
 `model` sent with each request.
 
-For the GPT-5.6 Sol migration, keep the authorized `LITELLM_API_KEY` in
-Vercel and deploy this code. `gpt-5.6-sol-2026-07-09` is the default, so
+For the GPT-6.1 Sol migration, keep the authorized `LITELLM_API_KEY` in
+Vercel and deploy this code. `gpt-6.1-sol-2026-09-29` is the default, so
 `LITELLM_MODEL` is optional. If you set it explicitly, use that exact model ID;
 an existing override (including an old Nano value) takes precedence over the
 code default. Redeploy after changing environment variables.

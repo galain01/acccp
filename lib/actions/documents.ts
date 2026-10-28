@@ -34,6 +34,8 @@ import {
 import type { UploadedDocument } from "@/lib/types/document";
 import { readPdfInteractionTestSummary } from "@/lib/pdf-interaction-summary";
 
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 // RLS is enabled but has no policies, so ownership is enforced here: every
 // query joins `sessions` and constrains owner_user_id.
 async function requireUserId(): Promise<string> {
@@ -46,126 +48,163 @@ export async function listDocuments(
 ): Promise<UploadedDocument[]> {
   const userId = await requireUserId();
 
-  const rows = await db
-    .select({
-      id: documents.id,
-      name: documents.originalFilename,
-      size: documents.fileSizeBytes,
-      uploadedAt: documents.createdAt,
-      jobId: conversionJobs.id,
-      status: conversionJobs.status,
-      errorMessage: conversionJobs.errorMessage,
-      outputTarget: conversionJobs.outputTarget,
-      changes: sql<unknown>`(select metadata -> 'changes' from job_events where job_events.job_id = ${conversionJobs.id} and event_type in ('conversion_completed', 'powerpoint_review_finished') and metadata ? 'changes' order by created_at desc, id desc limit 1)`,
-      // Read the current attempt's latest completion even when it has no
-      // summary, so a retry cannot revive evidence from an older output.
-      interactionTestSummary: sql<unknown>`(select metadata -> 'interactionTestSummary' from job_events where job_events.job_id = ${conversionJobs.id} and event_type = 'conversion_completed' and metadata ->> 'attemptNumber' = ${conversionJobs.attemptCount}::text and created_at >= ${conversionJobs.startedAt} order by created_at desc, id desc limit 1)`,
-    })
-    .from(documents)
-    .innerJoin(sessions, eq(sessions.id, documents.sessionId))
-    .leftJoin(conversionJobs, eq(conversionJobs.documentId, documents.id))
-    .where(
-      and(
-        eq(documents.sessionId, sessionId),
-        eq(sessions.ownerUserId, userId),
-        retainedDocumentCondition()
-      )
-    )
-    .orderBy(desc(documents.createdAt));
-
-  const jobIds = rows
-    .map((row) => row.jobId)
-    .filter((id): id is string => id !== null);
-  const findingsByJobId = new Map<string, AccessibilityError[]>();
-  if (jobIds.length > 0) {
-    const findingRows = await db
-      .select({
-        jobId: validationFindings.jobId,
-        severity: validationFindings.severity,
-        ruleCode: validationFindings.ruleCode,
-        title: validationFindings.title,
-        category: validationFindings.category,
-        message: validationFindings.message,
-        suggestion: validationFindings.suggestion,
-        wcag: validationFindings.wcag,
-        location: validationFindings.location,
-        pageCount: conversionJobs.pageCount,
-      })
-      .from(validationFindings)
-      .innerJoin(
-        conversionJobs,
-        eq(conversionJobs.id, validationFindings.jobId)
-      )
-      .innerJoin(documents, eq(documents.id, conversionJobs.documentId))
-      .innerJoin(sessions, eq(sessions.id, documents.sessionId))
-      .where(
-        and(
-          inArray(validationFindings.jobId, jobIds),
-          eq(documents.sessionId, sessionId),
-          eq(sessions.ownerUserId, userId),
-          retainedDocumentCondition()
+  // The output pointer, completion metadata and findings must share a snapshot;
+  // a concurrent publication cannot supply half of each result.
+  return db.transaction(
+    async (tx) => {
+      const rows = await tx
+        .select({
+          id: documents.id,
+          name: documents.originalFilename,
+          size: documents.fileSizeBytes,
+          uploadedAt: documents.createdAt,
+          jobId: conversionJobs.id,
+          status: conversionJobs.status,
+          attemptCount: conversionJobs.attemptCount,
+          errorMessage: conversionJobs.errorMessage,
+          outputTarget: conversionJobs.outputTarget,
+          sourceReady: sql<boolean>`${documents.uploadCompletedAt} is not null or ${documents.uploadExpiresAt} is null`,
+          savedOutputArtifactId: sql<string | null>`(
+        select ${artifacts.id} from ${artifacts}
+        where ${artifacts.jobId} = ${conversionJobs.id}
+          and ${artifacts.artifactStatus} = ${"available"}
+          and (
+            (${conversionJobs.outputTarget} = ${"canvas_html"} and ${artifacts.artifactType} = ${"html_output"})
+            or (${conversionJobs.outputTarget} = ${"accessible_docx"} and ${artifacts.artifactType} = ${"docx_output"})
+            or (${conversionJobs.outputTarget} = ${"accessible_pptx"} and ${artifacts.artifactType} = ${"pptx_output"})
+            or (${conversionJobs.outputTarget} = ${"accessible_pdf"} and ${artifacts.artifactType} = ${"pdf_output"})
+          )
+        order by ${artifacts.createdAt} desc, ${artifacts.id} desc limit 1
+      )`,
+          changes: sql<unknown>`(select metadata -> 'changes' from job_events where job_events.job_id = ${conversionJobs.id} and event_type in ('conversion_completed', 'powerpoint_review_finished') and metadata ? 'changes' order by created_at desc, id desc limit 1)`,
+          // Read the current attempt's latest completion even when it has no
+          // summary, so a retry cannot revive evidence from an older output.
+          interactionTestSummary: sql<unknown>`(select metadata -> 'interactionTestSummary' from job_events where job_events.job_id = ${conversionJobs.id} and event_type = 'conversion_completed' and metadata ->> 'attemptNumber' = ${conversionJobs.attemptCount}::text and created_at >= ${conversionJobs.startedAt} order by created_at desc, id desc limit 1)`,
+        })
+        .from(documents)
+        .innerJoin(sessions, eq(sessions.id, documents.sessionId))
+        .leftJoin(conversionJobs, eq(conversionJobs.documentId, documents.id))
+        .where(
+          and(
+            eq(documents.sessionId, sessionId),
+            eq(sessions.ownerUserId, userId),
+            retainedDocumentCondition()
+          )
         )
-      );
+        .orderBy(desc(documents.createdAt));
 
-    for (const finding of findingRows) {
-      const errors = findingsByJobId.get(finding.jobId) ?? [];
-      const storedLocation =
-        finding.location && typeof finding.location === "object"
-          ? (finding.location as Record<string, unknown>)
-          : null;
-      const category = [
-        "accessibility",
-        "canvas",
-        "source-review",
-        "content-fidelity",
-      ].includes(finding.category)
-        ? (finding.category as AccessibilityError["category"])
-        : undefined;
-      errors.push({
-        type: (finding.ruleCode as AccessibilityError["type"]) ?? "other",
-        severity: finding.severity === "info" ? "warning" : finding.severity,
-        title: finding.title ?? undefined,
-        category,
-        message: finding.message,
-        suggestion: finding.suggestion ?? "",
-        wcag: finding.wcag ?? undefined,
-        element:
-          typeof storedLocation?.element === "string"
-            ? storedLocation.element.slice(0, 240)
-            : undefined,
-        location: readFindingLocation(
-          storedLocation,
-          finding.pageCount ?? undefined
-        ),
-      });
-      findingsByJobId.set(finding.jobId, errors);
-    }
-  }
+      const jobIds = rows
+        .map((row) => row.jobId)
+        .filter((id): id is string => id !== null);
+      const findingsByJobId = new Map<string, AccessibilityError[]>();
+      if (jobIds.length > 0) {
+        const findingRows = await tx
+          .select({
+            jobId: validationFindings.jobId,
+            severity: validationFindings.severity,
+            ruleCode: validationFindings.ruleCode,
+            title: validationFindings.title,
+            category: validationFindings.category,
+            message: validationFindings.message,
+            suggestion: validationFindings.suggestion,
+            wcag: validationFindings.wcag,
+            location: validationFindings.location,
+            pageCount: conversionJobs.pageCount,
+          })
+          .from(validationFindings)
+          .innerJoin(
+            conversionJobs,
+            eq(conversionJobs.id, validationFindings.jobId)
+          )
+          .innerJoin(documents, eq(documents.id, conversionJobs.documentId))
+          .innerJoin(sessions, eq(sessions.id, documents.sessionId))
+          .where(
+            and(
+              inArray(validationFindings.jobId, jobIds),
+              eq(documents.sessionId, sessionId),
+              eq(sessions.ownerUserId, userId),
+              retainedDocumentCondition()
+            )
+          );
 
-  // A second query can cross the expiry boundary after the list was read.
-  const now = new Date();
-  return rows
-    .filter((row) => !isDocumentExpired(row.uploadedAt, now))
-    .map((row) => ({
-      id: row.id,
-      documentId: row.id,
-      jobId: row.jobId ?? undefined,
-      outputTarget: row.outputTarget ?? getOutputTargetForFilename(row.name),
-      changes: readOutputChanges(row.changes),
-      interactionTestSummary:
-        row.outputTarget === "accessible_pdf" &&
-        toConversionStatus(row.status) === "success"
-          ? readPdfInteractionTestSummary(row.interactionTestSummary)
-          : undefined,
-      name: row.name,
-      size: row.size,
-      uploadedAt: new Date(row.uploadedAt),
-      status: toConversionStatus(row.status),
-      // `documents` has no locked column, so the lock resets on reload.
-      locked: false,
-      errorMessage: row.errorMessage ?? undefined,
-      errors: row.jobId ? findingsByJobId.get(row.jobId) : undefined,
-    }));
+        for (const finding of findingRows) {
+          const errors = findingsByJobId.get(finding.jobId) ?? [];
+          const storedLocation =
+            finding.location && typeof finding.location === "object"
+              ? (finding.location as Record<string, unknown>)
+              : null;
+          const category = [
+            "accessibility",
+            "canvas",
+            "source-review",
+            "content-fidelity",
+          ].includes(finding.category)
+            ? (finding.category as AccessibilityError["category"])
+            : undefined;
+          errors.push({
+            type: (finding.ruleCode as AccessibilityError["type"]) ?? "other",
+            severity:
+              finding.severity === "info" ? "warning" : finding.severity,
+            title: finding.title ?? undefined,
+            category,
+            message: finding.message,
+            suggestion: finding.suggestion ?? "",
+            wcag: finding.wcag ?? undefined,
+            element:
+              typeof storedLocation?.element === "string"
+                ? storedLocation.element.slice(0, 240)
+                : undefined,
+            location: readFindingLocation(
+              storedLocation,
+              finding.pageCount ?? undefined
+            ),
+          });
+          findingsByJobId.set(finding.jobId, errors);
+        }
+      }
+
+      // A second query can cross the expiry boundary after the list was read.
+      const now = new Date();
+      return rows
+        .filter((row) => !isDocumentExpired(row.uploadedAt, now))
+        .map((row) => ({
+          id: row.id,
+          documentId: row.id,
+          jobId: row.jobId ?? undefined,
+          outputTarget:
+            row.outputTarget ?? getOutputTargetForFilename(row.name),
+          changes: readOutputChanges(row.changes),
+          interactionTestSummary:
+            row.outputTarget === "accessible_pdf" &&
+            toConversionStatus(row.status) === "success"
+              ? readPdfInteractionTestSummary(row.interactionTestSummary)
+              : undefined,
+          name: row.name,
+          size: row.size,
+          uploadedAt: new Date(row.uploadedAt),
+          status:
+            row.status === "queued" && row.attemptCount === 0
+              ? row.sourceReady
+                ? "idle"
+                : "error"
+              : toConversionStatus(row.status),
+          sourceReady: row.sourceReady,
+          hasAvailableOutput: Boolean(row.savedOutputArtifactId),
+          savedOutputArtifactId: row.savedOutputArtifactId ?? undefined,
+          // `documents` has no locked column, so the lock resets on reload.
+          locked: false,
+          errorMessage:
+            row.errorMessage ??
+            (row.status === "queued" &&
+            row.attemptCount === 0 &&
+            !row.sourceReady
+              ? "The source upload did not finish. Select the file again to continue."
+              : undefined),
+          errors: row.jobId ? findingsByJobId.get(row.jobId) : undefined,
+        }));
+    },
+    { isolationLevel: "repeatable read", accessMode: "read only" }
+  );
 }
 
 /**
@@ -173,9 +212,15 @@ export async function listDocuments(
  * instead of being loaded for every row of the documents table.
  */
 export async function getDocumentHtml(
-  documentId: string
+  documentId: string,
+  expectedArtifactId?: string
 ): Promise<string | null> {
   const userId = await requireUserId();
+  if (
+    expectedArtifactId !== undefined &&
+    (typeof expectedArtifactId !== "string" || !UUID.test(expectedArtifactId))
+  )
+    return null;
 
   try {
     return await withRetainedDocument(documentId, async (tx, document) => {
@@ -192,6 +237,9 @@ export async function getDocumentHtml(
             eq(artifacts.artifactType, "html_output"),
             eq(conversionJobs.outputTarget, "canvas_html"),
             eq(artifacts.artifactStatus, "available"),
+            expectedArtifactId
+              ? eq(artifacts.id, expectedArtifactId)
+              : undefined,
             retainedDocumentCondition()
           )
         );
@@ -212,10 +260,16 @@ export async function getDocumentHtml(
 /** Return a short-lived, attachment download for the owned, unexpired output. */
 export async function getDocumentOutputDownload(
   documentId: string,
-  outputTarget: OutputTarget
+  outputTarget: OutputTarget,
+  expectedArtifactId?: string
 ): Promise<{ url: string; filename: string } | null> {
   const userId = await requireUserId();
   if (!isOutputTarget(outputTarget)) return null;
+  if (
+    expectedArtifactId !== undefined &&
+    (typeof expectedArtifactId !== "string" || !UUID.test(expectedArtifactId))
+  )
+    return null;
   try {
     return await withRetainedDocument(documentId, async (tx, document) => {
       const [row] = await tx
@@ -243,6 +297,9 @@ export async function getDocumentOutputDownload(
                     : "html_output"
             ),
             eq(artifacts.artifactStatus, "available"),
+            expectedArtifactId
+              ? eq(artifacts.id, expectedArtifactId)
+              : undefined,
             retainedDocumentCondition()
           )
         );

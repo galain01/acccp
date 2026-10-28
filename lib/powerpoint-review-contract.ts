@@ -28,6 +28,8 @@ export interface PowerPointReviewSelection {
 }
 
 export interface PowerPointReviewExport {
+  /** Exact available output published with these findings and choices. */
+  savedOutputArtifactId?: string;
   revisionToken: string;
   url: string;
   filename: string;

@@ -129,6 +129,7 @@ function chain(value: unknown = []) {
   const builder = {
     from: vi.fn(),
     leftJoin: vi.fn(),
+    innerJoin: vi.fn(),
     where: vi.fn(),
     values: vi.fn(),
     set: vi.fn(),
@@ -140,6 +141,7 @@ function chain(value: unknown = []) {
   for (const method of [
     builder.from,
     builder.leftJoin,
+    builder.innerJoin,
     builder.where,
     builder.values,
     builder.set,
@@ -187,6 +189,27 @@ function ownedDocument(filename = "course.pdf") {
   return { sessionQuery, documentQuery };
 }
 
+function immutableKey(type: string) {
+  return expect.stringMatching(
+    new RegExp(`^session-1/doc-1/job-1/publication-[0-9a-f-]+/${type}$`)
+  );
+}
+
+function expectPendingReceipts(types: string[]) {
+  expect(artifactValues()).toEqual(
+    types.map((artifactType) =>
+      expect.objectContaining({
+        artifactType,
+        artifactStatus: "expired",
+        isUserDownloadable: false,
+        storageKey: immutableKey(artifactType),
+        checksumSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+        expiresAt: "2026-09-15T00:00:00.000Z",
+      })
+    )
+  );
+}
+
 function artifactValues() {
   return mocks.db.insert.mock.results
     .filter((_, index) => mocks.db.insert.mock.calls[index][0] === artifacts)
@@ -195,7 +218,7 @@ function artifactValues() {
 
 describe("native PDF conversion route", () => {
   const inserted = new Map<unknown, ReturnType<typeof chain>>();
-  const updated = chain();
+  const updated = chain([{ id: "promoted-receipt" }]);
   afterEach(() => {
     vi.useRealTimers();
     if (vi.isMockFunction(performance.now))
@@ -212,16 +235,22 @@ describe("native PDF conversion route", () => {
           _id: string,
           action: (
             tx: typeof mocks.db,
-            document: { createdAt: string }
+            document: { createdAt: string; sessionId: string }
           ) => unknown
-        ) => action(mocks.db, { createdAt: "2026-09-01T00:00:00.000Z" })
+        ) =>
+          action(mocks.db, {
+            createdAt: "2026-09-01T00:00:00.000Z",
+            sessionId: "session-1",
+          })
       );
     mocks.purgeDocumentIfEligible.mockResolvedValue("purged");
     mocks.auth.mockResolvedValue({ session: { user: { id: "user-1" } } });
     mocks.db.select.mockImplementation((fields) =>
       fields?.attemptNumber
-        ? chain([{ attemptNumber: 2 }])
-        : chain([{ id: "session-1" }])
+        ? chain([{ attemptNumber: 2, status: "processing" }])
+        : fields
+          ? chain([{ id: "session-1" }])
+          : chain([])
     );
     mocks.db.insert.mockImplementation((table: unknown) => {
       const result =
@@ -390,8 +419,8 @@ describe("native PDF conversion route", () => {
     expect(mocks.countPages).not.toHaveBeenCalled();
     expect(mocks.upload.mock.calls.map(([key]) => key)).toEqual([
       "session-1/doc-1/source.pdf",
-      "session-1/doc-1/job-1/output.pdf",
-      "session-1/doc-1/job-1/review.json",
+      immutableKey("pdf_output"),
+      immutableKey("review_metadata"),
     ]);
     expect(mocks.upload.mock.calls[0].slice(1)).toEqual([
       Buffer.from(PDF),
@@ -400,6 +429,10 @@ describe("native PDF conversion route", () => {
     expect(mocks.upload.mock.calls[1].slice(1)).toEqual([
       Buffer.from("%PDF-1.7\nrepaired test bytes\n%%EOF"),
       "application/pdf",
+      expect.objectContaining({
+        upsert: false,
+        signal: expect.any(AbortSignal),
+      }),
     ]);
     expect(inserted.get(documents)?.values).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -419,16 +452,16 @@ describe("native PDF conversion route", () => {
       },
     });
     expect(artifactValues().map((value) => value.artifactType)).toEqual([
-      "source_pdf",
       "pdf_output",
       "review_metadata",
+      "source_pdf",
     ]);
-    expect(artifactValues()[1]).toMatchObject({
+    expect(artifactValues()[0]).toMatchObject({
       filename: "Course-repaired.pdf",
       mimeType: "application/pdf",
     });
     expect(
-      artifactValues().every((value) => value.previewSnippet === null)
+      artifactValues().every((value) => value.previewSnippet == null)
     ).toBe(true);
     expect(inserted.get(conversionJobs)?.values).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -476,8 +509,8 @@ describe("native PDF conversion route", () => {
     );
     expect(inserted.has(documents)).toBe(false);
     expect(mocks.upload.mock.calls.map(([key]) => key)).toEqual([
-      "session-1/doc-1/job-1/output.pdf",
-      "session-1/doc-1/job-1/review.json",
+      immutableKey("pdf_output"),
+      immutableKey("review_metadata"),
     ]);
     expect(mocks.convert).not.toHaveBeenCalled();
   });
@@ -580,7 +613,122 @@ describe("native PDF conversion route", () => {
     expect(mocks.convert).not.toHaveBeenCalled();
   });
 
-  it.each(["output.pdf", "review.json"])(
+  it.each([
+    {
+      name: "course.pdf",
+      contents: PDF,
+      outputTarget: "accessible_pdf",
+      engine: mocks.repairNativePdf,
+    },
+    {
+      name: "course.docx",
+      contents: DOCX,
+      outputTarget: "accessible_docx",
+      engine: mocks.convertWord,
+    },
+    {
+      name: "course.pptx",
+      contents: DOCX,
+      outputTarget: "accessible_pptx",
+      engine: mocks.convertPowerPoint,
+    },
+    {
+      name: "course.pdf",
+      contents: PDF,
+      outputTarget: "canvas_html",
+      engine: mocks.convert,
+    },
+  ])(
+    "records an unexpected $outputTarget engine rejection and preserves retry identity",
+    async (input) => {
+      const privateError = Object.assign(
+        new Error("private document text; provider-secret"),
+        {
+          diagnostic: { code: "provider_auth", model: "private-value" },
+          calls: [{ ...usage, model: "private-value" }],
+        }
+      );
+      input.engine.mockRejectedValueOnce(privateError);
+      const response = await POST(request(input));
+      expect(response.status).toBe(500);
+      const body = await response.json();
+      expect(body).toMatchObject({
+        documentId: "doc-1",
+        jobId: "job-1",
+        outputTarget: input.outputTarget,
+      });
+      expect(updated.set).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: "failed",
+          errorCode: "unknown_error",
+          completedAt: expect.any(String),
+          processingDurationMs: null,
+        })
+      );
+      expect(inserted.get(jobEvents)?.values).toHaveBeenCalledWith(
+        expect.objectContaining({
+          eventType: "conversion_failed",
+          metadata: expect.objectContaining({
+            diagnostic: expect.objectContaining({
+              stage: "conversion",
+              code: "unknown_error",
+              attemptNumber: 2,
+            }),
+          }),
+        })
+      );
+      expect(inserted.has(dailyFailureMetrics)).toBe(true);
+      expect(inserted.has(modelCalls)).toBe(false);
+      expect(artifactValues()).toEqual([]);
+      expect(mocks.upload).toHaveBeenCalledTimes(1);
+      expect(
+        JSON.stringify([
+          body,
+          mocks.db.insert.mock.results.map((r) => r.value.values.mock.calls),
+          mocks.db.update.mock.results.map((r) => r.value.set.mock.calls),
+          vi.mocked(console.error).mock.calls,
+        ])
+      ).not.toMatch(/private document|provider-secret|private-value/);
+      expect(input.engine).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it("does not fail a newer attempt after an older engine unexpectedly rejects", async () => {
+    mocks.repairNativePdf.mockImplementationOnce(async () => {
+      mocks.db.select.mockReturnValueOnce(chain([{ attemptNumber: 3 }]));
+      throw new Error("private worker error");
+    });
+    const response = await POST(request());
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      documentId: "doc-1",
+      jobId: "job-1",
+      outputTarget: "accessible_pdf",
+    });
+    expect(updated.set).not.toHaveBeenCalledWith(
+      expect.objectContaining({ status: "failed" })
+    );
+    expect(inserted.has(jobEvents)).toBe(false);
+    expect(artifactValues()).toEqual([]);
+  });
+
+  it("honors expiry when recording an unexpected engine rejection", async () => {
+    mocks.repairNativePdf.mockImplementationOnce(async () => {
+      mocks.withRetainedDocument.mockRejectedValueOnce(
+        new DocumentUnavailableError()
+      );
+      throw new Error("private worker error");
+    });
+    const response = await POST(request());
+    expect(response.status).toBe(410);
+    expect(updated.set).not.toHaveBeenCalledWith(
+      expect.objectContaining({ status: "failed" })
+    );
+    expect(inserted.has(jobEvents)).toBe(false);
+    expect(artifactValues()).toEqual([]);
+  });
+
+  it.each(["pdf_output", "review_metadata"])(
     "retains both model stages if %s cannot be saved",
     async (failedFile) => {
       mocks.upload.mockImplementation(async (key: string) => {
@@ -602,7 +750,7 @@ describe("native PDF conversion route", () => {
         expect.objectContaining({ stage: "convert", costUsd: "0.001" }),
         expect.objectContaining({ stage: "validate", costUsd: "0.001" }),
       ]);
-      expect(artifactValues()).toEqual([]);
+      expectPendingReceipts(["pdf_output", "review_metadata"]);
     }
   );
 

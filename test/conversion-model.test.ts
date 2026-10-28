@@ -72,7 +72,7 @@ describe("conversion model configuration", () => {
   });
 
   it.each([
-    ["the Sol default when unset", undefined, "gpt-5.6-sol-2026-07-09"],
+    ["the Sol default when unset", undefined, "gpt-6.1-sol-2026-09-29"],
     ["an explicit model override", "custom-proxy-model", "custom-proxy-model"],
   ])(
     "uses %s for both stages and pricing",

@@ -11,10 +11,12 @@ export type ConversionStatus =
   | "error";
 
 export interface UploadedDocument {
-  /** Stable key for the UI. Equals `documentId` once the document is persisted. */
+  /** Stable key for the UI; saved rows use `documentId`, local rows keep their key. */
   id: string;
-  /** documents.id. Present after the source is saved, before or during conversion. */
+  /** Server-assigned identity, available before persistence for prepared submissions. */
   documentId?: string;
+  /** The original source has been verified; false reservations cannot be converted by ID yet. */
+  sourceReady?: boolean;
   jobId?: string;
   /** Implemented destination; fixed once processing starts. Legacy rows default to HTML. */
   outputTarget?: OutputTarget;
@@ -24,6 +26,12 @@ export interface UploadedDocument {
   size: number;
   uploadedAt: Date;
   status: ConversionStatus;
+  /** An owned, retained output exists independently of the latest attempt's status. */
+  hasAvailableOutput?: boolean;
+  /** Immutable artifact identity for the listed output and its review snapshot. */
+  savedOutputArtifactId?: string;
+  /** Browser-only: a failed request could not be reconciled with the saved result. */
+  savedResultUnverified?: boolean;
   /** Temporary browser-only phase; the saved job keeps the existing statuses. */
   processingPhase?: "uploading";
   locked: boolean;

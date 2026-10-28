@@ -1197,6 +1197,11 @@ async function loadPackage(
     },
   };
   const xmlBudget = { nodes: 0, deadline: Date.now() + 15_000 };
+  let xmlBytes = 0;
+  const inspectXml = (name: string, bytes: Buffer) => {
+    if ((xmlBytes += bytes.length) > LIMITS.totalXml) complex();
+    pkg.xml.set(name, parseXml(bytes, xmlBudget));
+  };
   // Parse every XML/relationship part, including unused parts, before returning any output.
   for (const [name, part] of parts) {
     if (/^_xmlsignatures\//i.test(name))
@@ -1212,8 +1217,7 @@ async function loadPackage(
         "pptx_unsupported",
         "Presentations with macros or ActiveX controls are not supported. Use a standard .pptx working copy."
       );
-    if (/\.(?:xml|rels|vml|svg)$/i.test(name))
-      pkg.xml.set(name, parseXml(part.bytes, xmlBudget));
+    if (/\.(?:xml|rels|vml|svg)$/i.test(name)) inspectXml(name, part.bytes);
   }
   const contentTypes = xmlPart(pkg, "[Content_Types].xml");
   if (
@@ -1230,6 +1234,11 @@ async function loadPackage(
     )
       fail();
     const contentType = element.getAttribute("ContentType") ?? "";
+    // Accept a bare media type; ambiguous suffixes must not bypass XML inspection.
+    if (
+      !/^[a-z0-9!#$%&'*+.^_`|~-]+\/[a-z0-9!#$%&'*+.^_`|~-]+$/i.test(contentType)
+    )
+      fail();
     if (/macroEnabled|vbaProject|activeX/i.test(contentType))
       throw new PptxPackageError(
         "pptx_unsupported",
@@ -1258,7 +1267,7 @@ async function loadPackage(
       defaults.get(path.posix.extname(name).slice(1).toLowerCase()) ??
       "";
     if (/(?:\/xml|\+xml)$/i.test(contentType) && !pkg.xml.has(name))
-      pkg.xml.set(name, parseXml(part.bytes, xmlBudget));
+      inspectXml(name, part.bytes);
   }
   const roots = relationships(pkg, "").filter((rel) =>
     rel.type.endsWith("/officeDocument")

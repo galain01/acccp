@@ -8,12 +8,13 @@ bytes are preserved. Unsupported structures stay available for human review.
 from __future__ import annotations
 
 import copy
+from decimal import Decimal
 import hashlib
 import json
 import re
 
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import (ArrayObject, BooleanObject, ByteStringObject, ContentStream,
+from pypdf.generic import (ArrayObject, BooleanObject, ByteStringObject, ContentStream, FloatObject,
     DictionaryObject, IndirectObject, NameObject, NullObject, NumberObject,
     TextStringObject)
 
@@ -124,10 +125,39 @@ def _freeze(value):
     return value
 
 
+class _PreciseContentFloat(FloatObject):
+    """Serialize one existing operand without pypdf's display rounding."""
+
+    def myrepr(self):
+        # PDF numbers cannot use exponent notation. The shortest round-trip
+        # decimal retains the original parsed float without global settings.
+        value = format(Decimal(repr(float(self))), 'f')
+        return value.rstrip('0').rstrip('.') if '.' in value else value
+
+
+def preserved_content_stream(writer, operations):
+    """Rewrite tag wrappers while retaining every parsed numeric operand."""
+    def exact(value):
+        if isinstance(value, FloatObject):
+            return _PreciseContentFloat(float(value))
+        if isinstance(value, ArrayObject):
+            return ArrayObject([exact(item) for item in value])
+        if isinstance(value, DictionaryObject):
+            return DictionaryObject({key: exact(item) for key, item in value.items()})
+        if isinstance(value, list):
+            return [exact(item) for item in value]
+        if isinstance(value, dict):
+            return {key: exact(item) for key, item in value.items()}
+        return value
+    content = ContentStream(None, writer)
+    content.operations = [(exact(args), operator) for args, operator in operations]
+    return content
+
+
 def _show_text(reader, page, ops, indices):
-    selected = [(args, operator) for index, (args, operator) in enumerate(ops)
-        if operator not in (b'Do', b'INLINE IMAGE')
-        and (operator not in SHOW or index in indices)]
+    indexed = v.scoped_text_operations(ops, list(range(len(ops))), [False] * len(ops))
+    selected = [(args, operator) for (args, operator), index, _ in indexed
+        if operator not in SHOW or index in indices]
     page_copy = copy.copy(page)
     page_copy[NameObject('/Contents')] = v.extraction_stream(selected, reader, page.get('/Resources', {}))
     return (page_copy.extract_text() or '').strip()
@@ -257,7 +287,7 @@ class _DiscoveryInspection:
     fresh saved-byte evidence by minting a new reader, never by importing a
     caller's inventory or retaining a mutable reader from an earlier phase.
     """
-    __slots__ = ('_reader', '_inventory', '_saved_pdf')
+    __slots__ = ('_reader', '_inventory', '_saved_pdf', '_source_sha256')
 
     def __init__(self, reader):
         if not isinstance(reader, PdfReader):
@@ -265,6 +295,7 @@ class _DiscoveryInspection:
         self._reader = reader
         self._inventory = v.structure_inventory(reader)
         self._saved_pdf = None
+        self._source_sha256 = source_digest(reader)
 
     @classmethod
     def _from_saved_pdf(cls, evidence):
@@ -274,10 +305,11 @@ class _DiscoveryInspection:
         result._reader = evidence.fresh_reader()
         result._inventory = evidence.copy_for(result._reader.stream.getvalue())
         result._saved_pdf = evidence
+        result._source_sha256 = source_digest(result._reader)
         return result._reader, result
 
     def copy_for(self, reader):
-        if reader is not self._reader:
+        if reader is not self._reader or source_digest(reader) != self._source_sha256:
             fail()
         # Worker enrichment adds editing flags and child indexes. Those must
         # never become part of the raw evidence used for candidate discovery.
@@ -393,13 +425,14 @@ def _discover(reader, *, _inspection=None):
             and 0 < first['y'] - item['y'] <= item['size'] * 1.5 for item in body_states)
         if re.fullmatch(r'[1-9][0-9]{0,2}|\*{1,2}|[†‡]', marker) and (tag['role'] == 'Note' or raised or marker in ('*', '**')):
             note_markers.setdefault((pi, marker), []).append((tag, mcid, scope))
+    note_pages = {page_index for page_index, _ in note_markers}
     for tag in tags:
         if tag['role'] != 'P' or tag['id'] not in eligible:
             continue
         pi, mcid, scope = eligible[tag['id']]
         ops, show = page_ops[pi], scope['shows']
         state = states[pi]
-        marker = show_text(pi, {show[-1]})
+        marker = show_text(pi, {show[-1]}) if pi in note_pages else None
         matches = note_markers.get((pi, marker), [])
         previous, last = state.get(show[-2], {}) if len(show) >= 2 else {}, state.get(show[-1], {})
         raised = (previous.get('size', 0) > 0 and 0 < last.get('size', 0) <= previous['size'] * .85
@@ -866,8 +899,7 @@ def apply_operations(source_reader, writer, operations, *, _inspection=None):
             changed.extend(edit['replacements'].get(index, [([_freeze(arg) for arg in args] if operator in SHOW else args, operator)]))
         if paint_fingerprint(changed, bool(edit['replacements'])) != paint_fingerprint(edit['ops'], bool(edit['replacements'])):
             raise SemanticStructureError('native_pdf_preservation')
-        content = ContentStream(None, writer)
-        content.operations = changed
+        content = preserved_content_stream(writer, changed)
         writer.pages[pi][NameObject('/Contents')] = writer._add_object(content)
     return {'changes': changes, 'lineage': lineage,
         'verification': _SplitHeadingVerification(_SPLIT_PROOF_TOKEN, split_proofs)}

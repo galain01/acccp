@@ -178,9 +178,12 @@ verified structure/painting boundaries. A planner may select
 `split_heading` candidate also accepts `role:"H2"` through `"H6"`. A
 `describe_chart` candidate requires `alt` (1–8000 characters) and forbids `role`.
 Other candidate kinds are `convert_list`, `join_list_continuation`,
-`mark_note_reference`, `rebuild_table`, `move_callout` and
-`move_page_continuation`; these accept neither `role` nor `alt`. Up to 200
-related tag IDs identify participants. Only `move_page_continuation` supplies
+`mark_note_reference`, `rebuild_table`, `rebuild_grid_table`, `repair_table_headers`,
+`move_callout` and `move_page_continuation`; these accept neither `role` nor `alt`.
+Up to 200 related tag IDs identify participants, or 4000 for an existing-table
+header repair's complete native subtree. The existing model evidence size limit
+still applies; participants and their text are never silently truncated.
+Only `move_page_continuation` supplies
 `readonlyTagIds`: exactly one related anchor, distinct from the primary tag,
 that provides context and is not modified by that operation. This permits a
 verified heading split on the anchor to compose with moving its continuation.
@@ -212,6 +215,31 @@ The private pipeline rederives selections from immutable source bytes, captures
 original node maps before edits, rejects overlapping operations, and verifies
 saved cell/header membership, graphic ownership and reading order after reopening.
 The independent audit checks semantic accuracy against the original pages.
+
+`repair_table_headers` supports an existing native rectangular table with a
+blank corner, authored first-row column-header IDs, and body cells explicitly
+linked only to their source column. It requires two adjacent source axis labels,
+unambiguous native/marked-content ownership on one page, and distinct row and
+column ranges. Discovery is bounded to eight tables, 60 data rows and 32 columns;
+spans, unresolved or conflicting attributes, protected text alternatives and
+ambiguous ownership are ineligible. The model confirms which axis describes the
+first-column row ranges and which describes the column ranges; it cannot supply
+text, geometry, IDs or replacement values. The writer retains all original nodes
+and authored ID ownership, places the original axes and header row under THead,
+places the original body rows under TBody, and gives each amount explicit links
+to both axes, its row header and its original column header. It independently
+verifies the saved hierarchy, scopes, complete acyclic header graph, source
+painting/resources and preserved form state. No page stream or field is edited.
+
+The model uses `table-header-relationships` with an exact assigned tag ID for an
+unresolved row/column association. After an executed and verified header repair,
+the independent audit receives a targeted reassessment and the current linked
+header text even across tag batches. An earlier concern is retired only after an
+explicit eligible `resolved` review of that saved tag and role; omitted,
+conflicting, invalid, unverified or uncertain reviews retain it. This cannot
+dismiss machine findings, form interaction requirements or unrelated table
+defects. The same current-state review channel continues to handle verified
+heading repairs.
 
 The table kernel may additionally wrap one source-proven constant pale axial
 shading in `/Artifact` marking. It requires a self-contained rectangular clip
@@ -267,15 +295,30 @@ seconds. The supervisor checks the saved bytes again before passing only the
 repair JSON to the PDF processor. Transport files are deleted in all outcomes;
 the app deletes the remote object and tracks failed cleanup for its purge.
 
+`SUPABASE_DOCUMENTS_BUCKET` optionally selects a separate private bucket for an
+isolated environment (default `documents`). Set the same value in app and worker.
+The transport matches that exact bucket; it does not accept arbitrary bucket
+names supplied by a request. Names contain only lowercase letters, digits,
+underscores and hyphens, beginning with a letter or digit, at most 100 characters.
+
 Bounds: 4 MiB PDF input and candidate, 60 pages, 5,000 tags, 500,000 text
 characters, 12 MiB repair JSON, 16 KiB stored-reference HTTP body, 16 MiB
-response, one active job per process, 90 seconds per worker request including
-the signed-object download. Busy jobs fail immediately with HTTP 503.
+response, one active job per process, a 90-second work budget per request including
+body intake and the signed-object download. Each phase receives only the
+remaining budget, and body reads check an absolute deadline so trickling input
+cannot extend it. Busy jobs fail immediately with HTTP 503.
+Bounded process cleanup and response delivery may add elapsed time after this
+work budget; it is not an exact HTTP response-time guarantee.
 All request-local files are deleted after success or failure, including Java
 scratch files pinned by `-Djava.io.tmpdir`. An isolated
 processor receives only fixed runtime paths, no application secrets. Process
 timeouts and OS resource limits supplement the container's memory limits;
-they do not constitute an OS sandbox. Existing tags are preserved; only
+they do not constitute an OS sandbox. In the production Linux service, its
+owned process group is terminated after every processor exit, before draining
+pipes, reading results, or deleting request files. This includes crashes and
+successes with leftover children. Windows development timeout cleanup uses
+`taskkill` and does not promise containment of children orphaned before their
+parent exits. Existing tags are preserved; only
 untagged PDFs go through OpenDataLoader. Every `page_content` row includes
 `selectableTextPresent` and `requiresVisualTextReview`. The mandatory auditor
 determines whether visible words need OCR or the page contains a graphic with

@@ -22,6 +22,7 @@ MAX_PDF = 4 * 1024 * 1024
 MAX_BODY = 12 * 1024 * 1024
 MAX_RESULT = 16 * 1024 * 1024
 DEADLINE = 90
+POSIX_PROCESS_GROUPS = os.name == "posix"
 PROCESSOR = Path(__file__).with_name("worker.py")
 TRANSPORT = Path(__file__).with_name("stored_transport.py")
 ACTIVE = threading.BoundedSemaphore(1)
@@ -84,6 +85,7 @@ def kill_tree(process):
 
 def execute(mode, body, toolchain, *, timeout=None):
     started = time.monotonic()
+    deadline = started + (DEADLINE if timeout is None else min(DEADLINE, max(0, timeout)))
 
     def failure(reason, process, code="native_pdf_worker_failed"):
         log_execution_failure(mode, code, (time.monotonic() - started) * 1000,
@@ -100,7 +102,7 @@ def execute(mode, body, toolchain, *, timeout=None):
         environment.update(TMPDIR=str(folder), TEMP=str(folder), TMP=str(folder), HOME=str(folder))
         process = subprocess.Popen([sys.executable, str(PROCESSOR), mode, str(request), str(folder), str(toolchain), str(result)],
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   env=environment, cwd=folder, start_new_session=os.name == "posix",
+                                   env=environment, cwd=folder, start_new_session=POSIX_PROCESS_GROUPS,
                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         output = [bytearray(), bytearray()]
         excessive = threading.Event()
@@ -116,21 +118,30 @@ def execute(mode, body, toolchain, *, timeout=None):
                    for number, stream in enumerate((process.stdout, process.stderr))]
         for thread in threads:
             thread.start()
+        terminal_failure = None
         try:
-            process.wait(timeout=DEADLINE if timeout is None else max(0.01, timeout))
+            process.wait(timeout=max(0, deadline - time.monotonic()))
             cpu_signal = getattr(signal, "SIGXCPU", None)
             if cpu_signal is not None and process.returncode == -cpu_signal:
-                # The OS ended this worker at its CPU budget. Stop any native
-                # descendants before draining pipes/cleaning request files;
-                # retain the original signal in the content-free diagnostic.
-                kill_tree(process)
-                return failure("cpu_limit", process, "native_pdf_timeout")
+                terminal_failure = "cpu_limit"
         except subprocess.TimeoutExpired:
-            kill_tree(process)
-            return failure("timeout", process, "native_pdf_timeout")
+            terminal_failure = "timeout"
         finally:
-            for thread in threads:
-                thread.join(timeout=5)
+            try:
+                # On Linux, the request owns the new session/process group even
+                # after its leader exits. Kill leftover native descendants on
+                # success and failure before draining pipes or deleting files.
+                # Windows taskkill cannot recover an already orphaned tree;
+                # retain its existing timeout cleanup without that claim.
+                # https://docs.python.org/3.12/library/subprocess.html#subprocess.Popen
+                # https://docs.python.org/3.12/library/os.html#os.killpg
+                if POSIX_PROCESS_GROUPS or terminal_failure is not None:
+                    kill_tree(process)
+            finally:
+                for thread in threads:
+                    thread.join(timeout=5)
+        if terminal_failure is not None:
+            return failure(terminal_failure, process, "native_pdf_timeout")
         if excessive.is_set():
             return failure("output_limit", process)
         if process.returncode != 0:
@@ -153,16 +164,16 @@ def execute(mode, body, toolchain, *, timeout=None):
             return failure("invalid_result", process)
 
 
-def fetch_stored(body, origin, *, timeout=stored_transport.FETCH_DEADLINE):
+def fetch_stored(body, origin, *, timeout=stored_transport.FETCH_DEADLINE, bucket="documents"):
     """Fetch separately so no signed URL reaches a PDF document processor."""
-    stored_transport.validate_reference(body, origin)
+    stored_transport.validate_reference(body, origin, bucket)
     with tempfile.TemporaryDirectory(prefix="native-pdf-transport-") as temporary:
         folder = Path(temporary)
         request, result = folder / "reference.json", folder / "request.json"
         request.write_bytes(body)
         environment = child_environment()
         environment.update(TMPDIR=str(folder), TEMP=str(folder), TMP=str(folder), HOME=str(folder))
-        process = subprocess.Popen([sys.executable, str(TRANSPORT), str(request), str(result), origin],
+        process = subprocess.Popen([sys.executable, str(TRANSPORT), str(request), str(result), origin, bucket],
                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                    env=environment, cwd=folder, start_new_session=os.name == "posix",
                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -178,7 +189,7 @@ def fetch_stored(body, origin, *, timeout=stored_transport.FETCH_DEADLINE):
             raise stored_transport.TransportError("pdf_complexity_limit")
         payload = result.read_bytes()
         # Independently verify the saved transport child's exact bytes.
-        reference, _, _ = stored_transport.validate_reference(body, origin)
+        reference, _, _ = stored_transport.validate_reference(body, origin, bucket)
         if len(payload) != reference["requestBytes"] or hashlib.sha256(payload).hexdigest() != reference["requestSha256"]:
             raise stored_transport.TransportError()
         return payload
@@ -236,6 +247,27 @@ class Handler(BaseHTTPRequestHandler):
         values = self.headers.get_all("Authorization", [])
         return len(values) == 1 and hmac.compare_digest(values[0].encode(), ("Bearer " + self.server.api_key).encode())
 
+    @staticmethod
+    def remaining_time(deadline):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError
+        return remaining
+
+    def read_body(self, length, deadline):
+        body = bytearray()
+        while len(body) < length:
+            self.connection.settimeout(min(10, self.remaining_time(deadline)))
+            # read1 performs at most one underlying read, so trickling bytes
+            # cannot reset the absolute request budget inside a buffered read.
+            # https://docs.python.org/3.12/library/io.html#io.BufferedReader.read1
+            block = self.rfile.read1(min(65536, length - len(body)))
+            self.remaining_time(deadline)
+            if not block:
+                break
+            body.extend(block)
+        return bytes(body)
+
     def do_GET(self):
         if not self.authorized():
             return self.send_json(401, {"error": {"code": "unauthorized"}})
@@ -259,18 +291,15 @@ class Handler(BaseHTTPRequestHandler):
         if not ACTIVE.acquire(blocking=False):
             return self.send_json(503, {"error": {"code": "native_pdf_busy"}})
         try:
-            started = time.monotonic()
-            body = self.rfile.read(int(lengths[0]))
+            deadline = time.monotonic() + DEADLINE
+            body = self.read_body(int(lengths[0]), deadline)
             if len(body) != int(lengths[0]):
                 return self.send_json(400, {"error": {"code": "pdf_invalid"}})
             if self.path == "/repair-stored":
-                body = fetch_stored(body, getattr(self.server, "storage_origin", ""), timeout=DEADLINE - (time.monotonic() - started))
-                remaining = DEADLINE - (time.monotonic() - started)
-                if remaining <= 0:
-                    raise stored_transport.TransportError("native_pdf_timeout")
-                status, response = execute("repair", body, self.server.toolchain, timeout=remaining)
-            else:
-                status, response = execute(self.path[1:], body, self.server.toolchain)
+                body = fetch_stored(body, getattr(self.server, "storage_origin", ""), timeout=self.remaining_time(deadline),
+                                    bucket=getattr(self.server, "storage_bucket", "documents"))
+            mode = "prepare" if self.path == "/prepare" else "repair"
+            status, response = execute(mode, body, self.server.toolchain, timeout=self.remaining_time(deadline))
             return self.send_json(status, response)
         except stored_transport.TransportError as error:
             return self.send_json(ERROR_STATUS[error.code], {"error": {"code": error.code}})
@@ -294,6 +323,7 @@ def main():
     server = Server((options.host, options.port), Handler)
     server.api_key, server.toolchain = key, options.toolchain.resolve()
     server.storage_origin = os.environ.get("SUPABASE_URL", "").rstrip("/")
+    server.storage_bucket = os.environ.get("SUPABASE_DOCUMENTS_BUCKET", "").strip() or "documents"
     server.serve_forever(poll_interval=0.5)
 
 

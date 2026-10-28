@@ -220,10 +220,14 @@ def compare_with_authorized_navigation(original: Path, final: Path, manifest: di
         # page geometry, catalog actions and authored Figure associations.
         from font_validation import verify_other_content
         unchanged = verify_other_content(before, normalized)
+        normalized_navigation = v.compare_annotations(before, normalized)
+        require(normalized_navigation['passed'], 'navigation_other_link_semantics_changed')
         require(all(page.get('pixels_identical') and page.get('extracted_text_identical') for page in report['preservation']['pages']), 'navigation_content_or_pixels_changed')
         allowed, retained = [], []
         for finding in report['findings']:
-            (allowed if finding['code'] == 'page_properties_changed' and finding.get('page') == 1 else retained).append(finding)
+            authorized = (finding['code'] == 'page_properties_changed' and finding.get('page') == 1
+                          or finding['code'] == 'annotation_navigation_changed_or_uninspected' and normalized_navigation['passed'])
+            (allowed if authorized else retained).append(finding)
         report['findings'] = retained
         evidence.update({'passed': True, 'checksComplete': True, 'changes': ledger,
                          'sourceSha256': manifest['sourceSha256'], 'candidateSha256': manifest['candidateSha256'],

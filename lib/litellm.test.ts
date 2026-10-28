@@ -83,9 +83,9 @@ describe("Independent conversion and audit models", () => {
       vi.stubEnv("LITELLM_CONVERSION_MODEL", override);
       vi.stubEnv("LITELLM_AUDIT_MODEL", override);
 
-      expect(getLiteLLMConfig("convert").model).toBe("gpt-5.6-sol-2026-07-09");
-      expect(getLiteLLMConfig("validate").model).toBe("gpt-5.6-sol-2026-07-09");
-      expect(getLiteLLMConfig().model).toBe("gpt-5.6-sol-2026-07-09");
+      expect(getLiteLLMConfig("convert").model).toBe("gpt-6.1-sol-2026-09-29");
+      expect(getLiteLLMConfig("validate").model).toBe("gpt-6.1-sol-2026-09-29");
+      expect(getLiteLLMConfig().model).toBe("gpt-6.1-sol-2026-09-29");
     }
   );
 
@@ -98,8 +98,8 @@ describe("Independent conversion and audit models", () => {
       vi.stubEnv(variable, "selected-model");
 
       expect(getLiteLLMConfig(selectedStage).model).toBe("selected-model");
-      expect(getLiteLLMConfig(otherStage).model).toBe("gpt-5.6-sol-2026-07-09");
-      expect(getLiteLLMConfig().model).toBe("gpt-5.6-sol-2026-07-09");
+      expect(getLiteLLMConfig(otherStage).model).toBe("gpt-6.1-sol-2026-09-29");
+      expect(getLiteLLMConfig().model).toBe("gpt-6.1-sol-2026-09-29");
     }
   );
 
@@ -152,13 +152,13 @@ describe("AI & LiteLLM connection", () => {
     ["empty", ""],
     ["whitespace-only", " \t\n "],
   ])(
-    "getLiteLLMConfig defaults to GPT-5.6 Sol when LITELLM_MODEL is %s",
+    "getLiteLLMConfig defaults to GPT-6.1 Sol when LITELLM_MODEL is %s",
     (_label, model) => {
       vi.stubEnv("LITELLM_BASE_URL", "https://litellm.cloud.osu.edu");
       vi.stubEnv("LITELLM_API_KEY", "updated-test-key");
       vi.stubEnv("LITELLM_MODEL", model);
 
-      expect(getLiteLLMConfig().model).toBe("gpt-5.6-sol-2026-07-09");
+      expect(getLiteLLMConfig().model).toBe("gpt-6.1-sol-2026-09-29");
     }
   );
 
@@ -186,7 +186,7 @@ describe("AI & LiteLLM connection", () => {
       .mockResolvedValueOnce(
         jsonResponse({
           choices: [{ message: { content: "  <p>Accessible content</p>  " } }],
-          model: "gpt-5.6-sol-2026-07-09",
+          model: "gpt-6.1-sol-2026-09-29",
           usage: {
             prompt_tokens: 120,
             completion_tokens: 40,
@@ -205,7 +205,7 @@ describe("AI & LiteLLM connection", () => {
               },
             },
             {
-              model_name: "gpt-5.6-sol-2026-07-09",
+              model_name: "gpt-6.1-sol-2026-09-29",
               model_info: {
                 input_cost_per_token: 0.000003,
                 output_cost_per_token: 0.000006,
@@ -237,7 +237,7 @@ describe("AI & LiteLLM connection", () => {
     );
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string)).toEqual({
-      model: "gpt-5.6-sol-2026-07-09",
+      model: "gpt-6.1-sol-2026-09-29",
       messages: [
         { role: "system", content: "conversion instructions" },
         { role: "user", content: "source" },
@@ -245,7 +245,7 @@ describe("AI & LiteLLM connection", () => {
     });
     expect(result).toEqual({
       content: "<p>Accessible content</p>",
-      model: "gpt-5.6-sol-2026-07-09",
+      model: "gpt-6.1-sol-2026-09-29",
       promptTokens: 120,
       completionTokens: 40,
     });

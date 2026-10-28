@@ -7,6 +7,18 @@ on:
     branches: [main, dev]
 
 jobs:
+  native-pdf-tools:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build only: the image is never pushed or deployed. Its existing build
+      # smoke runs the pinned Java tools on synthetic PDFs as the unprivileged
+      # production user, without application credentials or model calls.
+      - name: Verify native PDF tools and Linux worker boundary
+        timeout-minutes: 10
+        run: docker build --progress=plain --file Dockerfile.native-pdf.vercel --tag acccp-native-pdf-test:${{ github.sha }} .
+
   format:
     runs-on: ubuntu-latest
     steps:
@@ -17,10 +29,8 @@ jobs:
           node-version: 24
           cache: npm
 
-      # npm install instead of npm ci: the lockfile is maintained on Windows, where
-      # npm drops wasm/Linux-only optional deps that npm ci on Linux then requires
       - name: Install dependencies
-        run: npm install
+        run: npm ci --ignore-scripts
 
       - name: Check formatting
         run: npm run format:check
@@ -30,18 +40,67 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Production versions plus NumPy for the research verification tests only.
+      # Wheels only; NumPy is not added to the production worker image.
+      - name: Install native PDF test dependencies
+        timeout-minutes: 5
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: -r services/native-pdf/requirements.txt numpy==2.3.5
+
+      # Synthetic fixtures and loopback HTTP only. Java tools and remote calls are mocked.
+      - name: Check native PDF engine and supervisor
+        timeout-minutes: 5
+        run: |
+          python -m pip check
+          python -m unittest discover -s services/native-pdf -p "test_*.py"
+          python -m unittest discover -s research/native-pdf -p "test_native_pdf_validation.py"
+          python -m unittest discover -s research/native-pdf -p "test_navigation*.py"
+          python -m unittest discover -s research/native-pdf -p "test_link_grouping_repairs.py"
+          python -m unittest discover -s research/native-pdf -p "test_text_extraction_graphics_budget.py"
+
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
 
-      # npm install instead of npm ci: the lockfile is maintained on Windows, where
-      # npm drops wasm/Linux-only optional deps that npm ci on Linux then requires
       - name: Install dependencies
-        run: npm install
+        run: npm ci --ignore-scripts
 
       - name: Typecheck
         run: npm run typecheck
 
       - name: Run tests
         run: npm run test
+
+      - name: Install isolated PostgreSQL test runtime
+        timeout-minutes: 3
+        run: npm ci --prefix .github/test-runtime --ignore-scripts
+
+      - name: Verify submission recovery and immutable publication
+        timeout-minutes: 3
+        env:
+          PGLITE_RUNTIME_DIR: ${{ github.workspace }}/.github/test-runtime
+        run: |
+          node node_modules/vitest/vitest.mjs run --config test/conversion-publication-postgres.config.mjs
+          node node_modules/vitest/vitest.mjs run --config test/document-submission-postgres.config.mjs
+          node node_modules/vitest/vitest.mjs run --config test/powerpoint-review-publication-postgres.config.mjs
+
+      # Synthetic build/runtime checks: no production credentials or services.
+      - name: Build and verify traced PDF rendering
+        timeout-minutes: 5
+        env:
+          DATABASE_URL: postgresql://build:build@127.0.0.1:1/acccp_build
+          SUPABASE_URL: http://127.0.0.1:1
+          SUPABASE_SERVICE_ROLE_KEY: build-placeholder-not-a-credential
+          BETTER_AUTH_SECRET: build-only-placeholder-not-a-real-secret-20261026
+          BETTER_AUTH_URL: http://localhost:3000
+          NEXT_TELEMETRY_DISABLED: "1"
+        run: npm run build
+
+      - name: Verify signed-out framework runtime
+        timeout-minutes: 2
+        run: node scripts/check-framework-runtime.mjs

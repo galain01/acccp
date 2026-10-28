@@ -322,6 +322,7 @@ async function prepareExport(userId: string, input: PowerPointReviewSelection) {
         jobId: input.jobId,
         artifactType: "pptx_output",
         artifactStatus: "expired",
+        isUserDownloadable: false,
         filename: outputFilename(job.filename, "accessible_pptx"),
         mimeType: PPTX_MIME_TYPE,
         storageKey: outputKey,
@@ -332,7 +333,9 @@ async function prepareExport(userId: string, input: PowerPointReviewSelection) {
         jobId: input.jobId,
         artifactType: "review_metadata",
         artifactStatus: "expired",
-        filename: "review.json",
+        // Reuse the existing pending-publication settlement barrier. The
+        // receipt remains private after a failed or uncertain upload.
+        filename: "conversion-publication.json",
         mimeType: "application/json",
         storageKey: reviewKey,
         isUserDownloadable: false,
@@ -352,6 +355,44 @@ async function prepareExport(userId: string, input: PowerPointReviewSelection) {
   });
 }
 
+async function assertExportCurrent(
+  tx: DocumentTransaction,
+  userId: string,
+  input: PowerPointReviewSelection,
+  prepared: Awaited<ReturnType<typeof prepareExport>>
+) {
+  const job = await ownedJob(tx, userId, input.documentId, input.jobId);
+  const current = await storedReview(tx, input.jobId);
+  if (
+    job.attemptNumber !== prepared.attemptNumber ||
+    current?.revisionToken !== input.revisionToken
+  )
+    throw new PowerPointReviewError(
+      "A newer conversion or review was saved while this check ran. Reopen the review to use that version."
+    );
+  const [lease] = await tx
+    .select({ id: jobEvents.id, eventType: jobEvents.eventType })
+    .from(jobEvents)
+    .where(
+      and(
+        eq(jobEvents.jobId, input.jobId),
+        inArray(jobEvents.eventType, [
+          "powerpoint_review_started",
+          "powerpoint_review_finished",
+        ])
+      )
+    )
+    .orderBy(desc(jobEvents.createdAt), desc(jobEvents.id))
+    .limit(1);
+  if (
+    lease?.id !== prepared.exportId ||
+    lease.eventType !== "powerpoint_review_started"
+  )
+    throw new PowerPointReviewError(
+      "This review request is no longer current. Reopen the review before downloading."
+    );
+}
+
 export async function exportOwnedPowerPointReview(
   userId: string,
   input: PowerPointReviewSelection
@@ -359,6 +400,7 @@ export async function exportOwnedPowerPointReview(
   if (!isPowerPointReviewSelection(input))
     throw new PowerPointReviewError("The review choices were not valid.", 400);
   const prepared = await prepareExport(userId, input);
+  let outcomeUncertain = false;
   try {
     // CPU work, native rendering and model calls deliberately run outside the row lock.
     const selected = await replayPptxRevisions(
@@ -407,41 +449,71 @@ export async function exportOwnedPowerPointReview(
       throw new PowerPointReviewError(
         "The review could not be saved because it is too large."
       );
-    return await withRetainedDocument(
-      input.documentId,
-      async (tx, document) => {
-        const job = await ownedJob(tx, userId, input.documentId, input.jobId);
-        const current = await storedReview(tx, input.jobId);
-        if (
-          job.attemptNumber !== prepared.attemptNumber ||
-          current?.revisionToken !== input.revisionToken
-        )
-          throw new PowerPointReviewError(
-            "A newer conversion or review was saved while this check ran. Reopen the review to use that version."
-          );
-        const [lease] = await tx
-          .select({ id: jobEvents.id, eventType: jobEvents.eventType })
-          .from(jobEvents)
+    const revisionToken = token(Buffer.from(reviewBody));
+    const pair = [
+      {
+        id: prepared.outputId,
+        type: "pptx_output" as const,
+        key: prepared.outputKey,
+        body: checked.pptx,
+        mime: PPTX_MIME_TYPE,
+        checksum: token(checked.pptx),
+        size: checked.pptx.length,
+        filename: outputFilename(prepared.filename, "accessible_pptx"),
+        downloadable: true,
+      },
+      {
+        id: prepared.reviewId,
+        type: "review_metadata" as const,
+        key: prepared.reviewKey,
+        body: reviewBody,
+        mime: "application/json",
+        checksum: revisionToken,
+        size: Buffer.byteLength(reviewBody),
+        filename: "review.json",
+        downloadable: false,
+      },
+    ];
+    // Commit exact expected bytes before upload. An ambiguous acknowledgement
+    // stops here: no storage write starts until this transaction returns.
+    await withRetainedDocument(input.documentId, async (tx) => {
+      await assertExportCurrent(tx, userId, input, prepared);
+      for (const item of pair) {
+        const rows = await tx
+          .update(artifacts)
+          .set({
+            checksumSha256: item.checksum,
+            fileSizeBytes: item.size,
+          })
           .where(
             and(
-              eq(jobEvents.jobId, input.jobId),
-              inArray(jobEvents.eventType, [
-                "powerpoint_review_started",
-                "powerpoint_review_finished",
-              ])
+              eq(artifacts.id, item.id),
+              eq(artifacts.jobId, input.jobId),
+              eq(artifacts.artifactType, item.type),
+              eq(artifacts.storageKey, item.key),
+              eq(artifacts.artifactStatus, "expired"),
+              eq(artifacts.isUserDownloadable, false)
             )
           )
-          .orderBy(desc(jobEvents.createdAt), desc(jobEvents.id))
-          .limit(1);
-        if (
-          lease?.id !== prepared.exportId ||
-          lease.eventType !== "powerpoint_review_started"
-        )
+          .returning({ id: artifacts.id });
+        if (rows.length !== 1)
           throw new PowerPointReviewError(
-            "This review request is no longer current. Reopen the review before downloading."
+            "This export's cleanup receipt is unavailable. Reopen the review."
           );
-        await uploadObject(prepared.outputKey, checked.pptx, PPTX_MIME_TYPE);
-        await uploadObject(prepared.reviewKey, reviewBody, "application/json");
+      }
+    });
+
+    let publicationError: unknown;
+    let publicationFailed = false;
+    try {
+      await withRetainedDocument(input.documentId, async (tx) => {
+        await assertExportCurrent(tx, userId, input, prepared);
+        const signal = AbortSignal.timeout(30_000);
+        for (const item of pair)
+          await uploadObject(item.key, item.body, item.mime, {
+            signal,
+            upsert: false,
+          });
         await tx
           .update(artifacts)
           .set({ artifactStatus: "expired" })
@@ -455,20 +527,32 @@ export async function exportOwnedPowerPointReview(
               eq(artifacts.artifactStatus, "available")
             )
           );
-        await tx
-          .update(artifacts)
-          .set({
-            artifactStatus: "available",
-            fileSizeBytes: checked.pptx.length,
-          })
-          .where(eq(artifacts.id, prepared.outputId));
-        await tx
-          .update(artifacts)
-          .set({
-            artifactStatus: "available",
-            fileSizeBytes: Buffer.byteLength(reviewBody),
-          })
-          .where(eq(artifacts.id, prepared.reviewId));
+        for (const item of pair) {
+          const rows = await tx
+            .update(artifacts)
+            .set({
+              artifactStatus: "available",
+              filename: item.filename,
+              isUserDownloadable: item.downloadable,
+            })
+            .where(
+              and(
+                eq(artifacts.id, item.id),
+                eq(artifacts.jobId, input.jobId),
+                eq(artifacts.artifactType, item.type),
+                eq(artifacts.storageKey, item.key),
+                eq(artifacts.checksumSha256, item.checksum),
+                eq(artifacts.fileSizeBytes, item.size),
+                eq(artifacts.artifactStatus, "expired"),
+                eq(artifacts.isUserDownloadable, false)
+              )
+            )
+            .returning({ id: artifacts.id });
+          if (rows.length !== 1)
+            throw new PowerPointReviewError(
+              "This export's cleanup receipt is unavailable. Reopen the review."
+            );
+        }
         await tx
           .delete(validationFindings)
           .where(eq(validationFindings.jobId, input.jobId));
@@ -496,29 +580,128 @@ export async function exportOwnedPowerPointReview(
               includedChangeIds: input.includedChangeIds,
               reviewedChangeIds: input.reviewedChangeIds,
               findingCount: checked.errors.length,
+              savedOutputArtifactId: prepared.outputId,
+              reviewArtifactId: prepared.reviewId,
+              revisionToken,
             },
           })
           .where(eq(jobEvents.id, prepared.exportId));
-        const filename = outputFilename(job.filename, "accessible_pptx");
-        const expiresAt = Date.parse(retentionExpiresAt(document.createdAt));
-        const ttl = Math.min(
-          60,
-          Math.floor((expiresAt - Date.now()) / 1000) - 1
-        );
-        if (ttl < 1) throw new DocumentUnavailableError();
-        const url = await createSignedUrl(prepared.outputKey, ttl, filename);
-        if (Date.now() + ttl * 1000 > expiresAt)
-          throw new DocumentUnavailableError();
-        return {
-          url,
-          filename,
-          findings: checked.errors,
-          changes: checked.changes,
-          revisionToken: token(Buffer.from(reviewBody)),
-        };
-      }
+      });
+    } catch (error) {
+      publicationFailed = true;
+      publicationError = error;
+    }
+
+    // A committed pair may outlive a lost acknowledgement. Re-read exact
+    // available identities, hashes and the finished lease before signing. This
+    // also prevents a later conversion/export from supplying different bytes.
+    let result: PowerPointReviewExport | null;
+    try {
+      result = await withRetainedDocument(
+        input.documentId,
+        async (tx, document) => {
+          const job = await ownedJob(tx, userId, input.documentId, input.jobId);
+          if (job.attemptNumber !== prepared.attemptNumber) return null;
+          const rows = await tx
+            .select()
+            .from(artifacts)
+            .where(
+              and(
+                eq(artifacts.jobId, input.jobId),
+                inArray(artifacts.artifactType, [
+                  "pptx_output",
+                  "review_metadata",
+                ]),
+                eq(artifacts.artifactStatus, "available")
+              )
+            );
+          if (
+            rows.length !== pair.length ||
+            !pair.every((item) =>
+              rows.some(
+                (row) =>
+                  row.id === item.id &&
+                  row.artifactType === item.type &&
+                  row.storageKey === item.key &&
+                  row.checksumSha256 === item.checksum &&
+                  row.fileSizeBytes === item.size &&
+                  row.isUserDownloadable === item.downloadable
+              )
+            )
+          )
+            return null;
+          const [event] = await tx
+            .select({
+              eventType: jobEvents.eventType,
+              metadata: jobEvents.metadata,
+            })
+            .from(jobEvents)
+            .where(
+              and(
+                eq(jobEvents.id, prepared.exportId),
+                eq(jobEvents.jobId, input.jobId)
+              )
+            );
+          const metadata =
+            event?.metadata &&
+            typeof event.metadata === "object" &&
+            !Array.isArray(event.metadata)
+              ? (event.metadata as Record<string, unknown>)
+              : null;
+          if (
+            event?.eventType !== "powerpoint_review_finished" ||
+            metadata?.savedOutputArtifactId !== prepared.outputId ||
+            metadata?.reviewArtifactId !== prepared.reviewId ||
+            metadata?.revisionToken !== revisionToken
+          )
+            return null;
+          const filename = pair[0].filename;
+          const expiresAt = Date.parse(retentionExpiresAt(document.createdAt));
+          const ttl = Math.min(
+            60,
+            Math.floor((expiresAt - Date.now()) / 1000) - 1
+          );
+          if (ttl < 1) throw new DocumentUnavailableError();
+          let url: string;
+          try {
+            url = await createSignedUrl(prepared.outputKey, ttl, filename);
+          } catch {
+            throw new PowerPointReviewError(
+              "The selected presentation is saved, but its download could not be prepared. Reopen the review to download it.",
+              503
+            );
+          }
+          if (Date.now() + ttl * 1000 > expiresAt)
+            throw new DocumentUnavailableError();
+          return {
+            savedOutputArtifactId: prepared.outputId,
+            url,
+            filename,
+            findings: checked.errors,
+            changes: checked.changes,
+            revisionToken,
+          };
+        }
+      );
+    } catch (error) {
+      if (
+        error instanceof DocumentUnavailableError ||
+        error instanceof PowerPointReviewError
+      )
+        throw error;
+      outcomeUncertain = true;
+      throw new PowerPointReviewError(
+        "The selected export's saved status could not be confirmed. Refresh the page before trying again.",
+        503
+      );
+    }
+    if (result) return result;
+    if (publicationFailed) throw publicationError;
+    throw new PowerPointReviewError(
+      "A newer saved result replaced this selection. Reopen the review before downloading."
     );
   } catch (error) {
+    if (outcomeUncertain) throw error;
     try {
       await withRetainedDocument(input.documentId, async (tx) => {
         await tx
@@ -526,7 +709,7 @@ export async function exportOwnedPowerPointReview(
           .set({
             eventType: "powerpoint_review_finished",
             message:
-              "The selected presentation was not saved. The previous output is unchanged.",
+              "The selected export did not become the current saved result. Reopen the review before trying again.",
           })
           .where(
             and(

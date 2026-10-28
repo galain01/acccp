@@ -71,7 +71,9 @@ class HttpBoundaryTests(unittest.TestCase):
         with patch.object(server, "execute", return_value=(200, {"ok": True})) as execute:
             status, body, _ = self.request("/prepare", b"%PDF-1.7 synthetic")
             self.assertEqual((200, {"ok": True}), (status, body))
-            execute.assert_called_once_with("prepare", b"%PDF-1.7 synthetic", self.server.toolchain)
+            self.assertEqual(("prepare", b"%PDF-1.7 synthetic", self.server.toolchain), execute.call_args.args)
+            self.assertGreater(execute.call_args.kwargs["timeout"], 0)
+            self.assertLessEqual(execute.call_args.kwargs["timeout"], server.DEADLINE)
 
     def test_stored_repair_only_passes_verified_payload_to_pdf_child_with_remaining_deadline(self):
         reference, payload = b'{"signedReference":"synthetic"}', b'{"source":"synthetic verified request"}'

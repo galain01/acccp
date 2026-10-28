@@ -3,6 +3,10 @@ import {
   maxFileSizeForFilename,
   PPTX_MIME_TYPE,
 } from "./document-input";
+import {
+  sourceChecksum,
+  type PreparedDocumentSubmission,
+} from "./document-submission-client";
 
 export class DocumentUploadError extends Error {
   constructor(
@@ -19,11 +23,13 @@ export async function uploadPowerPointDocument({
   sessionId,
   signal,
   onReserved,
+  prepared,
 }: {
   file: File;
   sessionId: string;
   signal: AbortSignal;
   onReserved: (documentId: string) => void;
+  prepared?: PreparedDocumentSubmission;
 }): Promise<string> {
   signal.throwIfAborted();
   if (
@@ -35,12 +41,8 @@ export async function uploadPowerPointDocument({
       "Upload a PowerPoint (.pptx) file up to 25 MB."
     );
   }
-  const bytes = await file.arrayBuffer();
-  signal.throwIfAborted();
-  const checksum = await crypto.subtle.digest("SHA-256", bytes);
-  const checksumSha256 = Array.from(new Uint8Array(checksum), (value) =>
-    value.toString(16).padStart(2, "0")
-  ).join("");
+  const checksumSha256 =
+    prepared?.checksumSha256 ?? (await sourceChecksum(file));
   signal.throwIfAborted();
   // Let a reservation response finish even after cancellation so its known ID
   // can be deleted. The larger storage transfer remains abortable.
@@ -52,11 +54,12 @@ export async function uploadPowerPointDocument({
       filename: file.name,
       fileSizeBytes: file.size,
       checksumSha256,
+      ...(prepared ? { submissionToken: prepared.submissionToken } : {}),
     }),
   });
   if (response.status === 429)
     throw new DocumentUploadError(
-      "Too many unfinished PowerPoint uploads. Finish an existing upload, or wait up to three hours for abandoned uploads to clear."
+      "Too many unfinished PowerPoint uploads. Finish an existing upload, or wait for unfinished upload windows to expire."
     );
   if (!response.ok)
     throw new DocumentUploadError(
@@ -73,8 +76,12 @@ export async function uploadPowerPointDocument({
   ) {
     throw new DocumentUploadError();
   }
+  if (prepared && data.documentId !== prepared.documentId)
+    throw new DocumentUploadError();
   onReserved(data.documentId);
   signal.throwIfAborted();
+  if (prepared && "sourceReady" in data && data.sourceReady === true)
+    return data.documentId;
   if (!("uploadUrl" in data) || typeof data.uploadUrl !== "string")
     throw new DocumentUploadError();
   let url: URL;

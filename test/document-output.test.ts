@@ -7,7 +7,7 @@ const mocks = vi.hoisted(() => ({
   sign: vi.fn(),
   download: vi.fn(),
   retained: vi.fn(),
-  db: { select: vi.fn() },
+  db: { select: vi.fn(), transaction: vi.fn() },
 }));
 vi.mock("@/lib/auth", () => ({ verifyRoleOrRedirect: mocks.auth }));
 vi.mock("@/lib/db", () => ({ db: mocks.db }));
@@ -69,6 +69,7 @@ beforeEach(() => {
   );
   mocks.download.mockResolvedValue(Buffer.from("<h2>Original HTML</h2>"));
   mocks.db.select.mockReset().mockReturnValue(chain([]));
+  mocks.db.transaction.mockImplementation((action) => action(mocks.db));
   mocks.retained
     .mockReset()
     .mockImplementation((_documentId, action) =>
@@ -78,6 +79,62 @@ beforeEach(() => {
 afterEach(() => vi.useRealTimers());
 
 describe("owned output downloads", () => {
+  it.each([
+    null,
+    [],
+    ["11111111-1111-4111-8111-111111111111"],
+    { id: "11111111-1111-4111-8111-111111111111" },
+    42,
+    "not-a-uuid",
+  ])(
+    "rejects an invalid expected artifact identity before a database read (%#)",
+    async (identity) => {
+      expect(
+        await getDocumentHtml("doc-1", identity as unknown as string)
+      ).toBeNull();
+      expect(
+        await getDocumentOutputDownload(
+          "doc-1",
+          "accessible_pdf",
+          identity as unknown as string
+        )
+      ).toBeNull();
+      expect(mocks.db.select).not.toHaveBeenCalled();
+      expect(mocks.download).not.toHaveBeenCalled();
+      expect(mocks.sign).not.toHaveBeenCalled();
+    }
+  );
+
+  it("binds native downloads to the exact artifact shown in the saved review", async () => {
+    const artifactId = "11111111-1111-4111-8111-111111111111";
+    const builder = chain([
+      { storageKey: "old-immutable-output", filename: "Lecture.pdf" },
+    ]);
+    mocks.db.select.mockReturnValueOnce(builder);
+    await getDocumentOutputDownload("doc-1", "accessible_pdf", artifactId);
+    const compiled = query(builder.where.mock.calls[0][0]);
+    expect(compiled.sql).toContain('"artifacts"."id"');
+    expect(compiled.params).toContain(artifactId);
+    expect(compiled.params).toContain("available");
+    expect(mocks.sign).toHaveBeenCalledWith(
+      "old-immutable-output",
+      60,
+      "Lecture-repaired.pdf"
+    );
+  });
+
+  it("binds HTML retrieval to the listed artifact and withholds a replaced pointer", async () => {
+    const artifactId = "11111111-1111-4111-8111-111111111111";
+    const builder = chain([]);
+    mocks.db.select.mockReturnValueOnce(builder);
+    expect(await getDocumentHtml("doc-1", artifactId)).toBeNull();
+    const compiled = query(builder.where.mock.calls[0][0]);
+    expect(compiled.sql).toContain('"artifacts"."id"');
+    expect(compiled.params).toContain(artifactId);
+    expect(compiled.params).toContain("available");
+    expect(mocks.download).not.toHaveBeenCalled();
+  });
+
   it("signs the owned repaired PDF rather than its immutable source or HTML", async () => {
     const builder = chain([
       { storageKey: "session/doc/job/output.pdf", filename: "Lecture.PDF" },
@@ -327,6 +384,61 @@ describe("owned output downloads", () => {
 });
 
 describe("saved destination and change summaries", () => {
+  it.each([
+    ["canvas_html", "html_output"],
+    ["accessible_docx", "docx_output"],
+    ["accessible_pptx", "pptx_output"],
+    ["accessible_pdf", "pdf_output"],
+  ])(
+    "lists an available %s result without changing the failed attempt status",
+    async (outputTarget, artifactType) => {
+      const builder = chain([
+        {
+          id: "saved-doc",
+          name: "Course.pdf",
+          size: 42,
+          uploadedAt: createdAt,
+          jobId: "saved-job",
+          status: "failed",
+          errorMessage: "Retry failed.",
+          outputTarget,
+          changes: ["Earlier saved change."],
+          savedOutputArtifactId: "11111111-1111-4111-8111-111111111111",
+        },
+      ]);
+      mocks.db.select.mockReturnValueOnce(builder);
+      const [row] = await listDocuments("session-1");
+      expect(row).toMatchObject({
+        status: "error",
+        errorMessage: "Retry failed.",
+        hasAvailableOutput: true,
+        savedOutputArtifactId: "11111111-1111-4111-8111-111111111111",
+        documentId: "saved-doc",
+        jobId: "saved-job",
+        changes: ["Earlier saved change."],
+      });
+      const marker = query(
+        mocks.db.select.mock.calls[0][0].savedOutputArtifactId
+      );
+      expect(marker.sql).toContain('select "artifacts"."id"');
+      expect(marker.sql).toContain(
+        '"artifacts"."job_id" = "conversion_jobs"."id"'
+      );
+      expect(marker.params).toEqual(
+        expect.arrayContaining(["available", outputTarget, artifactType])
+      );
+      expect(marker.params).not.toContain("source_pdf");
+      const scope = query(builder.where.mock.calls[0][0]);
+      expect(scope.params).toContain("owner-1");
+      expect(scope.sql).toContain("clock_timestamp()");
+      expect(mocks.download).not.toHaveBeenCalled();
+      expect(mocks.db.transaction).toHaveBeenCalledWith(expect.any(Function), {
+        isolationLevel: "repeatable read",
+        accessMode: "read only",
+      });
+    }
+  );
+
   it("keeps an uploaded PPTX retryable when creating its first job failed", async () => {
     mocks.db.select.mockReturnValueOnce(
       chain([

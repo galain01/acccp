@@ -106,7 +106,7 @@ class SupervisorDiagnosticsTests(unittest.TestCase):
                 return self.returncode
 
         captured = io.StringIO()
-        with patch.object(server.subprocess, "Popen", return_value=Process()), contextlib.redirect_stderr(captured):
+        with patch.object(server.subprocess, "Popen", return_value=Process()), patch.object(server, "kill_tree"), contextlib.redirect_stderr(captured):
             response = server.execute("repair", SENTINEL.encode(), self.folder / "tools.json")
         self.assertEqual(FAILURE, response)
         self.assert_diagnostic(captured.getvalue(), "nonzero_exit", mode="repair", exit_code=-9)

@@ -97,6 +97,11 @@ const call = {
 };
 let selections: unknown[][];
 let inserts: { table: unknown; values: unknown }[];
+let updates: {
+  table: unknown;
+  values: Record<string, unknown>;
+  condition?: SQL;
+}[];
 let createdAt: string;
 function chain(rows: unknown[] = []) {
   const value = {
@@ -107,6 +112,7 @@ function chain(rows: unknown[] = []) {
     limit: vi.fn(),
     set: vi.fn(),
     values: vi.fn(),
+    returning: vi.fn(),
     then: Promise.resolve(rows).then.bind(Promise.resolve(rows)),
   };
   for (const method of [
@@ -117,6 +123,7 @@ function chain(rows: unknown[] = []) {
     value.limit,
     value.set,
     value.values,
+    value.returning,
   ])
     method.mockReturnValue(value);
   return value;
@@ -125,6 +132,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   selections = [];
   inserts = [];
+  updates = [];
   mock.events = [];
   mock.locked = false;
   createdAt = new Date().toISOString();
@@ -146,7 +154,20 @@ beforeEach(() => {
     });
     return result;
   });
-  mock.tx.update.mockImplementation(() => chain());
+  mock.tx.update.mockImplementation((table) => {
+    const result = chain([{ id: "matched-receipt" }]);
+    const update = { table, values: {} } as (typeof updates)[number];
+    result.set.mockImplementation((values) => {
+      update.values = values;
+      updates.push(update);
+      return result;
+    });
+    result.where.mockImplementation((condition) => {
+      update.condition = condition;
+      return result;
+    });
+    return result;
+  });
   mock.tx.delete.mockImplementation(() => chain());
   mock.download.mockImplementation(async (key: string) => {
     expect(mock.locked).toBe(true);
@@ -176,6 +197,42 @@ beforeEach(() => {
     };
   });
 });
+
+function exportPublicationQueries() {
+  selections = [[owned], [{ storageKey: "saved.json" }], []];
+  mock.tx.select.mockImplementation((fields) => {
+    if (selections.length) return chain(selections.shift());
+    const event = inserts.find((item) => item.table === jobEvents)?.values as {
+      id: string;
+    };
+    if (fields?.sessionId) return chain([owned]);
+    if (fields?.storageKey) return chain([{ storageKey: "saved.json" }]);
+    if (fields?.metadata) {
+      const finished = updates.findLast(
+        (item) =>
+          item.table === jobEvents &&
+          item.values.eventType === "powerpoint_review_finished"
+      );
+      return chain(finished ? [finished.values] : []);
+    }
+    if (fields?.eventType)
+      return chain([{ id: event.id, eventType: "powerpoint_review_started" }]);
+    const reserved = inserts.find((item) => item.table === artifacts)
+      ?.values as Record<string, unknown>[];
+    return chain(
+      reserved.map((row) =>
+        updates
+          .filter(
+            (item) =>
+              item.table === artifacts &&
+              item.condition &&
+              new PgDialect().sqlToQuery(item.condition).params.includes(row.id)
+          )
+          .reduce((value, item) => ({ ...value, ...item.values }), row)
+      )
+    );
+  });
+}
 
 describe("PowerPoint review ownership and retained storage", () => {
   it("loads an added description slide without inventing an original image", async () => {
@@ -471,19 +528,7 @@ describe("PowerPoint review ownership and retained storage", () => {
     expect(mock.sign).not.toHaveBeenCalled();
   });
   it("saves the checked selection with private reserved paths and signs only that output", async () => {
-    selections = [
-      [owned],
-      [{ storageKey: "saved.json" }],
-      [],
-      [owned],
-      [{ storageKey: "saved.json" }],
-    ];
-    mock.tx.select.mockImplementation(() => {
-      if (selections.length) return chain(selections.shift());
-      const event = inserts.find((item) => item.table === jobEvents)
-        ?.values as { id: string };
-      return chain([{ id: event.id, eventType: "powerpoint_review_started" }]);
-    });
+    exportPublicationQueries();
     const result = await exportOwnedPowerPointReview("owner", request());
     expect(result).toEqual({
       url: "https://storage.test/selected",
@@ -491,6 +536,7 @@ describe("PowerPoint review ownership and retained storage", () => {
       findings: [],
       changes: ["Chosen description"],
       revisionToken: expect.stringMatching(/^[a-f0-9]{64}$/),
+      savedOutputArtifactId: expect.stringMatching(/^[a-f0-9-]{36}$/),
     });
     expect(mock.upload).toHaveBeenCalledTimes(2);
     const [key, pptx] = mock.upload.mock.calls[0];
@@ -505,25 +551,16 @@ describe("PowerPoint review ownership and retained storage", () => {
     expect(inserts.filter((item) => item.table === modelCalls)).toHaveLength(1);
   });
   it("keeps the old artifact pointers if upload fails, with purge discovery already committed", async () => {
-    selections = [
-      [owned],
-      [{ storageKey: "saved.json" }],
-      [],
-      [owned],
-      [{ storageKey: "saved.json" }],
-    ];
-    mock.tx.select.mockImplementation(() => {
-      if (selections.length) return chain(selections.shift());
-      const event = inserts.find((item) => item.table === jobEvents)
-        ?.values as { id: string };
-      return chain([{ id: event.id, eventType: "powerpoint_review_started" }]);
-    });
+    exportPublicationQueries();
     mock.upload.mockRejectedValueOnce(new Error("Storage unavailable"));
     await expect(
       exportOwnedPowerPointReview("owner", request())
     ).rejects.toThrow("Storage unavailable");
     expect(
-      mock.tx.update.mock.calls.some(([table]) => table === artifacts)
+      updates.some(
+        (item) =>
+          item.table === artifacts && item.values.artifactStatus !== undefined
+      )
     ).toBe(false);
     expect(inserts.filter((item) => item.table === artifacts)).toHaveLength(1);
     expect(inserts.filter((item) => item.table === modelCalls)).toHaveLength(1);

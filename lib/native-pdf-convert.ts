@@ -58,13 +58,14 @@ interface Batch {
   visualPages: number[];
   first: boolean;
 }
-export interface NativePdfHeadingReviewTarget {
+export interface NativePdfRepairReviewTarget {
   findingId: string;
   finding: NativePdfFinding;
   tagId: string;
   beforeRole: string;
   currentRole: string;
   eligibleForResolution: boolean;
+  tableTagId?: string;
 }
 interface NativePdfArtifactReview {
   pageNumber: number;
@@ -334,7 +335,8 @@ export function parseNativePdfFindings(
         : batch.tags.find((t) => t.id === f.tagId);
     if (
       (f.tagId !== undefined && !tag) ||
-      (f.code === "heading-structure" && !tag) ||
+      (["heading-structure", "table-header-relationships"].includes(f.code) &&
+        !tag) ||
       (tag &&
         pagesOf(tag).length &&
         !pagesOf(tag).includes(Number(f.pageNumber)))
@@ -447,14 +449,71 @@ export function parseNativePdfPlan(
     if (
       op.type === "repair_structure" &&
       Object.keys(op).every((key) =>
-        ["type", "tagId", "candidateId", "role", "alt"].includes(key)
+        [
+          "type",
+          "tagId",
+          "candidateId",
+          "role",
+          "alt",
+          "selections",
+          "anchorRole",
+        ].includes(key)
       )
     ) {
       const candidate = state.inventory.structureCandidates?.find(
         (c) => c.tagId === tag.id && c.candidateId === op.candidateId
       );
       if (!candidate) return invalid();
-      if (candidate.kind === "describe_chart") {
+      if (candidate.kind === "restore_artifact_text") {
+        if (
+          op.role !== undefined ||
+          op.alt !== undefined ||
+          !Array.isArray(op.selections) ||
+          !op.selections.length ||
+          op.selections.length > 100
+        )
+          return invalid();
+        if (
+          op.anchorRole !== undefined &&
+          (op.anchorRole !== "P" || !tag.editable.role)
+        )
+          return invalid();
+        const seenScopes = new Set<string>();
+        const selections = op.selections.map((selection) => {
+          if (
+            !objectRecord(selection) ||
+            Object.keys(selection).some(
+              (key) => !["scopeId", "role"].includes(key)
+            ) ||
+            typeof selection.scopeId !== "string" ||
+            seenScopes.has(selection.scopeId) ||
+            !candidate.textScopes?.some(
+              (scope) => scope.scopeId === selection.scopeId
+            ) ||
+            !["P", "H2", "H3", "H4", "H5", "H6"].includes(
+              String(selection.role)
+            )
+          )
+            return invalid();
+          seenScopes.add(selection.scopeId);
+          return {
+            scopeId: selection.scopeId,
+            role: selection.role as "P" | "H2" | "H3" | "H4" | "H5" | "H6",
+          };
+        });
+        return {
+          ...common,
+          type: "repair_structure",
+          candidateId: candidate.candidateId,
+          selections,
+          ...(op.anchorRole === "P" ? { anchorRole: "P" as const } : {}),
+        };
+      }
+      if (op.selections !== undefined || op.anchorRole !== undefined)
+        return invalid();
+      if (
+        ["describe_chart", "restore_excluded_figure"].includes(candidate.kind)
+      ) {
         if (op.role !== undefined || !text(op.alt, 8000)) return invalid();
         return {
           ...common,
@@ -540,6 +599,11 @@ export function coalesceNativePdfOperations(
           candidate.tagId === operation.tagId &&
           [
             "rebuild_table",
+            "rebuild_grid_table",
+            "repair_table_headers",
+            "restore_excluded_figure",
+            "join_interrupted_text",
+            "restore_decimal_paragraphs",
             "move_callout",
             "move_page_continuation",
             "describe_chart",
@@ -753,10 +817,10 @@ function reconcileNativePdfArtifactReminders(
   });
   return { findings, evidence };
 }
-/** Only an explicit current-state review can retire a targeted heading concern. */
-export function parseNativePdfHeadingReviews(
+/** Only an explicit current-state review can retire a verified targeted repair. */
+export function parseNativePdfRepairFindingReviews(
   raw: unknown,
-  targets: NativePdfHeadingReviewTarget[]
+  targets: NativePdfRepairReviewTarget[]
 ): string[] {
   if (raw === undefined) return [];
   if (!Array.isArray(raw) || raw.length > targets.length) return invalid();
@@ -873,6 +937,140 @@ function visuals(pages: RenderedPdfPage[]): LiteLLMContentPart[] {
     },
   ]);
 }
+/** Native ownership is verified by the worker; avoid repeating its raw indexes.
+ * Full assigned tags retain their exact MCIDs and ordered content. Keep every
+ * other page check, excluded passage and incompleteness signal unchanged.
+ */
+function scopedPageChecks(
+  page: Record<string, unknown> | undefined,
+  tags: NativePdfTag[]
+): Record<string, unknown> | undefined {
+  if (!page) return page;
+  const {
+    mcids,
+    ownership_required_mcids: required,
+    occurrence_ids_by_mcid: occurrences,
+    ...checks
+  } = page;
+  if (
+    !Array.isArray(mcids) ||
+    !Array.isArray(required) ||
+    !objectRecord(occurrences) ||
+    !Object.values(occurrences).every(Array.isArray)
+  )
+    return page;
+  const assigned = new Set(
+    tags.flatMap((tag) =>
+      tag.content.flatMap((content) =>
+        content.pageNumber === page.pageNumber &&
+        content.streamId === undefined &&
+        typeof content.mcid === "number"
+          ? [content.mcid]
+          : []
+      )
+    )
+  );
+  return {
+    ...checks,
+    nativeContent: {
+      markedScopeCount: mcids.length,
+      ownershipRequiredScopeCount: required.length,
+      textOccurrenceCount: Object.values(occurrences).reduce<number>(
+        (count, ids) => count + (ids as unknown[]).length,
+        0
+      ),
+      assignedMarkedScopes: mcids.filter((mcid) => assigned.has(mcid)),
+      assignedOwnershipRequiredScopes: required.filter((mcid) =>
+        assigned.has(mcid)
+      ),
+      assignedTextOccurrenceCounts: Object.fromEntries(
+        Object.entries(occurrences)
+          .filter(([mcid]) => assigned.has(Number(mcid)))
+          .map(([mcid, ids]) => [mcid, (ids as unknown[]).length])
+      ),
+    },
+  };
+}
+function modelTag(tag: NativePdfTag): Record<string, unknown> {
+  const evidence: Record<string, unknown> = { ...tag };
+  // Writer preconditions stay in immutable state and are attached only after
+  // the model's operation has passed validation. They repeat current facts.
+  delete evidence.snapshot;
+  const marked = Array.isArray(tag.contentSequence)
+    ? tag.contentSequence.filter(
+        (entry): entry is Record<string, unknown> =>
+          objectRecord(entry) && entry.kind === "markedContent"
+      )
+    : undefined;
+  if (
+    marked &&
+    marked.length === tag.content.length &&
+    tag.content.every((content, index) =>
+      Object.entries(content).every(
+        ([key, value]) => marked[index][key] === value
+      )
+    )
+  )
+    delete evidence.content;
+  return evidence;
+}
+/** Follow verified header links to their actual text, including across tag batches. */
+function tableHeaderContext(
+  state: NativePdfState,
+  assigned: NativePdfTag[]
+): Set<string> {
+  const tags = new Map(state.inventory.tags.map((tag) => [tag.id, tag]));
+  const related = new Set<string>(),
+    visited = new Set<string>();
+  const seeds = new Set(assigned);
+  for (const tag of assigned) {
+    const ancestors = new Set<string>();
+    let parent = tag.parentId ? tags.get(tag.parentId) : undefined;
+    while (parent && ancestors.size < 64 && !ancestors.has(parent.id)) {
+      ancestors.add(parent.id);
+      if (["TD", "TH"].includes(parent.role)) {
+        seeds.add(parent);
+        related.add(parent.id);
+        break;
+      }
+      if (parent.role === "Table") break;
+      parent = parent.parentId ? tags.get(parent.parentId) : undefined;
+    }
+  }
+  const pending: NativePdfTag[] = [];
+  const links = (tag: NativePdfTag) => {
+    for (const attribute of Array.isArray(tag.attributes)
+      ? tag.attributes
+      : []) {
+      if (
+        !objectRecord(attribute) ||
+        attribute.owner !== "Table" ||
+        !attribute.headersEffective ||
+        !attribute.headersResolved ||
+        !attribute.headersAcyclic ||
+        !Array.isArray(attribute.headerTagIds)
+      )
+        continue;
+      for (const id of attribute.headerTagIds) {
+        const header = tags.get(String(id));
+        if (header) pending.push(header);
+      }
+    }
+  };
+  seeds.forEach(links);
+  while (pending.length) {
+    const tag = pending.pop()!;
+    if (visited.has(tag.id)) continue;
+    visited.add(tag.id);
+    related.add(tag.id);
+    links(tag);
+    for (const id of tag.children) {
+      const child = tags.get(id);
+      if (child) pending.push(child);
+    }
+  }
+  return related;
+}
 function scope(
   state: NativePdfState,
   batch: Batch,
@@ -880,7 +1078,7 @@ function scope(
   evidenceRole:
     | "current-saved-pdf"
     | "before-repair-comparison" = "current-saved-pdf",
-  headingReviewTargets: NativePdfHeadingReviewTarget[] = [],
+  repairReviewTargets: NativePdfRepairReviewTarget[] = [],
   interactionTests?: MatchedNativePdfInteractionTests
 ): string {
   const structureCandidates = (state.inventory.structureCandidates ?? [])
@@ -891,9 +1089,11 @@ function scope(
         ? { headingContext: nearbyHeadingContext(state, candidate.tagId) }
         : {}),
     }));
-  const relatedTagIds = new Set(
-    structureCandidates.flatMap((candidate) => candidate.relatedTagIds)
-  );
+  const relatedTagIds = new Set([
+    ...structureCandidates.flatMap((candidate) => candidate.relatedTagIds),
+    ...tableHeaderContext(state, batch.tags),
+  ]);
+  const assignedTagIds = new Set(batch.tags.map((tag) => tag.id));
   const payload = {
     evidenceRole,
     assignedPages: batch.pages,
@@ -904,22 +1104,23 @@ function scope(
     candidateSha256: state.candidateSha256,
     language: state.inventory.language,
     title: state.inventory.title,
-    tags: batch.tags,
+    tags: batch.tags.map(modelTag),
     structureCandidates,
-    relatedTagContext: state.inventory.tags.filter((tag) =>
-      relatedTagIds.has(tag.id)
-    ),
+    relatedTagContext: state.inventory.tags
+      .filter((tag) => relatedTagIds.has(tag.id) && !assignedTagIds.has(tag.id))
+      .map(modelTag),
     headingOutline: headingOutline(state),
     // Every hierarchy link remains available; only assigned tags may change.
-    hierarchy: state.inventory.tags.map((t) => ({
-      id: t.id,
-      parentId: t.parentId,
-      role: t.role,
-      pageNumber: t.pageNumber,
-      ...(/^H[1-6]?$/.test(t.role) ? { text: t.text } : {}),
-    })),
-    excludedTextAndPageChecks: batch.pages.map(
-      (n) => state.inventory.page_content[n - 1]
+    hierarchyColumns: ["id", "parentId", "role", "pageNumber", "headingText"],
+    hierarchy: state.inventory.tags.map((t) => [
+      t.id,
+      t.parentId,
+      t.role,
+      t.pageNumber,
+      /^H[1-6]?$/.test(t.role) ? t.text : null,
+    ]),
+    excludedTextAndPageChecks: batch.pages.map((n) =>
+      scopedPageChecks(state.inventory.page_content[n - 1], batch.tags)
     ),
     nestedFormContent: state.inventory.form_content,
     forms: state.inventory.forms,
@@ -940,7 +1141,7 @@ function scope(
           outstandingRepairFindings: outstandingRepairFindings.filter(
             (f) => !f.pageNumber || batch.visualPages.includes(f.pageNumber)
           ),
-          repairFindingReviewTargets: headingReviewTargets,
+          repairFindingReviewTargets: repairReviewTargets,
         }
       : {}),
   };
@@ -1103,7 +1304,9 @@ export async function repairNativePdf(
       };
     });
     const mappedRetained = retainedRecords.map((record) => record.finding);
-    const headingTargets = (batch: Batch): NativePdfHeadingReviewTarget[] =>
+    const repairFindingTargets = (
+      batch: Batch
+    ): NativePdfRepairReviewTarget[] =>
       retainedRecords.flatMap((record) => {
         const before = record.sourceFinding.tagId
           ? preparedById.get(record.sourceFinding.tagId)
@@ -1111,12 +1314,65 @@ export async function repairNativePdf(
         const preserved = repaired.inventory.tags.find(
           (tag) => tag.id === record.finding.tagId
         );
-        if (
-          record.finding.code !== "heading-structure" ||
-          !before ||
-          !preserved
-        )
-          return [];
+        if (!before || !preserved) return [];
+        if (record.finding.code === "table-header-relationships") {
+          if (!batch.tags.some((tag) => tag.id === preserved.id)) return [];
+          const candidate = prepared.inventory.structureCandidates?.find(
+            (candidate) =>
+              candidate.kind === "repair_table_headers" &&
+              [candidate.tagId, ...candidate.relatedTagIds].includes(before.id)
+          );
+          const table = candidate
+            ? repaired.inventory.tags.find(
+                (tag) =>
+                  tag.role === "Table" &&
+                  (tag.id ===
+                    repaired.inventory.sourceTagLineage?.[candidate.tagId] ||
+                    originalTagId(tag) === candidate.tagId)
+              )
+            : undefined;
+          const selected =
+            !!candidate &&
+            plan.operations.some(
+              (op) =>
+                op.type === "repair_structure" &&
+                op.tagId === candidate.tagId &&
+                op.candidateId === candidate.candidateId
+            );
+          const seen = new Set<string>();
+          let ancestor: NativePdfTag | undefined = preserved;
+          while (
+            ancestor &&
+            ancestor !== table &&
+            !seen.has(ancestor.id) &&
+            seen.size < 64
+          ) {
+            seen.add(ancestor.id);
+            ancestor = repaired.inventory.tags.find(
+              (tag) => tag.id === ancestor?.parentId
+            );
+          }
+          return [
+            {
+              findingId: record.findingId,
+              finding: record.finding,
+              tagId: preserved.id,
+              beforeRole: before.role,
+              currentRole: preserved.role,
+              ...(table ? { tableTagId: table.id } : {}),
+              eligibleForResolution:
+                selected &&
+                !!table &&
+                ancestor === table &&
+                repaired.changes.some(
+                  (change) =>
+                    change.code === "repair_table_headers" &&
+                    change.tagId === table.id
+                ),
+            },
+          ];
+        }
+        if (record.finding.code !== "heading-structure") return [];
         const splitOperation = plan.operations.find(
           (op) =>
             op.tagId === before.id &&
@@ -1162,7 +1418,7 @@ export async function repairNativePdf(
         ];
       });
     const auditEvidence = (batch: Batch) => {
-      const reviewTargets = headingTargets(batch);
+      const reviewTargets = repairFindingTargets(batch);
       const priorIds = new Set(batch.tags.map(originalTagId).filter(Boolean));
       const historicalBatch = {
         ...batch,
@@ -1222,7 +1478,7 @@ export async function repairNativePdf(
           batch,
           repaired
         );
-        const resolvedFindingIds = parseNativePdfHeadingReviews(
+        const resolvedFindingIds = parseNativePdfRepairFindingReviews(
           data.repairFindingReviews,
           reviewTargets
         );
@@ -1233,7 +1489,7 @@ export async function repairNativePdf(
             )!;
             return findings.some(
               (finding) =>
-                finding.code === "heading-structure" &&
+                finding.code === target.finding.code &&
                 finding.tagId === target.tagId
             );
           })

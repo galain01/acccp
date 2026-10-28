@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useId, useRef, useState } from "react";
-import { deleteDocument } from "@/lib/actions/documents";
+import { deleteDocument, listDocuments } from "@/lib/actions/documents";
 import {
   isPptxFilename,
   isSupportedDocumentFilename,
@@ -11,6 +11,12 @@ import {
   DocumentUploadError,
   uploadPowerPointDocument,
 } from "@/lib/document-upload-client";
+import {
+  prepareDocumentSubmission,
+  cancelDocumentSubmission,
+  DocumentSubmissionError,
+  type PreparedDocumentSubmission,
+} from "@/lib/document-submission-client";
 import {
   canChooseDocumentOutput,
   getDocumentOutputChoice,
@@ -44,12 +50,16 @@ export default function DocumentWorkspace({
   const [documents, setDocuments] =
     useState<UploadedDocument[]>(initialDocuments);
   const [outputIntent, setOutputIntent] = useState<OutputIntent>("original");
+  const [cleanupError, setCleanupError] = useState<string>();
   const outputFormatId = useId();
   const abortControllersRef = useRef<Map<string, AbortController>>(new Map());
   const mountedRef = useRef(false);
   const batchActiveRef = useRef(false);
   const deletedRowsRef = useRef(new Set<string>());
-  const reservedIdsRef = useRef(new Map<string, string>());
+  const preparedRef = useRef(
+    new Map<string, PreparedDocumentSubmission & { settled?: boolean }>()
+  );
+  const cancellationRequestsRef = useRef(new Map<string, Promise<void>>());
   const uploadedIdsRef = useRef(new Map<string, string>());
   const deleteRequestsRef = useRef(new Map<string, Promise<void>>());
 
@@ -156,6 +166,22 @@ export default function DocumentWorkspace({
     return request;
   }, []);
 
+  const cancelPrepared = useCallback((prepared: PreparedDocumentSubmission) => {
+    const existing = cancellationRequestsRef.current.get(prepared.documentId);
+    if (existing) return existing;
+    const request = cancelDocumentSubmission(prepared.submissionToken).catch(
+      () => {
+        cancellationRequestsRef.current.delete(prepared.documentId);
+        if (mountedRef.current)
+          setCleanupError(
+            "The file was removed from this view, but its upload cancellation could not be confirmed. Refresh to check saved documents. Online copies still expire automatically."
+          );
+      }
+    );
+    cancellationRequestsRef.current.set(prepared.documentId, request);
+    return request;
+  }, []);
+
   const handleDeleteDocument = useCallback(
     async (docId: string) => {
       deletedRowsRef.current.add(docId);
@@ -166,12 +192,14 @@ export default function DocumentWorkspace({
 
       const documentId =
         doc?.documentId ??
-        reservedIdsRef.current.get(docId) ??
+        preparedRef.current.get(docId)?.documentId ??
         uploadedIdsRef.current.get(docId);
       uploadedIdsRef.current.delete(docId);
-      if (documentId) await removeStoredDocument(documentId);
+      const prepared = preparedRef.current.get(docId);
+      if (prepared) await cancelPrepared(prepared);
+      else if (documentId) await removeStoredDocument(documentId);
     },
-    [documents, removeStoredDocument]
+    [documents, removeStoredDocument, cancelPrepared]
   );
 
   const convertDocument = useCallback(
@@ -184,8 +212,16 @@ export default function DocumentWorkspace({
         !mountedRef.current
       )
         return;
-      let documentId = doc.documentId ?? uploadedIdsRef.current.get(doc.id);
-      if (!documentId && !doc.file) {
+      let prepared = preparedRef.current.get(doc.id);
+      let documentId =
+        doc.documentId ??
+        uploadedIdsRef.current.get(doc.id) ??
+        prepared?.documentId;
+      let sourceReady =
+        doc.sourceReady ??
+        (uploadedIdsRef.current.has(doc.id) ||
+          Boolean(doc.documentId && !prepared));
+      if ((!documentId || !sourceReady) && !doc.file) {
         updateDocument(doc.id, {
           status: "error",
           errorMessage: "This document is no longer available. Re-upload it.",
@@ -196,11 +232,13 @@ export default function DocumentWorkspace({
 
       const controller = new AbortController();
       abortControllersRef.current.set(doc.id, controller);
-      let reservationId: string | undefined;
-      let uploadComplete = false;
-      let uploading = !documentId && isPptxFilename(doc.name);
+      let uploading = !sourceReady && isPptxFilename(doc.name);
+      const hadAvailableOutput =
+        doc.hasAvailableOutput ?? doc.status === "success";
       updateDocument(doc.id, {
         status: "processing",
+        hasAvailableOutput: hadAvailableOutput,
+        savedResultUnverified: undefined,
         processingPhase: uploading ? "uploading" : undefined,
         html: undefined,
         errorMessage: undefined,
@@ -209,25 +247,129 @@ export default function DocumentWorkspace({
         interactionTestSummary: undefined,
       });
 
+      const recordFailedRequest = async (errorMessage: string) => {
+        // A lost response may follow a committed output. Never pair cached
+        // findings with a freshly resolved download from another attempt.
+        updateDocument(doc.id, {
+          status: "error",
+          processingPhase: undefined,
+          ...(documentId ? { documentId } : {}),
+          sourceReady,
+          html: undefined,
+          errors: undefined,
+          changes: undefined,
+          interactionTestSummary: undefined,
+          errorMessage,
+          savedResultUnverified: true,
+        });
+        if (!documentId || controller.signal.aborted) return;
+        let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const rows = await Promise.race([
+            listDocuments(sessionId),
+            new Promise<never>((_resolve, reject) => {
+              refreshTimer = setTimeout(
+                () => reject(new Error("Refresh timed out")),
+                10_000
+              );
+            }),
+          ]);
+          if (controller.signal.aborted) return;
+          const saved = rows.find((row) => row.documentId === documentId);
+          if (!saved) {
+            updateDocument(doc.id, {
+              hasAvailableOutput: false,
+              savedOutputArtifactId: undefined,
+              savedResultUnverified: false,
+            });
+            return;
+          }
+          if (saved.outputTarget !== target) return;
+          sourceReady = saved.sourceReady ?? true;
+          if (sourceReady) uploadedIdsRef.current.set(doc.id, documentId);
+          if (
+            prepared &&
+            sourceReady &&
+            (saved.status === "success" ||
+              saved.status === "error" ||
+              saved.status === "idle")
+          )
+            prepared.settled = true;
+          const settled =
+            saved.status === "success" || saved.status === "error";
+          updateDocument(doc.id, {
+            // Preserve the local row key, lock and picked source file.
+            jobId: saved.jobId,
+            sourceReady,
+            hasAvailableOutput:
+              saved.hasAvailableOutput ?? saved.status === "success",
+            savedOutputArtifactId: saved.savedOutputArtifactId,
+            status: settled ? saved.status : "error",
+            errorMessage:
+              saved.status === "success"
+                ? undefined
+                : (saved.errorMessage ?? errorMessage),
+            errors: settled ? saved.errors : undefined,
+            changes: settled ? saved.changes : undefined,
+            interactionTestSummary:
+              saved.status === "success"
+                ? saved.interactionTestSummary
+                : undefined,
+            savedResultUnverified: !settled,
+          });
+        } catch {
+          // Retain only the availability hint; review evidence stays cleared.
+        } finally {
+          clearTimeout(refreshTimer);
+        }
+      };
+
       try {
+        if (!sourceReady && !prepared) {
+          prepared = await prepareDocumentSubmission({
+            file: doc.file!,
+            sessionId,
+            outputTarget: target,
+            signal: controller.signal,
+            onPrepared: (identity) => {
+              prepared = identity;
+              preparedRef.current.set(doc.id, identity);
+              documentId = identity.documentId;
+              updateDocument(doc.id, { documentId, sourceReady: false });
+              if (deletedRowsRef.current.has(doc.id))
+                void cancelPrepared(identity);
+            },
+          });
+        }
+        if (controller.signal.aborted || deletedRowsRef.current.has(doc.id)) {
+          if (prepared && deletedRowsRef.current.has(doc.id))
+            await cancelPrepared(prepared);
+          return;
+        }
         if (uploading) {
           documentId = await uploadPowerPointDocument({
             file: doc.file!,
             sessionId,
             signal: controller.signal,
+            prepared,
             onReserved: (id) => {
-              reservationId = id;
-              reservedIdsRef.current.set(doc.id, id);
+              documentId = id;
             },
           });
-          uploadComplete = true;
+          sourceReady = true;
           uploadedIdsRef.current.set(doc.id, documentId);
           // Remember the completed source before starting a possibly failing
           // model request. Retrying must not reserve or upload it again.
-          updateDocument(doc.id, { documentId, processingPhase: undefined });
+          updateDocument(doc.id, {
+            documentId,
+            sourceReady: true,
+            processingPhase: undefined,
+          });
           if (controller.signal.aborted) {
             if (deletedRowsRef.current.has(doc.id))
-              await removeStoredDocument(documentId);
+              await (prepared
+                ? cancelPrepared(prepared)
+                : removeStoredDocument(documentId));
             return;
           }
           uploading = false;
@@ -241,8 +383,10 @@ export default function DocumentWorkspace({
         const form = new FormData();
         form.append("sessionId", sessionId);
         form.append("outputTarget", target);
-        if (documentId) form.append("documentId", documentId);
+        if (sourceReady && documentId) form.append("documentId", documentId);
         else form.append("file", doc.file!);
+        if (prepared && !prepared.settled)
+          form.append("submissionToken", prepared.submissionToken);
         const response = await fetch("/api/convert", {
           method: "POST",
           body: form,
@@ -251,7 +395,6 @@ export default function DocumentWorkspace({
         const data = await response.json();
         if (typeof data.documentId === "string") {
           documentId = data.documentId;
-          uploadedIdsRef.current.set(doc.id, data.documentId);
         }
         if (
           controller.signal.aborted ||
@@ -259,30 +402,35 @@ export default function DocumentWorkspace({
           deletedRowsRef.current.has(doc.id)
         ) {
           if (documentId && deletedRowsRef.current.has(doc.id))
-            await removeStoredDocument(documentId);
+            await (prepared
+              ? cancelPrepared(prepared)
+              : removeStoredDocument(documentId));
           return;
         }
 
         if (!response.ok) {
-          updateDocument(doc.id, {
-            status: "error",
-            processingPhase: undefined,
-            // A failed model call may already have saved the source. Retrying
-            // must reuse that document instead of uploading a duplicate.
-            ...(documentId ? { documentId } : {}),
-            html: undefined,
-            errorMessage:
-              typeof data.detail === "string" && data.detail.trim()
-                ? data.detail
-                : typeof data.error === "string"
-                  ? data.error
-                  : "Conversion failed.",
-          });
+          await recordFailedRequest(
+            typeof data.detail === "string" && data.detail.trim()
+              ? data.detail
+              : typeof data.error === "string"
+                ? data.error
+                : "Conversion failed."
+          );
           return;
         }
 
+        sourceReady = true;
+        if (documentId) uploadedIdsRef.current.set(doc.id, documentId);
+        if (prepared) prepared.settled = true;
         updateDocument(doc.id, {
+          sourceReady: true,
           status: "success",
+          hasAvailableOutput: true,
+          savedOutputArtifactId:
+            typeof data.savedOutputArtifactId === "string"
+              ? data.savedOutputArtifactId
+              : undefined,
+          savedResultUnverified: undefined,
           processingPhase: undefined,
           documentId,
           jobId: data.jobId,
@@ -296,29 +444,25 @@ export default function DocumentWorkspace({
           errors: data.errors,
         });
       } catch (error) {
-        if (reservationId && !uploadComplete) {
-          await removeStoredDocument(reservationId);
-          reservedIdsRef.current.delete(doc.id);
-          updateDocument(doc.id, { documentId: undefined });
-        }
         // An abort means the user navigated away or removed the row.
-        if (controller.signal.aborted) return;
-        updateDocument(doc.id, {
-          status: "error",
-          processingPhase: undefined,
-          html: undefined,
-          errorMessage:
-            error instanceof DocumentUploadError
-              ? error.message
-              : uploading
-                ? "The PowerPoint upload did not finish. Please try again."
-                : "Conversion failed. Please try again.",
-        });
+        if (controller.signal.aborted) {
+          if (prepared && deletedRowsRef.current.has(doc.id))
+            await cancelPrepared(prepared);
+          return;
+        }
+        await recordFailedRequest(
+          error instanceof DocumentUploadError ||
+            error instanceof DocumentSubmissionError
+            ? error.message
+            : uploading
+              ? "The PowerPoint upload did not finish. Please try again."
+              : "Conversion failed. Please try again."
+        );
       } finally {
         abortControllersRef.current.delete(doc.id);
       }
     },
-    [sessionId, updateDocument, removeStoredDocument]
+    [sessionId, updateDocument, removeStoredDocument, cancelPrepared]
   );
 
   const runConversion = useCallback(() => {
@@ -365,6 +509,11 @@ export default function DocumentWorkspace({
 
   return (
     <div className="mt-8 flex flex-col gap-6">
+      {cleanupError && (
+        <p role="alert" className="text-sm text-destructive">
+          {cleanupError}
+        </p>
+      )}
       <section className="flex flex-col gap-2">
         <label
           htmlFor={outputFormatId}
@@ -471,6 +620,7 @@ export default function DocumentWorkspace({
           updateDocument(docId, {
             errors: result.findings,
             changes: result.changes,
+            savedOutputArtifactId: result.savedOutputArtifactId,
           })
         }
       />

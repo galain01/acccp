@@ -45,6 +45,25 @@ def synthetic_pdf():
     return result.getvalue()
 
 
+def synthetic_continued_list_pdf():
+    """Pinned OpenDataLoader emits an ID for this cross-page list owner."""
+    writer = PdfWriter(clone_from=PdfReader(io.BytesIO(synthetic_pdf())))
+    resources = writer.pages[0]['/Resources']
+    writer.add_blank_page(612, 792)[NameObject('/Resources')] = resources
+    for page_index, page in enumerate(writer.pages):
+        lines = [b'BT /F1 18 Tf 72 720 Td (Native PDF build check) Tj ET']
+        for offset in range(8):
+            number = page_index * 8 + offset + 1
+            text = f'{number}. Synthetic reference entry preserves its number and original wording.'
+            lines.append(f'BT /F1 12 Tf 72 {680 - offset * 65} Td ({text}) Tj ET'.encode())
+        content = DecodedStreamObject()
+        content.set_data(b'\n'.join(lines))
+        page[NameObject('/Contents')] = writer._add_object(content)
+    result = io.BytesIO()
+    writer.write(result)
+    return result.getvalue()
+
+
 def synthetic_heading_pdf():
     writer = PdfWriter(clone_from=PdfReader(io.BytesIO(synthetic_pdf())))
     page = writer.pages[0]
@@ -156,7 +175,7 @@ def request(service, path, body=None, *, authorized=True, method="POST"):
 
 
 def assert_result(result, source):
-    require(result["pageCount"] == 1, "Synthetic page count changed")
+    require(result["pageCount"] == len(PdfReader(io.BytesIO(source)).pages), "Synthetic page count changed")
     require(result["sourceSha256"] == hashlib.sha256(source).hexdigest(), "Original identity changed")
     candidate = base64.b64decode(result["pdfBase64"], validate=True)
     require(result["candidateSha256"] == hashlib.sha256(candidate).hexdigest(), "Output identity mismatch")
@@ -217,6 +236,15 @@ def main():
         require(any(item["id"] == tag["id"] and item["role"] == target_role
                     for item in repaired["inventory"]["tags"]), "Requested native tag edit was not saved")
         require(any(change["code"] == "set_role" for change in repaired["changes"]), "Native edit was not recorded")
+        list_source = synthetic_continued_list_pdf()
+        status, list_prepared = request(service, "/prepare", list_source)
+        require(status == 200, "Installed continued-list preparation failed: " + str(list_prepared.get("error", {}).get("code", status)))
+        assert_result(list_prepared, list_source)
+        index = list_prepared['inventory']['native_id_tree']
+        require(index['present'] and index['verified'] and index['entryCount'] > 0,
+                "Generated list identifiers did not have a verified saved index")
+        require(any(change['code'] == 'generated_identifier_index_added' for change in list_prepared['changes']),
+                "The pinned tagger no longer exercises the missing generated-index regression")
         heading_source = synthetic_heading_pdf()
         status, heading_prepared = request(service, "/prepare", heading_source)
         require(status == 200, "Installed structure preparation failed")
@@ -274,7 +302,7 @@ def main():
             require(expected == saved_packets[index].get_object().get_data(),
                     "Hybrid XFA changed beyond the exact authorized speech attribute")
         # Counts, tool versions and success states are safe build diagnostics.
-        print("Native PDF build smoke passed: authenticated HTTP, OpenDataLoader tagging, "
+        print("Native PDF build smoke passed: authenticated HTTP, OpenDataLoader tagging and generated-ID indexing, "
               "native repair, static hybrid form preservation, veraPDF validation, identical page pixels and preserved content.")
     finally:
         service.shutdown()

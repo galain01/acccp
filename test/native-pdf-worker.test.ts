@@ -347,35 +347,79 @@ describe("native PDF service client", () => {
       parseNativePdfState(raw, source).inventory.structureCandidates?.[0].kind
     ).toBe("convert_list");
   });
-  it.each(["rebuild_table", "move_callout", "describe_chart"])(
-    "accepts %s with all bounded participant IDs",
-    (kind) => {
-      const raw = response();
-      const inventory = raw.inventory as unknown as Record<string, unknown>;
-      inventory.tags = Array.from({ length: 42 }, (_, index) => ({
-        ...raw.inventory.tags[0],
-        id: `tag-${index + 1}`,
-      }));
-      const relatedTagIds = Array.from(
-        { length: 41 },
-        (_, index) => `tag-${index + 2}`
+  it.each([
+    "rebuild_table",
+    "repair_table_headers",
+    "move_callout",
+    "describe_chart",
+  ])("accepts %s with all bounded participant IDs", (kind) => {
+    const raw = response();
+    const inventory = raw.inventory as unknown as Record<string, unknown>;
+    inventory.tags = Array.from({ length: 42 }, (_, index) => ({
+      ...raw.inventory.tags[0],
+      id: `tag-${index + 1}`,
+    }));
+    const relatedTagIds = Array.from(
+      { length: 41 },
+      (_, index) => `tag-${index + 2}`
+    );
+    inventory.structureCandidates = [
+      {
+        candidateId: "b".repeat(64),
+        kind,
+        tagId: "tag-1",
+        pageNumber: 1,
+        text: "Source",
+        preview: "Verified structural relationship",
+        relatedTagIds,
+      },
+    ];
+    expect(
+      parseNativePdfState(raw, source).inventory.structureCandidates?.[0]
+    ).toMatchObject({ kind, relatedTagIds });
+  });
+  it("accepts a complete wide-table context while retaining bounded known participants", () => {
+    const raw = response();
+    const inventory = raw.inventory as unknown as Record<string, unknown>;
+    inventory.tags = Array.from({ length: 4002 }, (_, index) => ({
+      ...raw.inventory.tags[0],
+      id: `tag-${index + 1}`,
+    }));
+    const relatedTagIds = Array.from(
+      { length: 437 },
+      (_, index) => `tag-${index + 2}`
+    );
+    const candidate = {
+      candidateId: "d".repeat(64),
+      kind: "repair_table_headers",
+      tagId: "tag-1",
+      pageNumber: 1,
+      text: "Source axes",
+      preview: "Source row and column ranges",
+      relatedTagIds,
+    };
+    inventory.structureCandidates = [candidate];
+    expect(
+      parseNativePdfState(raw, source).inventory.structureCandidates?.[0]
+        .relatedTagIds
+    ).toEqual(relatedTagIds);
+    for (const changed of [
+      { kind: "rebuild_table" },
+      { relatedTagIds: [...relatedTagIds, "tag-unknown"] },
+      { relatedTagIds: [...relatedTagIds, relatedTagIds[0]] },
+      {
+        relatedTagIds: Array.from(
+          { length: 4001 },
+          (_, index) => `tag-${index + 2}`
+        ),
+      },
+    ]) {
+      inventory.structureCandidates = [{ ...candidate, ...changed }];
+      expect(() => parseNativePdfState(raw, source)).toThrow(
+        "pdf_protocol_error"
       );
-      inventory.structureCandidates = [
-        {
-          candidateId: "b".repeat(64),
-          kind,
-          tagId: "tag-1",
-          pageNumber: 1,
-          text: "Source",
-          preview: "Verified structural relationship",
-          relatedTagIds,
-        },
-      ];
-      expect(
-        parseNativePdfState(raw, source).inventory.structureCandidates?.[0]
-      ).toMatchObject({ kind, relatedTagIds });
     }
-  );
+  });
   it("rejects malformed structure candidates and lineage before supplying them to the model", () => {
     const candidate = {
       candidateId: "a".repeat(64),
@@ -743,5 +787,38 @@ describe("native PDF service client", () => {
     expect(String(vi.mocked(fetch).mock.calls[0][0])).toBe(
       "https://private-worker.example/repair"
     );
+  });
+});
+
+describe("excluded-text candidate protocol", () => {
+  it("accepts bounded source scopes and rejects duplicate or unbounded scope evidence", () => {
+    const raw = response();
+    const candidate = {
+      candidateId: "a".repeat(64),
+      kind: "restore_artifact_text",
+      tagId: "tag-1",
+      pageNumber: 1,
+      text: "Appendix",
+      preview: "Restore before footer",
+      relatedTagIds: [],
+      textScopes: [
+        { scopeId: "b".repeat(64), text: "Do NOT discard 19 items." },
+      ],
+    };
+    const inventory = raw.inventory as Record<string, unknown>;
+    inventory.structureCandidates = [candidate];
+    expect(
+      parseNativePdfState(raw, source).inventory.structureCandidates?.[0]
+    ).toMatchObject(candidate);
+    for (const scopes of [
+      [],
+      [candidate.textScopes[0], candidate.textScopes[0]],
+      [{ scopeId: "invalid", text: "Words" }],
+      [{ scopeId: "c".repeat(64), text: "x".repeat(8001) }],
+      [{ scopeId: "c".repeat(64), text: "   " }],
+    ]) {
+      inventory.structureCandidates = [{ ...candidate, textScopes: scopes }];
+      expect(() => parseNativePdfState(raw, source)).toThrow();
+    }
   });
 });

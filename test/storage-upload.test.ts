@@ -3,18 +3,23 @@ const mocks = vi.hoisted(() => ({
   createClient: vi.fn(),
   signUpload: vi.fn(),
   signDownload: vi.fn(),
+  upload: vi.fn(),
   fetch: vi.fn(),
+  from: vi.fn(),
 }));
 vi.mock("@supabase/supabase-js", () => ({ createClient: mocks.createClient }));
 beforeEach(() => {
   vi.stubEnv("SUPABASE_URL", "https://storage.test");
   vi.stubEnv("SUPABASE_SERVICE_ROLE_KEY", "synthetic-key");
+  vi.stubEnv("SUPABASE_DOCUMENTS_BUCKET", undefined);
+  mocks.from.mockImplementation(() => ({
+    createSignedUploadUrl: mocks.signUpload,
+    createSignedUrl: mocks.signDownload,
+    upload: mocks.upload,
+  }));
   mocks.createClient.mockReturnValue({
     storage: {
-      from: () => ({
-        createSignedUploadUrl: mocks.signUpload,
-        createSignedUrl: mocks.signDownload,
-      }),
+      from: mocks.from,
     },
   });
   mocks.signDownload.mockResolvedValue({
@@ -30,6 +35,58 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 describe("direct upload storage transport", () => {
+  it.each([
+    [undefined, "documents"],
+    ["", "documents"],
+    ["  isolated-validation  ", "isolated-validation"],
+  ])(
+    "uses the configured private bucket for all storage clients (%j)",
+    async (configured, bucket) => {
+      vi.stubEnv("SUPABASE_DOCUMENTS_BUCKET", configured);
+      mocks.upload.mockResolvedValue({ error: null });
+      const { DOCUMENTS_BUCKET, uploadObject, createSignedUrl } =
+        await import("@/lib/storage");
+      expect(DOCUMENTS_BUCKET).toBe(bucket);
+      await uploadObject(
+        "owned/output.pdf",
+        Buffer.from("test"),
+        "application/pdf",
+        { signal: new AbortController().signal }
+      );
+      await createSignedUrl("owned/output.pdf", 60, "output.pdf", {
+        signal: new AbortController().signal,
+      });
+      expect(mocks.from).toHaveBeenCalledTimes(3);
+      expect(mocks.from.mock.calls.every(([name]) => name === bucket)).toBe(
+        true
+      );
+    }
+  );
+  it("passes immutable upload policy and cancellation to the storage SDK", async () => {
+    mocks.upload.mockResolvedValue({ error: null });
+    const { uploadObject } = await import("@/lib/storage");
+    const signal = new AbortController().signal;
+    await uploadObject(
+      "owned/publication/output",
+      Buffer.from("synthetic"),
+      "application/pdf",
+      { upsert: false, signal }
+    );
+    expect(mocks.upload).toHaveBeenCalledWith(
+      "owned/publication/output",
+      Buffer.from("synthetic"),
+      { contentType: "application/pdf", upsert: false }
+    );
+    const options = mocks.createClient.mock.calls.at(-1)![2];
+    await options.global.fetch("https://storage.test/upload", {
+      method: "POST",
+    });
+    expect(mocks.fetch).toHaveBeenCalledWith("https://storage.test/upload", {
+      method: "POST",
+      signal,
+    });
+  });
+
   it("cancels signed read URL creation with the caller's signal", async () => {
     const controller = new AbortController();
     mocks.fetch.mockImplementation(

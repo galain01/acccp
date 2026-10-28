@@ -1,5 +1,6 @@
 # dependencies
 /node_modules
+/.github/test-runtime/node_modules/
 /.pnp
 .pnp.*
 .yarn/*
