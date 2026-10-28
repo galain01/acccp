@@ -86,7 +86,7 @@ class InventoryTextWorkTests(unittest.TestCase):
                     prior = v.structure_inventory(reader)
                 self.assertEqual(current, prior)
 
-    def test_index_keeps_all_painting_and_text_state_in_original_order(self):
+    def test_index_keeps_text_state_and_drops_pure_painting_in_original_order(self):
         ops = [([], op) for op in (b'q', b'BT', b'Tf', b'gs', b'Tm', b'BMC',
                                   b'BDC', b'TJ', b'TD', b'Tj', b'EMC', b'ET',
                                   b'Q', b'MP', b'DP', b'm', b'l', b'S', b'Do', b'INLINE IMAGE')]
@@ -94,7 +94,7 @@ class InventoryTextWorkTests(unittest.TestCase):
         artifacts = [bool(i % 2) for i in owners]
         actual = v.scoped_text_operations(ops, owners, artifacts)
         retained = [index for index, (_, op) in enumerate(ops)
-                    if op not in (b'BMC', b'BDC', b'EMC', b'MP', b'DP', b'Do', b'INLINE IMAGE')]
+                    if op not in (b'BMC', b'BDC', b'EMC', b'MP', b'DP', b'Do', b'INLINE IMAGE', b'm', b'l', b'S')]
         self.assertEqual(actual, [(ops[i], owners[i], artifacts[i]) for i in retained])
 
 

@@ -134,6 +134,19 @@ class ExactAlternativeProofTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.directory = Path(temporary.name)
 
+    def test_no_authored_figure_alt_needs_no_replacement_waiver_or_repeated_text_scan(self):
+        source = worker.open_pdf(figure_bytes("image 1"))
+        writer = PdfWriter(clone_from=source)
+        del worker.native_nodes(writer)[1][NameObject("/Alt")]
+        stream = io.BytesIO(); writer.write(stream)
+        source = worker.open_pdf(stream.getvalue())
+        inventory = worker.verify_pdf.structure_inventory(source)
+        tag = inventory["tags"][1]
+        operation = {"type": "set_alt", "tagId": tag["id"], "expected": worker.snapshot(tag),
+                     "alt": "A filled black rectangle with visible label Label0."}
+        with patch.object(worker.verify_pdf, "structure_inventory", side_effect=AssertionError("unexpected full text rescan")):
+            self.assertIsNone(alternatives.approve_replacements(source, source, [operation]))
+
     def planned(self, source):
         reader = worker.open_pdf(source)
         tag = worker.verify_pdf.structure_inventory(reader)["tags"][1]

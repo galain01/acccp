@@ -203,7 +203,7 @@ def verify_note_ids(before, after):
         raise NoteIdError("note_id_preservation")
 
 
-def verify_authored_ids(original, candidate, *, _candidate_inspection=None):
+def verify_authored_ids(original, candidate, *, _candidate_inspection=None, _original_inspection=None):
     """Keep each authored ID bound to the exact same ordered source content.
 
     Tag numbers may shift when a separately authorized structural edit adds a
@@ -211,9 +211,11 @@ def verify_authored_ids(original, candidate, *, _candidate_inspection=None):
     the ordinary preservation check independently protects their page programs.
     """
     try:
-        if _candidate_inspection is not None and type(_candidate_inspection) is not _DiscoveryInspection:
+        if any(item is not None and type(item) is not _DiscoveryInspection
+               for item in (_candidate_inspection, _original_inspection)):
             raise NoteIdError("authored_id_preservation")
-        inventories = [structure_inventory(original),
+        inventories = [_original_inspection.copy_for(original) if _original_inspection is not None
+                      else structure_inventory(original),
             _candidate_inspection.copy_for(candidate) if _candidate_inspection is not None
             else structure_inventory(candidate)]
         if any(item.get("tagged") and not item.get("native_id_tree", {}).get("verified") for item in inventories):

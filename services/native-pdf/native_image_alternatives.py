@@ -113,9 +113,14 @@ def approve_replacements(original, candidate, operations):
     selected = [operation for operation in operations if operation.get("type") == "set_alt"]
     if not selected:
         return None
+    source_figures = v.figure_association_inventory(original)["figures"]
+    if not any("alt" in figure for figure in source_figures):
+        # An absent source alternative is not an authored string to replace.
+        # No waiver is needed or issued; ordinary paint, ownership, ActualText
+        # and saved-output checks still apply to every added description.
+        return None
     before_tags = {tag["id"]: tag for tag in v.structure_inventory(original)["tags"]}
     tags = {tag["id"]: tag for tag in v.structure_inventory(candidate)["tags"]}
-    source_figures = v.figure_association_inventory(original)["figures"]
     candidate_figures = v.figure_association_inventory(candidate)["figures"]
     replacements, used = [], set()
     for operation in selected:

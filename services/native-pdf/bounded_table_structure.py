@@ -15,7 +15,7 @@ import re
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_raw
 
-from pypdf.generic import (ArrayObject, ByteStringObject, ContentStream,
+from pypdf.generic import (ArrayObject, ByteStringObject,
     DictionaryObject, NameObject as N, NullObject, NumberObject as I, TextStringObject)
 
 import bounded_semantic_structure as b
@@ -655,7 +655,7 @@ def apply_operations(source_reader, writer, operations, *, _inspection=None, _so
             else:changed.append(([b._freeze(arg) for arg in args] if op in b.SHOW else args,op))
             if index in background_ends:changed.append(([],b'EMC'))
         _require(v.drawing_fingerprint(ops,v.Canonicalizer(list(writer.pages)))==v.drawing_fingerprint(changed,v.Canonicalizer(list(writer.pages))))
-        stream=ContentStream(None,writer);stream.operations=changed;page[N('/Contents')]=writer._add_object(stream)
+        stream=b.preserved_content_stream(writer,changed);page[N('/Contents')]=writer._add_object(stream)
         proof.tables.append({'id':table_id.hex(),'pageNumber':page_number,'rows':expected_rows,
             'metadata':_metadata(table,list(writer.pages)), 'rowMetadata':expected_row_metadata,
             'members':expected_members,'backgrounds':[_background_identity(block) for block in detail['backgrounds']]})

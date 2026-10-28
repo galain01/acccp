@@ -512,7 +512,7 @@ describe("native PDF model contracts", () => {
 
   it("includes contextual evidence in the existing 900,000-character scope budget", async () => {
     const state = await makeState(3);
-    state.inventory.forms = { authoredDescription: "x".repeat(620_000) };
+    state.inventory.forms = { authoredDescription: "x".repeat(780_000) };
     for (const item of state.inventory.tags) {
       item.text = "x".repeat(55_000);
       item.snapshot.text = item.text;
@@ -2064,12 +2064,24 @@ describe("native PDF orchestration", () => {
     expect(historical).toMatchObject({
       evidenceRole: "before-repair-comparison",
       title: "",
-      tags: prepared.inventory.tags,
+      tags: prepared.inventory.tags.map((tag) =>
+        Object.fromEntries(
+          Object.entries(tag).filter(([key]) => key !== "snapshot")
+        )
+      ),
       forms: prepared.inventory.forms,
       nestedFormContent: prepared.inventory.form_content,
       excludedTextAndPageChecks: prepared.inventory.page_content,
     });
     expect(historical.hierarchy).toHaveLength(prepared.inventory.tags.length);
+    expect(historical.tags[0]).not.toHaveProperty("snapshot");
+    expect(prepared.inventory.tags[0].snapshot).toEqual({
+      role: prepared.inventory.tags[0].role,
+      text: prepared.inventory.tags[0].text,
+      pageNumber: prepared.inventory.tags[0].pageNumber,
+      mcids: [1],
+      alt: null,
+    });
     for (const property of [
       "machineChecks",
       "findings",

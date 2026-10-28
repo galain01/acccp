@@ -12,7 +12,7 @@ import json
 import math
 import re
 
-from pypdf.generic import (ArrayObject, ByteStringObject, ContentStream,
+from pypdf.generic import (ArrayObject, ByteStringObject,
     DictionaryObject, NameObject as N, NullObject, NumberObject as I)
 
 import bounded_semantic_structure as b
@@ -524,7 +524,7 @@ def apply_operations(source_reader, writer, operations, *, _inspection=None, _so
             else:changed.append(([b._freeze(arg) for arg in args] if op in b.SHOW else args,op))
             if index in background_ends:changed.append(([],b'EMC'))
         _require(v.drawing_fingerprint(ops,v.Canonicalizer(list(writer.pages)))==v.drawing_fingerprint(changed,v.Canonicalizer(list(writer.pages))))
-        stream=ContentStream(None,writer);stream.operations=changed;page[N('/Contents')]=writer._add_object(stream)
+        stream=b.preserved_content_stream(writer,changed);page[N('/Contents')]=writer._add_object(stream)
         proof.tables.append({'id':table_id.hex(),'pageNumber':page_number,'rows':expected_rows,
             'metadata':_metadata(table,list(writer.pages)), 'rowMetadata':expected_row_metadata, 'bodyMetadata':expected_bodies,
             'layout':[(str(v.resolved(child)['/S'])[1:],len(b._children(v.resolved(child))) if v.resolved(child)['/S']=='/TBody' else 1) for child in row_nodes],

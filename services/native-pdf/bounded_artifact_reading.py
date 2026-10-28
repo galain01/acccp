@@ -10,7 +10,7 @@ import hashlib
 import json
 
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import (ArrayObject, ContentStream, DictionaryObject,
+from pypdf.generic import (ArrayObject, DictionaryObject,
     NameObject as N, NullObject, NumberObject as I)
 
 import bounded_semantic_structure as semantic
@@ -359,7 +359,7 @@ def apply_operations(source_reader, writer, operations, *, _inspection=None,
             for index, (args, operator) in enumerate(ops)]
         require(_paint(changed) == detail['pagePaint'], 'native_pdf_preservation')
         require(_array_owners(array)[:len(before_owners)] == before_owners, 'native_pdf_preservation')
-        stream = ContentStream(None, writer); stream.operations = changed
+        stream = semantic.preserved_content_stream(writer, changed)
         page[N('/Contents')] = writer._add_object(stream)
         proofs.append({'pageNumber': pn, 'paint': _paint(changed), 'marks': _marks(changed),
             'resources': detail['resources'], 'parent': _key(parent),

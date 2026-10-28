@@ -7,8 +7,11 @@ continue through the worker's ordinary active-content and signature checks.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import base64
+import binascii
 import hashlib
 import re
+import struct
 import xml.etree.ElementTree as ET
 
 from pypdf import PdfWriter
@@ -30,10 +33,30 @@ ADOBE_BOOTSTRAP = {
 }
 
 _COMMENTS = re.compile(r"(?:[ \t\r\n]|//[^\r\n\u2028\u2029]*|/\*[\s\S]*?\*/)*\Z")
-_CHECKBOX_EVENT = re.compile(
+_CHECKBOX_STANZA = re.compile(
     r'comment\(\);\s*var\s+fld\s*=\s*this\.getField\s*\(\s*"[A-Za-z0-9_.\[\]()]{1,200}"\s*\);\s*'
     r'if\s*\(fld\.isBoxChecked\(0\)\)\s*\{\s*fld\.checkThisBox\s*\(0,\s*true\);\s*\}\s*'
-    r'else\s*\{\s*fld\.checkThisBox\s*\(0,\s*false\);\s*\}\s*MainCalculation\(\);\s*\Z', re.ASCII)
+    r'else\s*\{\s*fld\.checkThisBox\s*\(0,\s*false\);\s*\}\s*MainCalculation\(\);', re.ASCII)
+
+
+def _legacy_checkbox_event(text):
+    """Recognize up to three exact copies of the reviewed legacy stanza.
+
+    Some Designer exports duplicate this handler. Recognition never evaluates,
+    deduplicates or rewrites a program; the saved script must remain identical.
+    """
+    remaining = text.strip()
+    first = _CHECKBOX_STANZA.match(remaining)
+    if first is None:
+        return False
+    stanza = first.group()
+    for _ in range(3):
+        if not remaining.startswith(stanza):
+            return False
+        remaining = remaining[len(stanza):].lstrip()
+        if not remaining:
+            return True
+    return False
 
 
 class HybridFormError(ValueError):
@@ -159,7 +182,7 @@ def _xml_packets(form):
     packets = _resolve(form.get("/XFA"))
     _require(isinstance(packets, ArrayObject) and 2 <= len(packets) <= 32 and len(packets) % 2 == 0)
     values, xml_texts, total = {}, {}, 0
-    allowed = {"preamble", "config", "template", "datasets", "localeSet", "xmpmeta", "form", "postamble"}
+    allowed = {"preamble", "config", "template", "datasets", "localeSet", "xmpmeta", "xfdf", "form", "postamble"}
     for i in range(0, len(packets), 2):
         name, stream = str(packets[i]), _resolve(packets[i + 1])
         _require(name in allowed and name not in values and isinstance(stream, StreamObject))
@@ -196,11 +219,29 @@ def _xml_packets(form):
             "form": "http://www.xfa.org/schema/xfa-form/2.8/",
             "localeSet": "http://www.xfa.org/schema/xfa-locale-set/2.7/",
             "xmpmeta": "adobe:ns:meta/",
+            "xfdf": "http://ns.adobe.com/xfdf/",
         }
         if name == "template":
             _require(bool(re.fullmatch(r"\{http://www\.xfa\.org/schema/xfa-template/3\.[0-6]/\}template", roots[name].tag)))
         else:
             _require(roots[name].tag == "{" + namespaces[name] + "}" + name)
+        if name == "xfdf":
+            # Only an empty annotation envelope is supported. Retain its exact
+            # bytes; populated XFDF annotations, fields and file links remain
+            # outside the static form subset.
+            envelope = roots[name]
+            # ElementTree omits processing instructions. An empty tree alone
+            # must not admit a stylesheet or another unrecognized instruction.
+            _require(not re.search(r"<\?(?!xml[ \t\r\n])", xml_texts[name]))
+            space = "{http://www.w3.org/XML/1998/namespace}space"
+            _require(set(envelope.attrib) <= {space}
+                     and envelope.get(space, "preserve") == "preserve"
+                     and not (envelope.text or "").strip() and len(envelope) == 1)
+            annotations = envelope[0]
+            _require(annotations.tag == "{http://ns.adobe.com/xfdf/}annots"
+                     and not annotations.attrib and len(annotations) == 0
+                     and not (annotations.text or "").strip()
+                     and not (annotations.tail or "").strip())
     # Validate wrappers as XML too, without resolving any external resources.
     if "preamble" in values or "postamble" in values:
         _require("preamble" in values and "postamble" in values)
@@ -378,10 +419,53 @@ def _native_fields(pdf, form):
     return result
 
 
+def _static_drawing_bitmap(element, parents, namespace):
+    """Admit an inert monochrome BMP in a static drawing, without rendering it.
+
+    Both the encoded XFA image and the already-painted PDF pages are preserved.
+    Field images, external resources and other bitmap encodings stay unsupported.
+    """
+    value = parents.get(id(element))
+    draw = parents.get(id(value))
+    subform = parents.get(id(draw))
+    _require(value is not None and value.tag == namespace + "value"
+             and not value.attrib and len(value) == 1
+             and not (value.text or "").strip()
+             and draw is not None and draw.tag == namespace + "draw"
+             and sum(child.tag == namespace + "value" for child in draw) == 1
+             and subform is not None and subform.tag == namespace + "subform"
+             and element.tag == namespace + "image" and len(element) == 0
+             and element.attrib == {"contentType": "image/bmp"}
+             and not (element.tail or "").strip())
+    encoded = re.sub(r"[ \t\r\n]", "", element.text or "")
+    _require(0 < len(encoded) <= MAX_XML_BYTES, "pdf_complexity_limit")
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise HybridFormError() from error
+    _require(len(data) >= 62)
+    magic, size, reserved1, reserved2, offset = struct.unpack("<2sIHHI", data[:14])
+    header, width, height, planes, bits, compression, image_size, _, _, colors, important = struct.unpack("<IiiHHIIiiII", data[14:54])
+    _require(magic == b"BM" and size == len(data) and reserved1 == reserved2 == 0
+             and offset == 62 and header == 40 and planes == 1 and bits == 1
+             and compression == 0 and colors in {0, 2} and important in {0, 1, 2}
+             and 0 < width <= 4096 and 0 < height <= 4096
+             and width * height <= 8_000_000)
+    pixel_bytes = ((width + 31) // 32) * 4 * height
+    end = offset + pixel_bytes
+    # Some static Designer drawings pad the complete BMP to a four-byte
+    # boundary too. Permit only that exact zero padding, never opaque payloads.
+    padding = (-end) % 4
+    _require(image_size in {0, pixel_bytes}
+             and (len(data) == end or len(data) == end + padding
+                  and data[end:] == b"\x00" * padding))
+
+
 def _template_fields(template, native):
     unsupported = {"occur", "subformSet", "instanceManager", "connectionSet", "connect", "connection", "sourceSet", "submit", "execute", "calculate", "validate", "bindItems", "exclGroup", "variables", "signature", "signData", "exObject", "image", "barcode", "externalObject", "wsdlConnection", "xmlConnection", "xsdConnection"}
     result, script_count, all_names = [], 0, set()
     namespace = template.tag.rsplit("}", 1)[0] + "}"
+    parents = {id(child): element for element in template.iter() for child in element}
     evidence_elements = {"subform", "field", "draw", "assist", "speak", "ui", "textEdit", "checkButton", "comb",
                          "traversal", "traverse", "bind", "event", "script"}
 
@@ -391,7 +475,11 @@ def _template_fields(template, native):
         _require(tag not in evidence_elements or (not foreign_ancestor and element.tag == namespace + tag))
         if tag in {"field", "subform"}:
             _require(parent is not None and parent.tag in {namespace + "template", namespace + "subform"})
-        _require(tag not in unsupported)
+        if tag == "image":
+            _require(not foreign_ancestor)
+            _static_drawing_bitmap(element, parents, namespace)
+        else:
+            _require(tag not in unsupported)
         if tag in {"subform", "field"} and element.get("name"):
             name = element.get("name")
             _require(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,100}", name))
@@ -438,7 +526,7 @@ def _template_fields(template, native):
                      and set(element.attrib) <= {"contentType"} and element.get("contentType") == "application/x-javascript")
             text = (element.text or "").replace("\r\n", "\n").replace("\r", "\n")
             _require(len(text) <= 16_384, "pdf_complexity_limit")
-            _require(bool(_COMMENTS.fullmatch(text)) or (field_type == "checkButton" and parent.get("activity") == "mouseUp" and bool(_CHECKBOX_EVENT.fullmatch(text.strip()))))
+            _require(bool(_COMMENTS.fullmatch(text)) or (field_type == "checkButton" and parent.get("activity") == "mouseUp" and _legacy_checkbox_event(text)))
         if tag == "event":
             _require(set(element.attrib) <= {"activity", "name"} and len(element) == 1 and _local(element[0]) == "script")
         for child in element:

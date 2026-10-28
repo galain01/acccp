@@ -1099,12 +1099,14 @@ def scoped_text_operations(ops: list[tuple[Any, bytes]], owners: list[int | None
 
     Marked-content wrappers have no effect on pypdf's native text decoder.
     Removing them once from this disposable extraction index avoids charging
-    every MCID for all the tagger's wrappers on the page. All painting/text
-    state remains in order, and the existing work limit still bounds each
-    repeated extraction. Form/image invocations were already excluded from
-    these page-local text views; their separate inspection is unchanged.
+    every MCID for all the tagger's wrappers on the page. Pure path, painting
+    and color operations have no effect on native text decoding either. Keep
+    every text/graphics-state save, transform, font and unknown operation in
+    order; the existing work limit still bounds each repeated extraction.
+    Complete original paint and Form/image inspection is unchanged.
     """
     ignored = {b"BMC", b"BDC", b"EMC", b"MP", b"DP", b"Do", b"INLINE IMAGE"}
+    ignored.update(b"w J j M d ri i m l c v y h re S s f F f* B B* b b* n W W* CS cs SC SCN sc scn G g RG rg K k sh".split())
     return [(operation, owner, artifact) for operation, owner, artifact in zip(ops, owners, artifacts)
             if operation[1] not in ignored]
 
@@ -1253,6 +1255,11 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
                 artifact_text = artifact_text[:MAX_ARTIFACT_TEXT_CHARS] if decoded_text_chars <= MAX_TEXT_CHARS else ""
         info["page_content"].append({"pageNumber": page_number, "mcids": sorted(page_mcids), "ownership_required_mcids": sorted(ownership_required_mcids(ops, properties)), "text_show_operators": text_index, "untagged_text_operators": unowned, "artifact_text_operators": artifacts, "artifactText": artifact_text, "artifactTextComplete": artifact_complete, "occurrence_ids_by_mcid": occurrence_ids})
         for mcid in page_mcids:
+            if mcid not in occurrence_ids:
+                # The complete stream scan proved there is no owned text-show
+                # instruction here. Drawing-only scopes need no font decoding.
+                content_text[(page_number, mcid)] = ""
+                continue
             extraction_work += len(extraction_ops)
             if extraction_work > MAX_TEXT_EXTRACTION_OPERATORS:
                 content_text[(page_number, mcid)] = None
@@ -1338,7 +1345,14 @@ def structure_inventory(reader: PdfReader) -> dict[str, Any]:
             gaps.add("form_text_without_native_mcid")
         scope = {"id": f"form-{len(info['form_content']) + 1}", "pageNumber": pn, "mcids": sorted(mcids), "ownership_required_mcids": sorted(ownership_required_mcids(ops, props)), "stream": form, "text": {}, "gaps": gaps}
         extraction_ops = scoped_text_operations(ops, owners, artifacts)
+        text_targets = {None if artifact else owner
+                        for (_, operator), owner, artifact in extraction_ops
+                        if operator in (b"Tj", b"TJ", b"'", b'"') and (artifact or owner is not None)}
         for selected_mcid in [None, *sorted(mcids)]:
+            if selected_mcid not in text_targets:
+                if selected_mcid is not None:
+                    scope["text"][selected_mcid] = ""
+                continue
             extraction_work += len(extraction_ops)
             if extraction_work > MAX_TEXT_EXTRACTION_OPERATORS:
                 gaps.add("form_text_extraction_limit")

@@ -934,6 +934,83 @@ function visuals(pages: RenderedPdfPage[]): LiteLLMContentPart[] {
     },
   ]);
 }
+/** Native ownership is verified by the worker; avoid repeating its raw indexes.
+ * Full assigned tags retain their exact MCIDs and ordered content. Keep every
+ * other page check, excluded passage and incompleteness signal unchanged.
+ */
+function scopedPageChecks(
+  page: Record<string, unknown> | undefined,
+  tags: NativePdfTag[]
+): Record<string, unknown> | undefined {
+  if (!page) return page;
+  const {
+    mcids,
+    ownership_required_mcids: required,
+    occurrence_ids_by_mcid: occurrences,
+    ...checks
+  } = page;
+  if (
+    !Array.isArray(mcids) ||
+    !Array.isArray(required) ||
+    !objectRecord(occurrences) ||
+    !Object.values(occurrences).every(Array.isArray)
+  )
+    return page;
+  const assigned = new Set(
+    tags.flatMap((tag) =>
+      tag.content.flatMap((content) =>
+        content.pageNumber === page.pageNumber &&
+        content.streamId === undefined &&
+        typeof content.mcid === "number"
+          ? [content.mcid]
+          : []
+      )
+    )
+  );
+  return {
+    ...checks,
+    nativeContent: {
+      markedScopeCount: mcids.length,
+      ownershipRequiredScopeCount: required.length,
+      textOccurrenceCount: Object.values(occurrences).reduce<number>(
+        (count, ids) => count + (ids as unknown[]).length,
+        0
+      ),
+      assignedMarkedScopes: mcids.filter((mcid) => assigned.has(mcid)),
+      assignedOwnershipRequiredScopes: required.filter((mcid) =>
+        assigned.has(mcid)
+      ),
+      assignedTextOccurrenceCounts: Object.fromEntries(
+        Object.entries(occurrences)
+          .filter(([mcid]) => assigned.has(Number(mcid)))
+          .map(([mcid, ids]) => [mcid, (ids as unknown[]).length])
+      ),
+    },
+  };
+}
+function modelTag(tag: NativePdfTag): Record<string, unknown> {
+  const evidence: Record<string, unknown> = { ...tag };
+  // Writer preconditions stay in immutable state and are attached only after
+  // the model's operation has passed validation. They repeat current facts.
+  delete evidence.snapshot;
+  const marked = Array.isArray(tag.contentSequence)
+    ? tag.contentSequence.filter(
+        (entry): entry is Record<string, unknown> =>
+          objectRecord(entry) && entry.kind === "markedContent"
+      )
+    : undefined;
+  if (
+    marked &&
+    marked.length === tag.content.length &&
+    tag.content.every((content, index) =>
+      Object.entries(content).every(
+        ([key, value]) => marked[index][key] === value
+      )
+    )
+  )
+    delete evidence.content;
+  return evidence;
+}
 function scope(
   state: NativePdfState,
   batch: Batch,
@@ -955,6 +1032,7 @@ function scope(
   const relatedTagIds = new Set(
     structureCandidates.flatMap((candidate) => candidate.relatedTagIds)
   );
+  const assignedTagIds = new Set(batch.tags.map((tag) => tag.id));
   const payload = {
     evidenceRole,
     assignedPages: batch.pages,
@@ -965,22 +1043,23 @@ function scope(
     candidateSha256: state.candidateSha256,
     language: state.inventory.language,
     title: state.inventory.title,
-    tags: batch.tags,
+    tags: batch.tags.map(modelTag),
     structureCandidates,
-    relatedTagContext: state.inventory.tags.filter((tag) =>
-      relatedTagIds.has(tag.id)
-    ),
+    relatedTagContext: state.inventory.tags
+      .filter((tag) => relatedTagIds.has(tag.id) && !assignedTagIds.has(tag.id))
+      .map(modelTag),
     headingOutline: headingOutline(state),
     // Every hierarchy link remains available; only assigned tags may change.
-    hierarchy: state.inventory.tags.map((t) => ({
-      id: t.id,
-      parentId: t.parentId,
-      role: t.role,
-      pageNumber: t.pageNumber,
-      ...(/^H[1-6]?$/.test(t.role) ? { text: t.text } : {}),
-    })),
-    excludedTextAndPageChecks: batch.pages.map(
-      (n) => state.inventory.page_content[n - 1]
+    hierarchyColumns: ["id", "parentId", "role", "pageNumber", "headingText"],
+    hierarchy: state.inventory.tags.map((t) => [
+      t.id,
+      t.parentId,
+      t.role,
+      t.pageNumber,
+      /^H[1-6]?$/.test(t.role) ? t.text : null,
+    ]),
+    excludedTextAndPageChecks: batch.pages.map((n) =>
+      scopedPageChecks(state.inventory.page_content[n - 1], batch.tags)
     ),
     nestedFormContent: state.inventory.form_content,
     forms: state.inventory.forms,

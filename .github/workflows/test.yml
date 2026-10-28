@@ -60,6 +60,7 @@ jobs:
           python -m unittest discover -s research/native-pdf -p "test_native_pdf_validation.py"
           python -m unittest discover -s research/native-pdf -p "test_navigation*.py"
           python -m unittest discover -s research/native-pdf -p "test_link_grouping_repairs.py"
+          python -m unittest discover -s research/native-pdf -p "test_text_extraction_graphics_budget.py"
 
       - uses: actions/setup-node@v4
         with:
